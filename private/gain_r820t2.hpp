@@ -68,10 +68,11 @@ constexpr size_t kR820T2GainStepCount =
 inline size_t r820t2_nearest_gain_index(int tenth_db)
 {
     size_t best = 0;
-    int best_err = 100000;
+    int64_t best_err = INT64_MAX;
     for (size_t i = 0; i < kR820T2GainStepCount; ++i) {
-        const int err = tenth_db - kR820T2GainSteps[i].tenth_db;
-        const int aerr = err < 0 ? -err : err;
+        const int64_t err =
+            static_cast<int64_t>(tenth_db) - kR820T2GainSteps[i].tenth_db;
+        const int64_t aerr = err < 0 ? -err : err;
         if (aerr < best_err) {
             best_err = aerr;
             best = i;

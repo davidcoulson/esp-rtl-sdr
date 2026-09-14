@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 
 static int g_failed = 0;
 static int g_passed = 0;
@@ -227,6 +228,9 @@ static void test_capability_matrix(void)
         EXPECT_EQ_U(kR820T2GainSteps[i].reg07,
                     expected_r820t2_stages[i][1]);
     }
+    EXPECT_EQ_U(r820t2_nearest_gain_index(std::numeric_limits<int>::min()), 0u);
+    EXPECT_EQ_U(r820t2_nearest_gain_index(std::numeric_limits<int>::max()),
+                std::size(kR820T2GainSteps) - 1);
 
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_STREAM) != 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_RETUNE) != 0);
