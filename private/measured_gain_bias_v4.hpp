@@ -166,10 +166,11 @@ inline RtlControlRecord measured_v4_demod_reg_write(uint8_t reg, uint8_t value)
 inline size_t measured_v4_nearest_gain_index(int tenth_db)
 {
     size_t best = 0;
-    int best_err = 100000;
+    int64_t best_err = INT64_MAX;
     for (size_t i = 0; i < kMeasuredV4GainStepCount; ++i) {
-        const int err = tenth_db - kMeasuredV4GainSteps[i].tenth_db;
-        const int aerr = err < 0 ? -err : err;
+        const int64_t err =
+            static_cast<int64_t>(tenth_db) - kMeasuredV4GainSteps[i].tenth_db;
+        const int64_t aerr = err < 0 ? -err : err;
         if (aerr < best_err) {
             best_err = aerr;
             best = i;

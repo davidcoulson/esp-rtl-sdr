@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0-rc2 (2026-09-14) — EXPERIMENTAL multi-dongle
+
 ### Fixed
 
 - **Blog V3/V3c manual-gain stage candidate (implementation and host/build

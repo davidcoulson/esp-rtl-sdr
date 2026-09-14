@@ -3855,8 +3855,10 @@ static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *ap
         h->pending_gain_tenth = tenth_db;
         h->pending_gain = true;
         if (applied_tenth != nullptr) {
-            *applied_tenth = kMeasuredV4GainSteps[measured_v4_nearest_gain_index(tenth_db)]
-                                 .tenth_db;
+            *applied_tenth = rtl_profile_uses_r820t2_i2c_remap(h->profile)
+                                 ? kR820T2GainSteps[r820t2_nearest_gain_index(tenth_db)].tenth_db
+                                 : kMeasuredV4GainSteps[measured_v4_nearest_gain_index(tenth_db)]
+                                       .tenth_db;
         }
         return ESP_OK;
     }
@@ -4009,7 +4011,7 @@ esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth
     if (err == ESP_OK) {
         handle->gain_tenth_db = applied;
         set_error_unlocked(handle, ESP_OK);
-        ESP_LOGI(TAG, "tuner gain applied %d (0.1 dB) [measured V4 table]", applied);
+        ESP_LOGI(TAG, "tuner gain applied %d (0.1 dB) [profile table]", applied);
     } else {
         set_error_unlocked(handle, err);
     }

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 
 #include "esp_rtl_sdr.h"
@@ -148,6 +149,9 @@ static void test_measured_agc_tables(void)
     EXPECT_EQ_U(kMeasuredV4RtlAgcOn, 0x25);
     EXPECT_EQ_U(kMeasuredV4RtlAgcOff, 0x05);
     EXPECT_TRUE(kMeasuredV4RtlAgcOn != kMeasuredV4RtlAgcOff);
+    EXPECT_EQ_U(measured_v4_nearest_gain_index(std::numeric_limits<int>::min()), 0u);
+    EXPECT_EQ_U(measured_v4_nearest_gain_index(std::numeric_limits<int>::max()),
+                kMeasuredV4GainStepCount - 1);
 
     const RtlControlRecord ir = measured_v4_ir_reg_write(0x05, kMeasuredV4TunerAgcReg05);
     EXPECT_EQ_U(ir.value, 0x0074);
