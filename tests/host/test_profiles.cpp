@@ -229,6 +229,10 @@ static void test_capability_matrix(void)
                     expected_r820t2_stages[i][1]);
     }
     EXPECT_EQ_U(r820t2_nearest_gain_index(std::numeric_limits<int>::min()), 0u);
+    EXPECT_EQ_U(r820t2_nearest_gain_index(0), 0u);
+    EXPECT_EQ_U(r820t2_nearest_gain_index(10), 1u);
+    EXPECT_EQ_U(r820t2_nearest_gain_index(496),
+                std::size(kR820T2GainSteps) - 1);
     EXPECT_EQ_U(r820t2_nearest_gain_index(std::numeric_limits<int>::max()),
                 std::size(kR820T2GainSteps) - 1);
 
