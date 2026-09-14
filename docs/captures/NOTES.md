@@ -496,3 +496,37 @@ non-regression on the exact candidate. A V3c 96.1 RDS lock was not captured;
 gain calibration remains separate. The live V3c-to-V4 swap also showed an
 OrcSDR app behavior outside this driver fix: the newly attached V4 was ready but
 remained idle until the active FM dashboard was left and re-entered.
+
+## V3c gain-stage candidate (2026-09-14)
+
+The later OrcSDR hardware investigation used the same V3c with a roughly
+27-inch-per-leg dipole. With the receiver parked on a stable 99.1 MHz broadcast,
+the old provisional table produced this sweep:
+
+| Requested gain (dB) | Average level (dBFS) |
+|---:|---:|
+| 0.0 | -11.7 |
+| 7.7 | -2.2 |
+| 15.7 | -1.6 |
+| 25.4 | -1.5 |
+| 29.7 | -6.6 |
+| 38.6 | -10.0 |
+| 44.5 | -9.7 |
+| 49.6 | -9.7 |
+
+This is first-party device evidence that linear interpolation between the two
+captured endpoint register pairs does not represent R820T2/R860 gain stages.
+The candidate table retains the driver's existing 29 nominal gain requests but
+walks discrete LNA/mixer register pairs instead. The entire pair sequence and
+the Blog V3 MANUAL default are enforced by the host profile test; both host
+suites pass, and the driver-integrated OrcSDR ESP-IDF 5.5.4 build passes.
+
+The public Osmocom `rtl-sdr` R82xx implementation (`src/tuner_r82xx.c`,
+GPL-2.0-or-later) was used to corroborate the public register-stage behavior and
+is credited here. The implementation in this repository was written directly
+in the existing table/profile design; no upstream control flow was copied.
+
+This does not yet claim calibrated dB accuracy. The 99.1 MHz station is strong
+enough to clip at several settings, and the corrected candidate has not yet
+been flashed. Final acceptance requires a controlled weaker signal sweep on the
+real V3c, followed by a Blog V4 non-regression check.

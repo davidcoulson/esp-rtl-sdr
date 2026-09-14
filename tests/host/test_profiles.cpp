@@ -3,6 +3,7 @@
  * No USB / FreeRTOS. Pure profile + V4 frontend composition + tuner isolation.
  */
 #include "esp_rtl_sdr.h"
+#include "gain_r820t2.hpp"
 #include "measured_gain_bias_v4.hpp"
 #include "rtl_profile.hpp"
 #include "transfers_blog_v3.hpp"
@@ -201,7 +202,31 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_RETUNE) != 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_HF_UPCONVERTER) == 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_GAIN) != 0);
+    EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_GAIN_AUTO) == 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_BIAS_TEE) == 0);
+    EXPECT_EQ_U(rtl_profile_default_gain_mode(RtlProfileId::BlogV4),
+                ESP_RTL_SDR_GAIN_MODE_AUTO);
+    EXPECT_EQ_U(rtl_profile_default_gain_mode(RtlProfileId::BlogV3),
+                ESP_RTL_SDR_GAIN_MODE_MANUAL);
+
+    constexpr uint8_t expected_r820t2_stages[][2] = {
+        {0x90, 0x60}, {0x91, 0x60}, {0x91, 0x61}, {0x92, 0x61},
+        {0x92, 0x62}, {0x93, 0x62}, {0x93, 0x63}, {0x94, 0x63},
+        {0x94, 0x64}, {0x95, 0x64}, {0x95, 0x65}, {0x96, 0x65},
+        {0x96, 0x66}, {0x97, 0x66}, {0x97, 0x67}, {0x98, 0x67},
+        {0x98, 0x68}, {0x99, 0x68}, {0x99, 0x69}, {0x9a, 0x69},
+        {0x9a, 0x6a}, {0x9b, 0x6a}, {0x9b, 0x6b}, {0x9c, 0x6b},
+        {0x9c, 0x6c}, {0x9d, 0x6c}, {0x9d, 0x6d}, {0x9e, 0x6d},
+        {0x9f, 0x6e},
+    };
+    EXPECT_EQ_U(std::size(kR820T2GainSteps),
+                std::size(expected_r820t2_stages));
+    for (size_t i = 0; i < std::size(expected_r820t2_stages); ++i) {
+        EXPECT_EQ_U(kR820T2GainSteps[i].reg05,
+                    expected_r820t2_stages[i][0]);
+        EXPECT_EQ_U(kR820T2GainSteps[i].reg07,
+                    expected_r820t2_stages[i][1]);
+    }
 
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_STREAM) != 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_RETUNE) != 0);

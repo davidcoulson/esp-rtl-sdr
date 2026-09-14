@@ -152,10 +152,10 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
     case RtlProfileId::BlogV4:
         return rtl_profile_library_capabilities();
     case RtlProfileId::BlogV3:
-        /* Manual gain (2026-09-11): apply_r820t2_gain_records() writes
-         * reg05/07 directly from private/interpolated_gain_r820t2.hpp --
-         * two hardware-confirmed anchors, 27 interpolated points, NOT a
-         * full measured table (see that header + docs/captures/NOTES.md).
+        /* Manual gain: apply_r820t2_gain_records() writes reg05/07 directly
+         * from private/gain_r820t2.hpp. Its discrete stage sequence remains
+         * a hardware candidate, not a calibrated table (see that header and
+         * docs/captures/NOTES.md).
          * Still no AUTO/RTL_AGC/BIAS_TEE/HF_UPCONVERTER -- unimplemented
          * for this tuner family, not just unverified. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
@@ -173,6 +173,14 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
 inline bool rtl_profile_supports_stream(RtlProfileId profile)
 {
     return (rtl_profile_device_capabilities(profile) & ESP_RTL_SDR_CAP_STREAM) != 0;
+}
+
+inline esp_rtl_sdr_gain_mode_t rtl_profile_default_gain_mode(RtlProfileId profile)
+{
+    const uint32_t caps = rtl_profile_device_capabilities(profile);
+    return (caps & ESP_RTL_SDR_CAP_GAIN) != 0 && (caps & ESP_RTL_SDR_CAP_GAIN_AUTO) == 0
+               ? ESP_RTL_SDR_GAIN_MODE_MANUAL
+               : ESP_RTL_SDR_GAIN_MODE_AUTO;
 }
 
 inline bool rtl_profile_uses_v4_hf_routing(RtlProfileId profile)
