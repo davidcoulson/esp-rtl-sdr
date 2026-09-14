@@ -4,6 +4,17 @@
 
 ### Fixed
 
+- **Blog V3/V3c manual-gain stage candidate (implementation and host/build
+  verification):** the provisional table linearly interpolated two endpoint
+  register pairs even though R820T2/R860 gain is selected by discrete LNA and
+  mixer stages. A real V3c on a stable 99.1 MHz signal rose from -11.7 dBFS at
+  0.0 dB to clipping near -1.5 dBFS, then fell to roughly -10 dBFS as the
+  requested gain increased, proving the intermediate pairs were invalid. The
+  29 advertised steps now use an alternating hardware stage candidate, and
+  Blog V3 defaults to MANUAL because it does not expose measured tuner AGC.
+  Mode changes now require the capability for the requested mode instead of
+  accepting AUTO through manual-gain capability. Absolute gain values remain
+  nominal until checked against a controlled RF source.
 - **Tab5 release-image startup RAM regression:** the USB fault guard's timer
   handle and current-boot flag no longer consume ordinary internal BSS. The
   final RC4 image added only eight aligned bytes of internal state compared
@@ -90,9 +101,10 @@
   user-observed because COM17 was necessarily absent; the sampled 96.1 V3c
   serial status had not yet acquired RDS lock even though reception was reported
   correct.
-- Blog V3/V3c manual/automatic gain calibration remains separate from this IF
-  repair. The existing provisional manual-gain capability and register path are
-  unchanged; Nooelec gain and IF behavior remain unverified.
+- Blog V3/V3c now has a discrete manual-gain stage candidate, but its stage
+  order, absolute gain values, and RF response still require controlled-source
+  hardware validation. Hardware tuner AGC remains unsupported; Nooelec gain and
+  IF behavior remain unverified.
 - OrcSDR (app-level, separate repo): auto-start-scan-on-attach did not
   trigger for the `blog_v3_r820t2` profile on hot-swap (manually
   navigating to the FM screen and back did restore audio/waterfall). Very

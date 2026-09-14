@@ -35,7 +35,7 @@
 #include "transfers_blog_v3.hpp"
 #include "transfers_blog_v4.hpp"
 #include "measured_gain_bias_v4.hpp"
-#include "interpolated_gain_r820t2.hpp"
+#include "gain_r820t2.hpp"
 #include "reentrancy.hpp"
 
 static const char *TAG = "esp_rtl_sdr";
@@ -605,6 +605,7 @@ static void apply_profile_to_handle(esp_rtl_sdr_handle *h, RtlProfileId profile,
 {
     h->profile = profile;
     h->device_caps = rtl_profile_device_capabilities(profile);
+    h->gain_mode = rtl_profile_default_gain_mode(profile);
     h->info = info;
     h->info.present = (profile != RtlProfileId::Unknown);
 }
@@ -3601,22 +3602,21 @@ esp_err_t esp_rtl_sdr_probe_rates(esp_rtl_sdr_handle_t handle,
 }
 
 /* -------------------------------------------------------------------------- */
-/* Phase 3 — gain / bias (clean-room measured Blog V4 2026-08-12)             */
+/* Phase 3 — profile gain / bias                                               */
 /* -------------------------------------------------------------------------- */
 
 /**
  * R820T2/R860 manual gain: write reg05 then reg07 directly (no V4
  * board frontend/GPIO routing -- this tuner family's board has 1 RF input,
  * not V4's 3-input triplexer, so run_band_frontend()'s GPIO/Cable-2 logic
- * does not apply here). See private/interpolated_gain_r820t2.hpp for the
- * evidence behind these values -- two hardware-confirmed anchors, 27
- * interpolated points, NOT a full measured table.
+ * does not apply here). See private/gain_r820t2.hpp and
+ * docs/captures/NOTES.md for the evidence boundary.
  */
 static esp_err_t apply_r820t2_gain_records(esp_rtl_sdr_handle *h, int tenth_db,
                                            int *applied_tenth)
 {
     const size_t idx = r820t2_nearest_gain_index(tenth_db);
-    const R820T2GainStep &st = kR820T2InterpolatedGainSteps[idx];
+    const R820T2GainStep &st = kR820T2GainSteps[idx];
 
     /*
      * V4's manual gain path also writes reg0x0c (kMeasuredV4GainReg0c=0x68,
@@ -3848,7 +3848,7 @@ static esp_err_t apply_pending_sideband_ep0(esp_rtl_sdr_handle *h)
     return err;
 }
 
-static esp_err_t apply_measured_v4_gain(esp_rtl_sdr_handle *h, int tenth_db, int *applied_tenth)
+static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *applied_tenth)
 {
     /* Streaming: queue for delivery task (non-blocking for HTTP/UI). */
     if (h->streaming) {
@@ -3874,8 +3874,8 @@ static esp_err_t apply_measured_v4_bias(esp_rtl_sdr_handle *h, bool enable)
     return apply_bias_records(h, enable);
 }
 
-static esp_err_t apply_measured_v4_gain_mode(esp_rtl_sdr_handle *h,
-                                             esp_rtl_sdr_gain_mode_t mode)
+static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
+                                         esp_rtl_sdr_gain_mode_t mode)
 {
     if (h->streaming) {
         h->pending_gain_mode_val = mode;
@@ -3910,7 +3910,10 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
     if (mode != ESP_RTL_SDR_GAIN_MODE_AUTO && mode != ESP_RTL_SDR_GAIN_MODE_MANUAL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if ((handle->device_caps & (ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO)) == 0) {
+    const uint32_t required = mode == ESP_RTL_SDR_GAIN_MODE_AUTO
+                                  ? ESP_RTL_SDR_CAP_GAIN_AUTO
+                                  : ESP_RTL_SDR_CAP_GAIN;
+    if ((handle->device_caps & required) == 0) {
         return ESP_RTL_SDR_ERR_UNSUPPORTED;
     }
     if (check_not_reentrant(handle) != ESP_OK) {
@@ -3936,7 +3939,7 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
         }
     }
 
-    const esp_err_t err = apply_measured_v4_gain_mode(handle, mode);
+    const esp_err_t err = apply_profile_gain_mode(handle, mode);
 
     HandleLock lk(handle);
     if (!lk.ok()) {
@@ -3945,7 +3948,7 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
     if (err == ESP_OK) {
         handle->gain_mode = mode;
         set_error_unlocked(handle, ESP_OK);
-        ESP_LOGI(TAG, "tuner gain mode %s [measured V4]",
+        ESP_LOGI(TAG, "tuner gain mode %s",
                  mode == ESP_RTL_SDR_GAIN_MODE_AUTO ? "AUTO" : "MANUAL");
     } else {
         set_error_unlocked(handle, err);
@@ -3997,7 +4000,7 @@ esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth
     }
 
     int applied = 0;
-    const esp_err_t err = apply_measured_v4_gain(handle, gain_tenth_db, &applied);
+    const esp_err_t err = apply_profile_gain(handle, gain_tenth_db, &applied);
 
     HandleLock lk(handle);
     if (!lk.ok()) {
