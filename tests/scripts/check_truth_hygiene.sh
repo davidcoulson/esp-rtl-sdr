@@ -5,11 +5,11 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 hdr="include/esp_rtl_sdr.h"
-MAJOR=$(grep -E '#define ESP_RTL_SDR_VERSION_MAJOR' "$hdr" | head -1 | grep -oE '[0-9]+$')
-MINOR=$(grep -E '#define ESP_RTL_SDR_VERSION_MINOR' "$hdr" | head -1 | grep -oE '[0-9]+$')
-PATCH=$(grep -E '#define ESP_RTL_SDR_VERSION_PATCH' "$hdr" | head -1 | grep -oE '[0-9]+$')
-IS_PRE=$(grep -E '#define ESP_RTL_SDR_VERSION_IS_PRERELEASE' "$hdr" | head -1 | grep -oE '[0-9]+$' || echo 0)
-PRE_TOK=$(grep -E '#define ESP_RTL_SDR_VERSION_PRERELEASE' "$hdr" | head -1 | awk '{print $3}')
+MAJOR=$(grep -E '#define ESP_RTL_SDR_VERSION_MAJOR' "$hdr" | head -1 | tr -d '\r' | grep -oE '[0-9]+$')
+MINOR=$(grep -E '#define ESP_RTL_SDR_VERSION_MINOR' "$hdr" | head -1 | tr -d '\r' | grep -oE '[0-9]+$')
+PATCH=$(grep -E '#define ESP_RTL_SDR_VERSION_PATCH' "$hdr" | head -1 | tr -d '\r' | grep -oE '[0-9]+$')
+IS_PRE=$(grep -E '#define ESP_RTL_SDR_VERSION_IS_PRERELEASE' "$hdr" | head -1 | tr -d '\r' | grep -oE '[0-9]+$' || echo 0)
+PRE_TOK=$(grep -E '#define ESP_RTL_SDR_VERSION_PRERELEASE' "$hdr" | head -1 | awk '{print $3}' | tr -d '\r')
 VER="${MAJOR}.${MINOR}.${PATCH}"
 if [[ "$IS_PRE" == "1" && -n "$PRE_TOK" ]]; then
   VER="${VER}-${PRE_TOK}"

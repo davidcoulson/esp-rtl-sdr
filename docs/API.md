@@ -78,7 +78,8 @@ reset   → IDLE from FAULT if not streaming (clears metrics)
 
 - `struct_size` match
 - `sample_rate_sps` 0 (fill preferred) or any in-window rate (see `docs/RATES.md`)
-- `CUSTOM_HZ`: frequency in [24 MHz, 1766 MHz], quantized to 1 kHz
+- `CUSTOM_HZ`: exact-Hz frequency in the 24 kHz…1766 MHz arithmetic range;
+  the attached profile can reject a narrower unsupported range
 - Named presets ignore `frequency_hz` (driver LO constants)
 - `max_bytes` even (IQ pairs) when non-zero
 - `timeout_ms` ≤ 30000
@@ -141,7 +142,7 @@ Prefer component codes over generic `INVALID_STATE` when the app can branch:
 | `HF_UPCONVERTER` | On (0.7.7) |
 | `BIAS_TEE` | On (measured SYS sequence; no multimeter DC yet) |
 | `IQ_ACQUIRE` | Off |
-| `DIRECT_SAMPLING` | Reserved off |
+| `DIRECT_SAMPLING` | On only for Blog V3/V3c; Q branch below 24 MHz |
 
 ---
 

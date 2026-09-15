@@ -232,19 +232,20 @@ const char *esp_rtl_sdr_err_to_name(esp_err_t err);
 #define ESP_RTL_SDR_PRESET_NOAA_HZ     162400000u
 
 /**
- * Frequency policy (Hz) — Blog V4 full advertised span (public DS / product page).
+ * Frequency policy (Hz) — driver arithmetic span. Individual device profiles
+ * may support a narrower range; start/retune validate the selected profile.
  * Below HF_UPCONV_LO_HZ the driver programs the R828D at RF+28.8 MHz (built-in
  * SA612 upconverter). The Cable-2 route remains selected through exactly 28.8 MHz.
  */
-#define ESP_RTL_SDR_FREQ_MIN_HZ        500000u
+#define ESP_RTL_SDR_FREQ_MIN_HZ        24000u
 #define ESP_RTL_SDR_FREQ_MAX_HZ        1766000000u
 /** Built-in HF upconverter LO (Blog V4 public: SA612 @ 28.8 MHz). */
 #define ESP_RTL_SDR_HF_UPCONV_LO_HZ    28800000u
 /** Triplexer edges: HF is <= VHF_MIN_HZ; VHF begins immediately above it. */
 #define ESP_RTL_SDR_BAND_VHF_MIN_HZ    28800000u
 #define ESP_RTL_SDR_BAND_UHF_MIN_HZ    250000000u
-/** Quantization applied by retune_hz / start (Hz). */
-#define ESP_RTL_SDR_FREQ_QUANT_HZ      1000u
+/** Exact-Hz frequency step applied by retune_hz / start. */
+#define ESP_RTL_SDR_FREQ_QUANT_HZ      1u
 
 /**
  * Bulk transfer defaults (bytes). Must be multiple of 512 for HS bulk.
@@ -316,7 +317,7 @@ typedef enum {
     ESP_RTL_SDR_CAP_METRICS = 1u << 3,      /**< get_metrics live */
     ESP_RTL_SDR_CAP_CUSTOM_HZ = 1u << 4,    /**< CUSTOM_HZ preset */
     ESP_RTL_SDR_CAP_BIAS_TEE = 1u << 5,     /**< measured Blog V4 SYS bias (0.7.5+) */
-    ESP_RTL_SDR_CAP_DIRECT_SAMPLING = 1u << 6, /**< reserved; not claimed */
+    ESP_RTL_SDR_CAP_DIRECT_SAMPLING = 1u << 6, /**< profile supports direct ADC sampling */
     ESP_RTL_SDR_CAP_IQ_ACQUIRE = 1u << 7,   /**< release_iq_block required */
     ESP_RTL_SDR_CAP_FREQ_CORRECTION = 1u << 8, /**< software ppm LO offset */
     ESP_RTL_SDR_CAP_MULTI_DEVICE = 1u << 9, /**< enumerate / select by index/serial */
@@ -555,7 +556,7 @@ typedef struct {
     esp_rtl_sdr_preset_t preset;
     /**
      * Required for CUSTOM_HZ. For named presets, ignored (driver uses fixed LO).
-     * Quantized to ESP_RTL_SDR_FREQ_QUANT_HZ.
+     * Validated and normalized to ESP_RTL_SDR_FREQ_QUANT_HZ.
      */
     uint32_t frequency_hz;
     /**
@@ -611,7 +612,8 @@ esp_err_t esp_rtl_sdr_get_supported_rates(uint32_t *out_rates,
 /**
  * Clamp and quantize frequency to driver policy.
  * Returns false if out of absolute range or out_hz is NULL.
- * Range: FREQ_MIN_HZ (500 kHz) … FREQ_MAX_HZ (with CAP_HF_UPCONVERTER).
+ * Arithmetic range: FREQ_MIN_HZ (24 kHz) … FREQ_MAX_HZ. The selected
+ * device profile may reject part of that range.
  */
 bool esp_rtl_sdr_normalize_frequency(uint32_t in_hz, uint32_t *out_hz);
 
@@ -648,7 +650,8 @@ esp_rtl_sdr_profile_t esp_rtl_sdr_get_profile(esp_rtl_sdr_handle_t handle);
 
 /**
  * Capability bitmask for the currently attached profile.
- * Detached / UNKNOWN → 0. Blog V3 / Nooelec provisional omit HF/gain/bias.
+ * Detached / UNKNOWN → 0. Blog V3 adds direct sampling and manual gain;
+ * Nooelec omits HF/direct sampling/gain/bias.
  */
 uint32_t esp_rtl_sdr_get_device_capabilities(esp_rtl_sdr_handle_t handle);
 
@@ -1013,6 +1016,8 @@ typedef enum {
  * While streaming, EP0 runs on the delivery task after a bulk pause (async).
  * ESP_OK means the request was accepted, not that the dongle ACKed registers.
  * set_tuner_gain() forces MANUAL. Not the RTL digital AGC (see set_rtl_agc).
+ * Returns ESP_RTL_SDR_ERR_UNSUPPORTED while Blog V3 direct sampling bypasses
+ * the tuner.
  */
 esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
                                           esp_rtl_sdr_gain_mode_t mode);
@@ -1028,6 +1033,8 @@ esp_err_t esp_rtl_sdr_get_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
  * Manual gain in tenths of dB (e.g. 496 = 49.6 dB). Applies nearest measured
  * Blog V4 step (0.0…49.6 dB ladder). Requires claimed interface (after start).
  * Streaming: queued on the delivery task (async). ESP_OK = accepted request.
+ * Returns ESP_RTL_SDR_ERR_UNSUPPORTED while Blog V3 direct sampling bypasses
+ * the tuner.
  */
 esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth_db);
 

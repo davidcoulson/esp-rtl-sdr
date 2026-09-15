@@ -126,6 +126,7 @@ inline uint32_t rtl_profile_library_capabilities(void)
 {
     return ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE | ESP_RTL_SDR_CAP_METRICS |
            ESP_RTL_SDR_CAP_CUSTOM_HZ | ESP_RTL_SDR_CAP_HOTPLUG |
+           ESP_RTL_SDR_CAP_DIRECT_SAMPLING |
            ESP_RTL_SDR_CAP_FREQ_CORRECTION | ESP_RTL_SDR_CAP_MULTI_DEVICE |
            ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_CONTINUOUS_RATE |
            ESP_RTL_SDR_CAP_NEED | ESP_RTL_SDR_CAP_HEALTH | ESP_RTL_SDR_CAP_PASSPORT |
@@ -150,7 +151,7 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
 
     switch (profile) {
     case RtlProfileId::BlogV4:
-        return rtl_profile_library_capabilities();
+        return rtl_profile_library_capabilities() & ~ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
     case RtlProfileId::BlogV3:
         /* Manual gain: apply_r820t2_gain_records() writes reg05/07 directly
          * from private/gain_r820t2.hpp. Its discrete stage sequence remains
@@ -160,7 +161,7 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
          * for this tuner family, not just unverified. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
-               ESP_RTL_SDR_CAP_GAIN;
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
     case RtlProfileId::NooelecSmartV5:
         /* Provisional: stream/retune/sync-read/passport; no V4 HF or measured gain/bias. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
@@ -193,6 +194,21 @@ inline bool rtl_profile_uses_r820t2_i2c_remap(RtlProfileId profile)
     return profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5;
 }
 
+inline bool rtl_profile_uses_v3_direct_sampling(RtlProfileId profile, uint32_t frequency_hz)
+{
+    return profile == RtlProfileId::BlogV3 && frequency_hz < kR820T2NativeMinHz;
+}
+
+/** Captured RTL2832U Q-branch NCO: 22-bit negative corrected RF/28.8 MHz, truncated. */
+inline uint32_t rtl_profile_v3_direct_nco_word(uint32_t frequency_hz, int32_t ppm = 0)
+{
+    const int64_t corrected_hz = static_cast<int64_t>(frequency_hz) +
+        (static_cast<int64_t>(frequency_hz) * ppm) / 1000000LL;
+    const uint32_t scaled = static_cast<uint32_t>(
+        (static_cast<uint64_t>(corrected_hz) << 22) / ESP_RTL_SDR_XTAL_HZ);
+    return (0x400000u - scaled) & 0x3fffffu;
+}
+
 /** Blog V4 vendor board controls must never run on plain R820T2/R860 sticks. */
 inline bool rtl_profile_allows_init_record(RtlProfileId profile,
                                            const RtlControlRecord &record)
@@ -205,9 +221,12 @@ inline bool rtl_profile_allows_init_record(RtlProfileId profile,
 
 inline bool rtl_profile_supports_rf_hz(RtlProfileId profile, uint32_t frequency_hz)
 {
-    /* R820T2-family provisional paths: fail-closed below native floor (~24 MHz).
-     * No V4 HF upconverter / Cable-2 / GPIO5. */
-    if (rtl_profile_uses_r820t2_i2c_remap(profile) && frequency_hz < kR820T2NativeMinHz) {
+    if (frequency_hz < ESP_RTL_SDR_FREQ_MIN_HZ || frequency_hz > ESP_RTL_SDR_FREQ_MAX_HZ) {
+        return false;
+    }
+    /* Nooelec has no measured direct-sampling path. Blog V3 uses its separately
+     * captured Q-branch path below this native tuner floor. */
+    if (profile == RtlProfileId::NooelecSmartV5 && frequency_hz < kR820T2NativeMinHz) {
         return false;
     }
     if (profile == RtlProfileId::Unknown) {
@@ -218,6 +237,9 @@ inline bool rtl_profile_supports_rf_hz(RtlProfileId profile, uint32_t frequency_
 
 inline uint32_t rtl_profile_tuner_frequency_hz(RtlProfileId profile, uint32_t rf_hz)
 {
+    if (rtl_profile_uses_v3_direct_sampling(profile, rf_hz)) {
+        return 0; /* tuner bypassed */
+    }
     if (rtl_profile_uses_v4_hf_routing(profile)) {
         return esp_rtl_sdr_tuner_frequency_hz(rf_hz);
     }

@@ -246,7 +246,7 @@ Design contract: [`docs/API.md`](docs/API.md) · header: [`include/esp_rtl_sdr.h
 | `set_tuner_gain_mode(MANUAL\|AUTO)` | MANUAL ladder; AUTO measured R828D AGC (`CAP_GAIN_AUTO`, 0.7.8+). Streaming = async EP0. |
 | `set/get_rtl_agc` | RTL2832 digital AGC (`CAP_RTL_AGC`); not tuner AUTO. **get** = requested shadow, not readback. |
 | `set/get_bias_tee` | Measured SYS EP0 (CAP_BIAS_TEE); need claimed stream |
-| HF (0.7.15 routing correction) | **500 kHz…1766 MHz**; RF&lt;28.8 MHz uses +28.8 MHz LO, RF≤28.8 MHz selects Cable-2 and GPIO5-low (`CAP_HF_UPCONVERTER`) |
+| HF/LF (unreleased) | Blog V4 accepts **24 kHz…1766 MHz** with exact-Hz requests; RF&lt;28.8 MHz uses +28.8 MHz LO and Cable-2 (`CAP_HF_UPCONVERTER`). Blog V3/V3c uses capture-derived Q-branch direct sampling below 24 MHz (`CAP_DIRECT_SAMPLING`); its tuner gain is bypassed there. Both paths are experimental and await ESP32-P4 RF acceptance. Nooelec remains fail-closed below 24 MHz. |
 
 Evidence: [`docs/PHASE3_CAPTURE_REPORT.md`](docs/PHASE3_CAPTURE_REPORT.md), [`docs/AGC_IF_CAPTURE.md`](docs/AGC_IF_CAPTURE.md), and the checked-in clean-room transfer table. The 0.7.15 routing composition is host/build verified only; P4 GPIO and RF acceptance remain open.
 

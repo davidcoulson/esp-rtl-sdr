@@ -132,11 +132,17 @@ static void test_tuner_isolation(void)
 
 static void test_frequency_policy(void)
 {
-    /* V4: HF upconverter + full span. */
-    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV4, 1120000u));
-    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV4, 100000000u));
-    EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::BlogV4, 10000000u),
-                10000000u + 28800000u);
+    /* V4: experimental LF/HF upconverter path, exact requested RF retained. */
+    const uint32_t v4_rf_hz[] = {24000u, 60000u, 135600u, 147300u, 474000u,
+                                 500000u, 1000000u, 10000000u, 28799999u,
+                                 28800000u, 28800001u, 28801000u, 96100000u, 162400000u,
+                                 433000000u, 1090000000u};
+    for (const uint32_t rf_hz : v4_rf_hz) {
+        EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV4, rf_hz));
+        const uint32_t expected = rf_hz < 28800000u ? rf_hz + 28800000u : rf_hz;
+        EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::BlogV4, rf_hz), expected);
+    }
+    EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::BlogV4, 23999u));
     EXPECT_TRUE(rtl_profile_uses_v4_hf_routing(RtlProfileId::BlogV4));
 
     /* Nooelec: reject < 24 MHz; no V4 HF LO offset / routing. */
@@ -148,11 +154,21 @@ static void test_frequency_policy(void)
                 100000000u);
     EXPECT_TRUE(!rtl_profile_uses_v4_hf_routing(RtlProfileId::NooelecSmartV5));
 
-    /* V3 provisional: same R820T2 floor as Nooelec; no V4 HF LO offset. */
-    EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, 10000000u));
-    EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, 23999999u));
-    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, 24000000u));
-    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, 100000000u));
+    /* V3: captured Q-branch direct sampling below the 24 MHz tuner floor. */
+    const uint32_t direct_rf_hz[] = {60000u, 135600u, 147300u, 474000u, 500000u,
+                                     1000000u, 10000000u, 20000000u, 23999999u};
+    for (const uint32_t rf_hz : direct_rf_hz) {
+        EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, rf_hz));
+        EXPECT_TRUE(rtl_profile_uses_v3_direct_sampling(RtlProfileId::BlogV3, rf_hz));
+        EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::BlogV3, rf_hz), 0u);
+    }
+    const uint32_t normal_v3_rf_hz[] = {24000000u, 28800000u, 96100000u,
+                                        162400000u, 433000000u, 1090000000u};
+    for (const uint32_t rf_hz : normal_v3_rf_hz) {
+        EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::BlogV3, rf_hz));
+        EXPECT_TRUE(!rtl_profile_uses_v3_direct_sampling(RtlProfileId::BlogV3, rf_hz));
+        EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::BlogV3, rf_hz), rf_hz);
+    }
     EXPECT_TRUE(rtl_profile_supports_stream(RtlProfileId::BlogV3));
     EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::BlogV3, 100000000u),
                 100000000u);
@@ -161,6 +177,20 @@ static void test_frequency_policy(void)
     EXPECT_TRUE(rtl_profile_uses_r820t2_i2c_remap(RtlProfileId::NooelecSmartV5));
     EXPECT_TRUE(!rtl_profile_uses_r820t2_i2c_remap(RtlProfileId::BlogV4));
     EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::Unknown, 100000000u));
+
+    struct DirectNcoCase { uint32_t rf_hz; uint32_t nco; };
+    constexpr DirectNcoCase captured[] = {
+        {60000u, 0x3fdddeu}, {135600u, 0x3fb2dcu}, {147300u, 0x3fac34u},
+        {472500u, 0x3ef334u}, {1000123u, 0x3dc70bu}, {10000000u, 0x29c71du},
+        {20000000u, 0x138e39u}, {23999999u, 0x0aaaabu},
+    };
+    for (const auto &point : captured) {
+        EXPECT_EQ_U(rtl_profile_v3_direct_nco_word(point.rf_hz), point.nco);
+    }
+
+    EXPECT_EQ_U(rtl_profile_v3_direct_nco_word(147300u, 100), 0x3fac32u);
+    EXPECT_EQ_U(rtl_profile_v3_direct_nco_word(147300u, -100), 0x3fac36u);
+    EXPECT_EQ_U(rtl_profile_v3_direct_nco_word(23999999u, 1000), 0x0a9d04u);
 }
 
 static void test_matched_if_policy(void)
@@ -187,6 +217,35 @@ static void test_matched_if_policy(void)
     }
 }
 
+static void test_v3_direct_transition_records(void)
+{
+    EXPECT_EQ_U(std::size(kBlogV3DirectEnable), 8u);
+    EXPECT_EQ_U(kBlogV3DirectEnable[0].value, 0xb120u);
+    EXPECT_EQ_U(kBlogV3DirectEnable[0].data[0], 0x1au);
+    EXPECT_EQ_U(kBlogV3DirectEnable[2].value, 0x1520u);
+    EXPECT_EQ_U(kBlogV3DirectEnable[2].data[0], 0x00u);
+    EXPECT_EQ_U(kBlogV3DirectEnable[4].data[0], 0x4du);
+    EXPECT_EQ_U(kBlogV3DirectEnable[6].data[0], 0x90u);
+    EXPECT_EQ_U(std::size(kBlogV3DirectDisable), 4u);
+    EXPECT_EQ_U(kBlogV3DirectDisable[0].data[0], 0x01u);
+    EXPECT_EQ_U(kBlogV3DirectDisable[2].data[0], 0x80u);
+    EXPECT_EQ_U(kRtlTunerCleanupLast, 13u);
+    EXPECT_EQ_U(kRtlTunerReinitFirst, 363u);
+    EXPECT_EQ_U(kRtlTunerReinitLast, 419u);
+    EXPECT_EQ_U(kRtlInitTransfers[kRtlTunerReinitFirst].value, 0x0074u);
+    EXPECT_EQ_U(kRtlInitTransfers[kRtlTunerReinitLast].value, 0x0120u);
+    EXPECT_EQ_U(std::size(kBlogV3TunerRepeaterOn), 2u);
+    EXPECT_EQ_U(kBlogV3TunerRepeaterOn[0].value, 0x0120u);
+    EXPECT_EQ_U(kBlogV3TunerRepeaterOn[0].data[0], 0x18u);
+
+    const uint32_t retunes[] = {96100000u, 10000000u, 147300u, 96100000u, 147300u};
+    const bool direct[] = {false, true, true, false, true};
+    for (size_t i = 0; i < std::size(retunes); ++i) {
+        EXPECT_EQ_U(rtl_profile_uses_v3_direct_sampling(RtlProfileId::BlogV3, retunes[i]),
+                    direct[i]);
+    }
+}
+
 static void test_capability_matrix(void)
 {
     const uint32_t v4 = rtl_profile_device_capabilities(RtlProfileId::BlogV4);
@@ -198,6 +257,7 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((v4 & ESP_RTL_SDR_CAP_HF_UPCONVERTER) != 0);
     EXPECT_TRUE((v4 & ESP_RTL_SDR_CAP_GAIN) != 0);
     EXPECT_TRUE((v4 & ESP_RTL_SDR_CAP_BIAS_TEE) != 0);
+    EXPECT_TRUE((v4 & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) == 0);
 
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_STREAM) != 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_RETUNE) != 0);
@@ -205,6 +265,7 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_GAIN) != 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_GAIN_AUTO) == 0);
     EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_BIAS_TEE) == 0);
+    EXPECT_TRUE((v3 & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0);
     EXPECT_EQ_U(rtl_profile_default_gain_mode(RtlProfileId::BlogV4),
                 ESP_RTL_SDR_GAIN_MODE_AUTO);
     EXPECT_EQ_U(rtl_profile_default_gain_mode(RtlProfileId::BlogV3),
@@ -241,6 +302,7 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_HF_UPCONVERTER) == 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_GAIN) == 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_BIAS_TEE) == 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) == 0);
 
     EXPECT_EQ_U(unk, 0);
     EXPECT_EQ_U(esp_rtl_sdr_get_capabilities(), rtl_profile_library_capabilities());
@@ -307,6 +369,7 @@ int main(void)
     test_tuner_isolation();
     test_frequency_policy();
     test_matched_if_policy();
+    test_v3_direct_transition_records();
     test_capability_matrix();
     test_profile_transition_matrix();
     std::printf("RESULT profiles passed=%d failed=%d\n", g_passed, g_failed);

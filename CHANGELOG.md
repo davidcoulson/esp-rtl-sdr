@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **Blog V4 experimental LF policy (host/build-verified only):** custom tuning now
+  preserves exact Hz and accepts 24 kHz through 1.766 GHz. Below 28.8 MHz the
+  existing V4 upconverter mapping remains `tuner = requested RF + 28.8 MHz`, so
+  DDH47 at 147.300 kHz maps to 28.947300 MHz.
+- **Blog V3/V3c Q-branch LF/HF (capture-derived, experimental):** below 24 MHz,
+  the driver now bypasses/shuts down the R820T2-family tuner, enables Q-branch
+  direct sampling, and programs the captured exact-Hz RTL2832 NCO. Both hot
+  transition directions reuse existing captured tuner cleanup/reinit records.
+  A real V3c completed PC-side cold tunes and IQ reads at 60 kHz through
+  23.999999 MHz plus normal/direct hot transitions. Tuner gain setters return
+  `ERR_UNSUPPORTED` while direct sampling is selected. ESP32-P4 RF reception
+  and DDH47 decoding remain open; Nooelec remains fail-closed below 24 MHz.
+
 ## 0.8.0-rc2 (2026-09-14) — EXPERIMENTAL multi-dongle
 
 ### Fixed

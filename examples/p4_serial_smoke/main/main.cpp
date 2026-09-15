@@ -146,7 +146,7 @@ static void check_pure_helpers(void)
 {
     uint32_t q = 0;
     smoke_row("normalize_frequency",
-              esp_rtl_sdr_normalize_frequency(96123456, &q) && q == 96123000);
+              esp_rtl_sdr_normalize_frequency(96123456, &q) && q == 96123456);
 
     uint32_t exact = 0;
     smoke_row("quantize_2048k",
@@ -163,6 +163,7 @@ static void check_pure_helpers(void)
     smoke_row("cap_gain_auto", (caps & ESP_RTL_SDR_CAP_GAIN_AUTO) != 0);
     smoke_row("cap_rtl_agc", (caps & ESP_RTL_SDR_CAP_RTL_AGC) != 0);
     smoke_row("cap_bias_tee", (caps & ESP_RTL_SDR_CAP_BIAS_TEE) != 0);
+    smoke_row("cap_direct_sampling", (caps & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0);
     smoke_row("cap_sync_read", (caps & ESP_RTL_SDR_CAP_SYNC_READ) != 0);
 
     ESP_LOGI(TAG, "helpers version=%s caps=0x%08x urbs=%ux%u soak_ms=%d",
@@ -196,10 +197,15 @@ static void run_l4_matrix(esp_rtl_sdr_handle_t sdr)
     err = esp_rtl_sdr_set_tuner_gain_mode(sdr, ESP_RTL_SDR_GAIN_MODE_AUTO);
     settle_ms(250);
     (void)esp_rtl_sdr_get_tuner_gain_mode(sdr, &mode);
-    smoke_row("tuner_auto_set_get", err == ESP_OK && mode == ESP_RTL_SDR_GAIN_MODE_AUTO);
+    const bool auto_supported =
+        (esp_rtl_sdr_get_device_capabilities(sdr) & ESP_RTL_SDR_CAP_GAIN_AUTO) != 0;
+    smoke_row("tuner_auto_set_get", auto_supported
+                                           ? err == ESP_OK && mode == ESP_RTL_SDR_GAIN_MODE_AUTO
+                                           : err == ESP_RTL_SDR_ERR_UNSUPPORTED);
 
     err = esp_rtl_sdr_set_tuner_gain_mode(sdr, ESP_RTL_SDR_GAIN_MODE_AUTO);
-    smoke_row("tuner_auto_idempotent", err == ESP_OK);
+    smoke_row("tuner_auto_idempotent",
+              auto_supported ? err == ESP_OK : err == ESP_RTL_SDR_ERR_UNSUPPORTED);
     smoke_read(sdr, "tuner_auto_read");
 
     err = esp_rtl_sdr_set_tuner_gain(sdr, 297);
@@ -210,14 +216,18 @@ static void run_l4_matrix(esp_rtl_sdr_handle_t sdr)
     err = esp_rtl_sdr_set_tuner_gain_mode(sdr, ESP_RTL_SDR_GAIN_MODE_AUTO);
     settle_ms(250);
     (void)esp_rtl_sdr_get_tuner_gain_mode(sdr, &mode);
-    smoke_row("tuner_auto_restore", err == ESP_OK && mode == ESP_RTL_SDR_GAIN_MODE_AUTO);
+    smoke_row("tuner_auto_restore", auto_supported
+                                           ? err == ESP_OK && mode == ESP_RTL_SDR_GAIN_MODE_AUTO
+                                           : err == ESP_RTL_SDR_ERR_UNSUPPORTED &&
+                                                 mode == ESP_RTL_SDR_GAIN_MODE_MANUAL);
 
+    const esp_rtl_sdr_gain_mode_t mode_before_rtl = mode;
     err = esp_rtl_sdr_set_rtl_agc(sdr, true);
     settle_ms(250);
     (void)esp_rtl_sdr_get_rtl_agc(sdr, &rtl);
     (void)esp_rtl_sdr_get_tuner_gain_mode(sdr, &mode);
     smoke_row("rtl_agc_on", err == ESP_OK && rtl);
-    smoke_row("rtl_agc_independent", mode == ESP_RTL_SDR_GAIN_MODE_AUTO);
+    smoke_row("rtl_agc_independent", mode == mode_before_rtl);
 
     err = esp_rtl_sdr_set_rtl_agc(sdr, false);
     settle_ms(250);
@@ -235,6 +245,38 @@ static void run_l4_matrix(esp_rtl_sdr_handle_t sdr)
     (void)esp_rtl_sdr_get_tuner_gain(sdr, &gain);
     smoke_row("manual_restore_gain", err == ESP_OK && gain == 297);
     smoke_read(sdr, "manual_restore_read");
+}
+
+static void run_lf_matrix(esp_rtl_sdr_handle_t sdr, uint32_t caps)
+{
+    if ((caps & (ESP_RTL_SDR_CAP_HF_UPCONVERTER |
+                 ESP_RTL_SDR_CAP_DIRECT_SAMPLING)) == 0) {
+        return;
+    }
+    if ((caps & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0) {
+        smoke_row("direct_tuner_gain_unsupported",
+                  esp_rtl_sdr_set_tuner_gain(sdr, 297) == ESP_RTL_SDR_ERR_UNSUPPORTED);
+    }
+    struct Step { const char *name; uint32_t hz; };
+    const Step steps[] = {
+        {"lf_to_fm", 96100000u}, {"fm_to_10m", 10000000u},
+        {"10m_to_147300", 147300u}, {"lf_back_to_fm", 96100000u},
+        {"fm_back_to_147300", 147300u}, {"lf_finish_fm", 96100000u},
+    };
+    for (const auto &step : steps) {
+        const esp_err_t err = esp_rtl_sdr_retune_hz(sdr, step.hz);
+        settle_ms(250);
+        esp_rtl_sdr_metrics_t metrics = {};
+        size_t n = 0;
+        const esp_err_t read_err = esp_rtl_sdr_read(sdr, s_drain_buf, 4096, 500, &n);
+        const bool ok = err == ESP_OK && read_err == ESP_OK && n != 0 &&
+                        esp_rtl_sdr_get_metrics(sdr, &metrics) == ESP_OK &&
+                        metrics.frequency_hz == step.hz;
+        smoke_row(step.name, ok);
+        ESP_LOGI(TAG, "%s rf=%u bytes=%u over=%u drops=%u", step.name,
+                 (unsigned)metrics.frequency_hz, (unsigned)n,
+                 (unsigned)metrics.overruns, (unsigned)metrics.consumer_drops);
+    }
 }
 
 static bool restart_stream_for_soak(esp_rtl_sdr_handle_t sdr,
@@ -331,10 +373,15 @@ extern "C" void app_main(void)
         smoke_row("no_device_skip", true);
     } else {
         hw = "RUN";
+        const uint32_t device_caps = esp_rtl_sdr_get_device_capabilities(sdr);
         esp_rtl_sdr_stream_config_t stream;
         esp_rtl_sdr_stream_config_default(&stream);
         stream.preset = ESP_RTL_SDR_PRESET_CUSTOM_HZ;
-        stream.frequency_hz = 96100000;
+        stream.frequency_hz =
+            (device_caps & (ESP_RTL_SDR_CAP_HF_UPCONVERTER |
+                            ESP_RTL_SDR_CAP_DIRECT_SAMPLING)) != 0
+                ? 147300u
+                : 96100000u;
         stream.sample_rate_sps = 960000;
         const esp_err_t start_err = esp_rtl_sdr_start(sdr, &stream);
         smoke_row("start", start_err == ESP_OK);
@@ -342,6 +389,7 @@ extern "C" void app_main(void)
             settle_ms(400);
             smoke_read(sdr, "first_read");
             run_quiet_soak(sdr, &stream);
+            run_lf_matrix(sdr, device_caps);
             run_l4_matrix(sdr);
 
             esp_rtl_sdr_metrics_t metrics;

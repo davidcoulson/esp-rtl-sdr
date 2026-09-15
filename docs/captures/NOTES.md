@@ -1,5 +1,16 @@
 # Capture evidence — 2026-09-11 official-driver AGC loop discovery
 
+## LF/HF follow-up — 2026-09-14
+
+A new labeled first-party V3c campaign captured Q-branch cold tunes at eight
+LF/HF frequencies and both normal/direct hot-transition directions. The
+derived sequence, NCO values, capture hashes, and evidence boundary are in
+[`v3c_lf_hf_direct_sampling_2026-09-14.txt`](v3c_lf_hf_direct_sampling_2026-09-14.txt).
+The implementation reuses the existing captured tuner cleanup/reinit tables.
+PC-side IQ reads prove the device accepted the mode/tune sequence and delivered
+bulk samples; they do not prove ESP32-P4 operation, RF reception, or DDH47
+decoding. The Blog V4 sub-500 kHz path remains host/build-verified only.
+
 ## Purpose
 
 Root-cause why the `blog_v3_r820t2` profile streams without crashing but
