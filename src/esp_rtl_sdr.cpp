@@ -901,7 +901,7 @@ static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_h
     return err;
 }
 
-static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
+static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 {
     esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
                                 std::size(kBlogV3TunerRepeaterOn));
@@ -913,6 +913,15 @@ static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
         if (err != ESP_OK) {
             return err;
         }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
+{
+    esp_err_t err = run_v3_tuner_reinit(h);
+    if (err != ESP_OK) {
+        return err;
     }
     err = run_profile_demod_if_restore(h);
     if (err == ESP_OK) {
@@ -2627,6 +2636,12 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         ret = run_sample_rate(handle, local.sample_rate_sps);
         if (ret != ESP_OK) {
             break;
+        }
+        if (rtl_profile_needs_cold_tuner_reinit(handle->profile, freq)) {
+            ret = run_v3_tuner_reinit(handle);
+            if (ret != ESP_OK) {
+                break;
+            }
         }
         if (!rtl_profile_uses_v3_direct_sampling(handle->profile, freq)) {
             ret = run_profile_demod_if_restore(handle);

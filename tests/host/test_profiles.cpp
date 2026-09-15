@@ -238,6 +238,28 @@ static void test_v3_direct_transition_records(void)
     EXPECT_EQ_U(kBlogV3TunerRepeaterOn[0].value, 0x0120u);
     EXPECT_EQ_U(kBlogV3TunerRepeaterOn[0].data[0], 0x18u);
 
+    EXPECT_TRUE(rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV3, 24000000u));
+    EXPECT_TRUE(rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV3, 99100000u));
+    EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV3, 23999999u));
+    EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV4, 99100000u));
+    EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::NooelecSmartV5,
+                                                     99100000u));
+
+    uint8_t full_tail_reg05 = 0;
+    uint8_t reinit_reg05 = 0;
+    for (size_t i = 0; i < std::size(kRtlInitTransfers); ++i) {
+        const auto &record = kRtlInitTransfers[i];
+        if (record.value == 0x0074u && record.index == 0x0610u &&
+            record.length >= 2 && record.data[0] == 0x05u) {
+            full_tail_reg05 = record.data[1];
+            if (i >= kRtlTunerReinitFirst && i <= kRtlTunerReinitLast) {
+                reinit_reg05 = record.data[1];
+            }
+        }
+    }
+    EXPECT_EQ_U(full_tail_reg05, 0xe3u);
+    EXPECT_EQ_U(reinit_reg05, 0x83u);
+
     const uint32_t retunes[] = {96100000u, 10000000u, 147300u, 96100000u, 147300u};
     const bool direct[] = {false, true, true, false, true};
     for (size_t i = 0; i < std::size(retunes); ++i) {

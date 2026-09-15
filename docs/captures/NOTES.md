@@ -541,3 +541,41 @@ This does not yet claim calibrated dB accuracy. The 99.1 MHz station is strong
 enough to clip at several settings, and the corrected candidate has not yet
 been flashed. Final acceptance requires a controlled weaker signal sweep on the
 real V3c, followed by a Blog V4 non-regression check.
+
+## V3c cold normal-tuner spectrum asymmetry (2026-09-15)
+
+OrcSDR captured 4,800,000-byte CU8 streams before FFT, filtering,
+demodulation, or UI rendering at 2.4 MS/s. With the same 27-inch-per-leg dipole
+and exact 99.100 MHz target, a V4 cold control measured 0.434 dB median
+spectrum-half separation. A V3c cold normal-tuner start measured 10.565 dB,
+with zero overruns, drops, or short transfers. Crossing the same running V3c
+through direct-Q at 10 MHz and returning immediately to 99.100 MHz reduced the
+separation to 0.431 dB.
+
+Diagnostic write shadowing added no hardware reads or writes and isolated the
+first differing owned state:
+
+```text
+cold BAD:           t05=e3 t06=30 t07=75 t0c=68 t17=20
+direct-return GOOD: t05=83 t06=30 t07=75 t0c=68 t17=20
+both demod:         d06=80 d08=4d d15=01 d19=38 d1a=11 d1b=12 db1=1a
+```
+
+The shared V4 initialization tail ends with tuner register 0x05 at `0xE3`.
+The already-working V3c direct-Q-to-normal path replays captured initialization
+records 363 through 419 and ends at `0x83`. Cold V3c normal-tuner startup now
+reuses that entire bounded sequence after sample-rate setup, followed by the
+existing 3.570 MHz demodulator-IF restore and exact-frequency tune. No register
+value was added or inferred, and gain calibration remains separate.
+
+Accepted pre-fix CU8 SHA-256 values:
+
+- V4 cold 99.1 control: `a1bdf7ec48967a29728deb2dd8de1cd3970f76d60910d9256aaa48f0d2774067`
+- V3c cold BAD 99.1: `3f969c510bb7e3557542dde9d6b320d293622479b4d63e1b92cb8ac27c0cd661`
+- V3c normal-to-direct-Q 10 MHz: `6d46037000b4876e720facf221fbf09d66a89e49bbc8238253c6444e6cd0dbd5`
+- V3c direct-Q-to-normal GOOD 99.1: `69b0e6cce2076aa4f7f3544a8a98592fa0024ee97298c2a4794ce15b566af54d`
+
+The 10 MHz dipole capture is transition evidence only; that antenna is not
+suitable for a 10 MHz reception claim. Post-fix cold-start, fixed-gain, power,
+reattach, audio/RDS, and V4 regression results are recorded after running the
+clean candidate on hardware.

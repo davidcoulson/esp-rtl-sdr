@@ -199,6 +199,13 @@ inline bool rtl_profile_uses_v3_direct_sampling(RtlProfileId profile, uint32_t f
     return profile == RtlProfileId::BlogV3 && frequency_hz < kR820T2NativeMinHz;
 }
 
+inline bool rtl_profile_needs_cold_tuner_reinit(RtlProfileId profile,
+                                                 uint32_t frequency_hz)
+{
+    return profile == RtlProfileId::BlogV3 &&
+           !rtl_profile_uses_v3_direct_sampling(profile, frequency_hz);
+}
+
 /** Captured RTL2832U Q-branch NCO: 22-bit negative corrected RF/28.8 MHz, truncated. */
 inline uint32_t rtl_profile_v3_direct_nco_word(uint32_t frequency_hz, int32_t ppm = 0)
 {
