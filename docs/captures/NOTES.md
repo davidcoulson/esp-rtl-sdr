@@ -608,5 +608,14 @@ Accepted post-fix CU8 SHA-256 values:
 - Direct-Q 10 MHz transition: `8047684037a753a3b2ef25e5c88b96758d51442a3b679ecbc83476823553b378`
 - Returned 22.9 dB 99.1: `b14cb407ed1e3250e3867b463a47785376156bd636de4650b134f775066f09e2`
 
-Audible 99.1 MHz reception, RDS/station identity, and the V4 non-regression are
-still separate pending acceptance claims.
+The V4 FM non-regression used the same FM-suitable dipole. A cold 99.100 MHz
+capture identified `blog_v4_r828d`, reported exact frequency at 2.4 MS/s, and
+recorded zero overruns, drops, short transfers, or clipping. Median spectrum-
+half separation was 0.859 dB and half-power delta was -1.129 dB. CU8 SHA-256:
+`9a8f0e2be6a478c37d892efdcbcba907666fcb2676878b813720105cb6b5aab4`.
+Separately, the user confirmed clear audio, RDS station text "99.1 The Beat of
+Eugene", and PTY "Adult Hit".
+
+V3c audible/RDS acceptance, explicit V4 physical-spectrum confirmation, and
+the V4 MLA-30+ 1.450 MHz HF-upconverter/transition regression remain separate
+pending claims.
