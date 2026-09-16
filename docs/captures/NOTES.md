@@ -616,6 +616,13 @@ half separation was 0.859 dB and half-power delta was -1.129 dB. CU8 SHA-256:
 Separately, the user confirmed clear audio, RDS station text "99.1 The Beat of
 Eugene", and PTY "Adult Hit".
 
-V3c audible/RDS acceptance, explicit V4 physical-spectrum confirmation, and
-the V4 MLA-30+ 1.450 MHz HF-upconverter/transition regression remain separate
-pending claims.
+With the MLA-30+ active loop, the V4 cold 1.450 MHz capture reported exact
+frequency at 2.4 MS/s through `HF_UPCONVERTER`, with zero overruns, drops,
+short transfers, or clipping. CU8 SHA-256:
+`8efac3ba6afae7074a90abb0ab5355ba31ea44c722bbb510a0ad333d9d67a3b7`.
+The exact-frequency route suite then crossed 28.8 MHz in both directions with
+continuous IQ and zero transport faults. Separately, the user confirmed
+understandable 1.450 MHz audio and the correct on-screen frequency/route.
+
+V3c audible/RDS acceptance, explicit V4 99.1 MHz physical-spectrum
+confirmation, and the strict V3c cold clipping threshold remain open claims.
