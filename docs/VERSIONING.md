@@ -1,11 +1,11 @@
 # Versioning and release stages
 
-`esp_rtl_sdr` uses Semantic Versioning: `MAJOR.MINOR.PATCH[-stage.N]`.
+`esp_rtl_sdr` uses Semantic Versioning: `MAJOR.MINOR.PATCH[-stageN]`.
 
-- **alpha.N** — incomplete experimental work. APIs and behavior may change.
-- **beta.N** — the intended feature set is substantially present, but API or
+- **alphaN** — incomplete experimental work. APIs and behavior may change.
+- **betaN** — the intended feature set is substantially present, but API or
   hardware behavior may still change as validation expands.
-- **rc.N** — a release candidate for the exact stable `MAJOR.MINOR.PATCH`.
+- **rcN** — a release candidate for the exact stable `MAJOR.MINOR.PATCH`.
   Scope and public API are frozen; only release-blocking fixes, evidence, and
   release documentation may change. Any code fix increments `N`.
 - **No suffix** — the stable release.
