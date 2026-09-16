@@ -6,8 +6,8 @@ wins for *what is true right now*.
 Same discipline as [TheOrc PROJECT_TRUTH](https://github.com/hardcoreerik/TheOrc):
 claims need evidence labels; oversell is a bug; retract rather than spin.
 
-Snapshot date: **2026-09-14**
-Version: **0.8.0-rc2** (EXPERIMENTAL multi-dongle stabilization; Blog V4 routing preserved; Blog V3/V3c/R860 identification+streaming hardware-verified; matched-IF tuning hardware-verified across hot retune, reattach, and a user-observed battery cold boot; gain and Nooelec still provisional; not production-ready)
+Snapshot date: **2026-09-15**
+Version: **0.8.0-rc3** (EXPERIMENTAL multi-dongle stabilization; Blog V3c cold normal-tuner initialization and LF/HF transitions hardware-verified; Blog V4 FM and HF-upconverter regressions hardware-verified; true LF reception, absolute V3c gain calibration, and Nooelec remain provisional; not production-ready)
 Local repo: `F:\Ai\ESP_RTL_SDR\`  
 Remote: **https://github.com/hardcoreerik/esp-rtl-sdr**  
 Open-source honesty: [docs/AI_DEVELOPMENT_DISCLOSURE.md](docs/AI_DEVELOPMENT_DISCLOSURE.md) ·
