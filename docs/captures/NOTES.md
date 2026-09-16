@@ -597,8 +597,10 @@ Post-fix V3c results on the clean candidate, using the FM-suitable
   antenna is unsuitable for a 10 MHz reception claim.
 - Clipping remains an open acceptance gate: the repeated cold 22.9 dB capture
   measured 0.101271%, just above the strict <0.1% requirement, while the
-  returned capture measured 0.075958%. This did not reintroduce spectrum
-  asymmetry and does not justify changing the gain table in this fix.
+  returned capture measured 0.075958%. A final cold repeat measured 0.340042%
+  clipping while remaining balanced at 0.194 dB median-half separation and
+  -0.652 dB half-power delta. This does not reintroduce spectrum asymmetry and
+  does not justify changing the gain table in this fix.
 
 Accepted post-fix CU8 SHA-256 values:
 
@@ -607,6 +609,7 @@ Accepted post-fix CU8 SHA-256 values:
 - Cold 22.9 dB 99.1 repeat: `ceb9e64cc531b51a373941e29cb5049d48e4c8636bebdd3c68839219eb8cabcd`
 - Direct-Q 10 MHz transition: `8047684037a753a3b2ef25e5c88b96758d51442a3b679ecbc83476823553b378`
 - Returned 22.9 dB 99.1: `b14cb407ed1e3250e3867b463a47785376156bd636de4650b134f775066f09e2`
+- Final cold 22.9 dB 99.1: `5b3ae0ccbd0101383f3620c09a6cc47be135c55e59c62b9c0d86faaacd6b442c`
 
 The V4 FM non-regression used the same FM-suitable dipole. A cold 99.100 MHz
 capture identified `blog_v4_r828d`, reported exact frequency at 2.4 MS/s, and
@@ -624,5 +627,10 @@ The exact-frequency route suite then crossed 28.8 MHz in both directions with
 continuous IQ and zero transport faults. Separately, the user confirmed
 understandable 1.450 MHz audio and the correct on-screen frequency/route.
 
-V3c audible/RDS acceptance, explicit V4 99.1 MHz physical-spectrum
-confirmation, and the strict V3c cold clipping threshold remain open claims.
+Separately, the user confirmed normal understandable V3c audio, complete RDS
+information, and a physically restored two-sided spectrum at 99.1 MHz. The
+user also confirmed that the V4 99.1 MHz physical spectrum looked normal.
+
+The strict V3c cold 22.9 dB clipping threshold remains open. True LF reception
+also remains unverified because no appropriate LF antenna and signal source
+were used.
