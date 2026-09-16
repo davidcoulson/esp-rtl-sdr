@@ -903,13 +903,8 @@ static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_h
 
 static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 {
-    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
-                                std::size(kBlogV3TunerRepeaterOn));
-    if (err != ESP_OK) {
-        return err;
-    }
     for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
-        err = run_record(h, kRtlInitTransfers[i], false);
+        esp_err_t err = run_record(h, kRtlInitTransfers[i], false);
         if (err != ESP_OK) {
             return err;
         }
@@ -919,7 +914,11 @@ static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 
 static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
 {
-    esp_err_t err = run_v3_tuner_reinit(h);
+    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
+                                std::size(kBlogV3TunerRepeaterOn));
+    if (err == ESP_OK) {
+        err = run_v3_tuner_reinit(h);
+    }
     if (err != ESP_OK) {
         return err;
     }
@@ -2637,14 +2636,27 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (ret != ESP_OK) {
             break;
         }
-        if (rtl_profile_needs_cold_tuner_reinit(handle->profile, freq)) {
-            ret = run_v3_tuner_reinit(handle);
+        const bool cold_tuner_reinit =
+            rtl_profile_needs_cold_tuner_reinit(handle->profile, freq);
+        if (cold_tuner_reinit) {
+            ret = run_records(handle, kBlogV3TunerRepeaterOn,
+                              std::size(kBlogV3TunerRepeaterOn));
+            if (ret == ESP_OK) {
+                ret = run_v3_tuner_reinit(handle);
+            }
             if (ret != ESP_OK) {
                 break;
             }
         }
         if (!rtl_profile_uses_v3_direct_sampling(handle->profile, freq)) {
             ret = run_profile_demod_if_restore(handle);
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+        if (cold_tuner_reinit) {
+            ret = run_records(handle, kBlogV3TunerRepeaterOn,
+                              std::size(kBlogV3TunerRepeaterOn));
             if (ret != ESP_OK) {
                 break;
             }

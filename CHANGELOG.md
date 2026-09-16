@@ -6,11 +6,14 @@
 
 - **Blog V3/V3c cold normal-tuner initialization:** cold starts at or above
   24 MHz now finish with the same captured R820T2/R860 reinitialization slice
-  already used by the verified direct-Q-to-normal transition. Raw 2.4 MS/s
+  and tuner-repeater ordering already used by the verified direct-Q-to-normal
+  transition. Raw 2.4 MS/s
   captures isolated the former path at tuner register state `0x05=0xE3` with a
   roughly 10 dB spectrum-half imbalance, while the transition path ended at
   `0x05=0x83` with a 0.431 dB median separation. The fix replays the captured
-  sequence rather than hardcoding a register value. V4, Nooelec, direct-Q,
+  sequence rather than hardcoding a register value. Post-fix V3c cold and
+  direct-Q-return captures at 99.100 MHz were balanced with zero transport
+  faults. V4, Nooelec, direct-Q,
   hot normal retunes, gain tables, and public APIs are unchanged.
 
 ### Changed
