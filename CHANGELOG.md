@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.8.0-rc3 (2026-09-15) — V3c cold-start and LF/HF acceptance
+
+### Fixed
+
+- **Blog V3/V3c cold normal-tuner initialization:** cold starts at or above
+  24 MHz now finish with the same captured R820T2/R860 reinitialization slice
+  and tuner-repeater ordering already used by the verified direct-Q-to-normal
+  transition. Raw 2.4 MS/s
+  captures isolated the former path at tuner register state `0x05=0xE3` with a
+  roughly 10 dB spectrum-half imbalance, while the transition path ended at
+  `0x05=0x83` with a 0.431 dB median separation. The fix replays the captured
+  sequence rather than hardcoding a register value. Post-fix V3c cold and
+  direct-Q-return captures at 99.100 MHz were balanced with zero transport
+  faults. V4, Nooelec, direct-Q,
+  hot normal retunes, gain tables, and public APIs are unchanged.
+
+### Changed
+
+- **Blog V4 experimental LF policy (host/build-verified only):** custom tuning now
+  preserves exact Hz and accepts 24 kHz through 1.766 GHz. Below 28.8 MHz the
+  existing V4 upconverter mapping remains `tuner = requested RF + 28.8 MHz`, so
+  DDH47 at 147.300 kHz maps to 28.947300 MHz.
+- **Blog V3/V3c Q-branch LF/HF (capture-derived, experimental):** below 24 MHz,
+  the driver now bypasses/shuts down the R820T2-family tuner, enables Q-branch
+  direct sampling, and programs the captured exact-Hz RTL2832 NCO. Both hot
+  transition directions reuse existing captured tuner cleanup/reinit records.
+  A real V3c completed PC-side cold tunes and IQ reads at 60 kHz through
+  23.999999 MHz plus normal/direct hot transitions. Tuner gain setters return
+  `ERR_UNSUPPORTED` while direct sampling is selected. ESP32-P4 RF reception
+  and DDH47 decoding remain open; Nooelec remains fail-closed below 24 MHz.
 
 ## 0.8.0-rc2 (2026-09-14) — EXPERIMENTAL multi-dongle
 

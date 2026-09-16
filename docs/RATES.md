@@ -4,6 +4,9 @@
 **Policy:** any rate **within hardware windows** after quantize. Recommended
 named rates remain for discovery and passport defaults.
 
+Sample-rate policy is independent of center-frequency policy. `CUSTOM_HZ`
+frequency requests preserve exact Hz; no sample-rate window changed.
+
 Programming: RTL2832U resampler  
 `ratio = (28.8e6 << 22) / sps` (masked `& ~3`), via clean-room Blog V4 EP0 slice.
 

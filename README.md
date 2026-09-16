@@ -3,13 +3,16 @@
 **Make RTL2832U SDR dongles first-class peripherals on ESP32-P4** — continuous I/Q over USB Host, with a real embedded driver API.
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-![Status](https://img.shields.io/badge/version-0.8.0--rc2-orange)
+![Status](https://img.shields.io/badge/version-0.8.0--rc3-orange)
 [![GitHub](https://img.shields.io/badge/github-esp--rtl--sdr-black)](https://github.com/hardcoreerik/esp-rtl-sdr)
 ![Target](https://img.shields.io/badge/ESP32--P4-HS_USB-green)
 
 **Not a librtlsdr port.** Clean-room Blog V4 USB profile · provisional Nooelec SMArt v5 · provisional Blog V3 stream · stand-alone ESP-IDF component · fail-closed lifecycle
 
-**Status authority:** [`PROJECT_TRUTH.md`](PROJECT_TRUTH.md) wins if anything here disagrees. This is **0.8.0-rc2** experimental — early, public, honest.
+**Status authority:** [`PROJECT_TRUTH.md`](PROJECT_TRUTH.md) wins if anything here disagrees. This is **0.8.0-rc3** experimental — early, public, honest.
+
+Release numbers and `alpha` / `beta` / `rc` meanings are defined in
+[`docs/VERSIONING.md`](docs/VERSIONING.md).
 
 ---
 
@@ -66,7 +69,7 @@ We are **not** chasing full librtlsdr feature parity (tuner IF filter still open
 | Item | Notes |
 |---|---|
 | **MCU** | **ESP32-P4** with High-Speed USB Host (e.g. M5Stack Tab5, Waveshare P4 kit) |
-| **Dongle** | **RTL-SDR Blog V4** (primary) — `RTLSDRBlog` / `Blog V4`. **0.8.0-rc2** also recognizes provisional **Nooelec NESDR SMArt v5** and provisional **Blog V3** stream (R820T2 `0x34` remap; community soak). Bare `0bda:2838` is never assumed V4. |
+| **Dongle** | **RTL-SDR Blog V4** (primary) — `RTLSDRBlog` / `Blog V4`. **0.8.0-rc3** also recognizes provisional **Nooelec NESDR SMArt v5** and provisional **Blog V3** stream (R820T2 `0x34` remap; community soak). Bare `0bda:2838` is never assumed V4. |
 | **Tooling** | ESP-IDF **≥ 5.5** with `esp32p4` support (OrcSDR Tab5 uses 5.5.4) |
 | **Antenna** | For RF; compile/smoke works without RF |
 
@@ -246,7 +249,7 @@ Design contract: [`docs/API.md`](docs/API.md) · header: [`include/esp_rtl_sdr.h
 | `set_tuner_gain_mode(MANUAL\|AUTO)` | MANUAL ladder; AUTO measured R828D AGC (`CAP_GAIN_AUTO`, 0.7.8+). Streaming = async EP0. |
 | `set/get_rtl_agc` | RTL2832 digital AGC (`CAP_RTL_AGC`); not tuner AUTO. **get** = requested shadow, not readback. |
 | `set/get_bias_tee` | Measured SYS EP0 (CAP_BIAS_TEE); need claimed stream |
-| HF (0.7.15 routing correction) | **500 kHz…1766 MHz**; RF&lt;28.8 MHz uses +28.8 MHz LO, RF≤28.8 MHz selects Cable-2 and GPIO5-low (`CAP_HF_UPCONVERTER`) |
+| HF/LF (unreleased) | Blog V4 accepts **24 kHz…1766 MHz** with exact-Hz requests; RF&lt;28.8 MHz uses +28.8 MHz LO and Cable-2 (`CAP_HF_UPCONVERTER`). Blog V3/V3c uses capture-derived Q-branch direct sampling below 24 MHz (`CAP_DIRECT_SAMPLING`); its tuner gain is bypassed there. Both paths are experimental and await ESP32-P4 RF acceptance. Nooelec remains fail-closed below 24 MHz. |
 
 Evidence: [`docs/PHASE3_CAPTURE_REPORT.md`](docs/PHASE3_CAPTURE_REPORT.md), [`docs/AGC_IF_CAPTURE.md`](docs/AGC_IF_CAPTURE.md), and the checked-in clean-room transfer table. The 0.7.15 routing composition is host/build verified only; P4 GPIO and RF acceptance remain open.
 

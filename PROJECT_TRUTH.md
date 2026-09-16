@@ -6,8 +6,8 @@ wins for *what is true right now*.
 Same discipline as [TheOrc PROJECT_TRUTH](https://github.com/hardcoreerik/TheOrc):
 claims need evidence labels; oversell is a bug; retract rather than spin.
 
-Snapshot date: **2026-09-11**
-Version: **0.8.0-rc2** (EXPERIMENTAL multi-dongle stabilization; Blog V4 routing preserved; Blog V3/V3c/R860 identification+streaming hardware-verified; matched-IF tuning hardware-verified across hot retune, reattach, and a user-observed battery cold boot; gain and Nooelec still provisional; not production-ready)
+Snapshot date: **2026-09-15**
+Version: **0.8.0-rc3** (EXPERIMENTAL multi-dongle stabilization; Blog V3c cold normal-tuner initialization and LF/HF transitions hardware-verified; Blog V4 FM and HF-upconverter regressions hardware-verified; true LF reception, absolute V3c gain calibration, and Nooelec remain provisional; not production-ready)
 Local repo: `F:\Ai\ESP_RTL_SDR\`  
 Remote: **https://github.com/hardcoreerik/esp-rtl-sdr**  
 Open-source honesty: [docs/AI_DEVELOPMENT_DISCLOSURE.md](docs/AI_DEVELOPMENT_DISCLOSURE.md) ·
@@ -101,7 +101,8 @@ Product vision: **`docs/VISION.md`**. Silicon / DS map: **`docs/SILICON.md`**.
 | Tab5 / Waveshare Blog V4 RF | **Provenance** | OrcSDR |
 | Re-verify from *this* tree on hardware | **Planned** | |
 | Gain / bias-T hardware | **Implemented** (tables from PC USBPcap) | Lab 2026-08-12; **not** yet Hardware-verified from *this* tree on P4; no multimeter DC |
-| HF upconverter path CAP | **Implemented (routing corrected 0.7.15)** | RF&lt;28.8 MHz → tuner RF+28.8e6; RF≤28.8 MHz → Cable-2/GPIO5-low; host/build verified, physical FE soak open |
+| Blog V4 HF/LF upconverter path CAP | **Implemented; sub-500 kHz experimental (unreleased)** | Exact-Hz RF requests from 24 kHz; RF&lt;28.8 MHz → tuner RF+28.8e6; RF≤28.8 MHz → Cable-2/GPIO5-low. Host tests cover 24 kHz, DDH47 147.300 kHz, exact-Hz preservation, band edges, and VHF/UHF regression. Physical LF reception remains open. |
+| Blog V3/V3c direct-sampling LF/HF | **Implemented from first-party V3c capture; experimental (unreleased)** | Below 24 MHz, uses Q-branch direct sampling and the captured exact-Hz RTL2832 NCO sequence; both normal/direct hot transitions are implemented. PC-side V3c control/IQ captures cover 60 kHz, 135.6 kHz, 147.3 kHz, 472.5 kHz, 1.000123 MHz, 10 MHz, 20 MHz, and 23.999999 MHz. ESP32-P4 RF reception/decoding remains open. Tuner gain is unavailable while bypassed. Nooelec remains out of scope and fail-closed below 24 MHz. |
 | R828D stage gain / input / notches | **Planned** | |
 | Adaptive USB URB | **Planned** | |
 | Beacon ppm learn | **Planned** | |

@@ -838,6 +838,8 @@ static esp_err_t run_sample_rate(esp_rtl_sdr_handle *h, uint32_t sample_rate_sps
     return ESP_OK;
 }
 
+static esp_err_t run_records(esp_rtl_sdr_handle *h, const RtlControlRecord *tab, size_t n);
+
 static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
 {
     const uint32_t demod_if_hz = rtl_profile_demod_if_restore_hz(h->profile);
@@ -856,6 +858,75 @@ static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
              static_cast<unsigned>(demod_if_hz),
              static_cast<unsigned>(kRtlStandardIfLast - kRtlStandardIfFirst + 1));
     return ESP_OK;
+}
+
+static esp_err_t run_v3_direct_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
+{
+    const uint32_t nco =
+        rtl_profile_v3_direct_nco_word(frequency_hz, h->freq_correction_ppm);
+    const RtlControlRecord records[] = {
+        {0x0120, 0x0011, 0x40, 1, {0x10, 0, 0, 0, 0, 0, 0, 0}},
+        {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}},
+        {0x1920, 0x0011, 0x40, 1,
+         {static_cast<uint8_t>(nco >> 16), 0, 0, 0, 0, 0, 0, 0}},
+        {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}},
+        {0x1a20, 0x0011, 0x40, 1,
+         {static_cast<uint8_t>(nco >> 8), 0, 0, 0, 0, 0, 0, 0}},
+        {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}},
+        {0x1b20, 0x0011, 0x40, 1,
+         {static_cast<uint8_t>(nco), 0, 0, 0, 0, 0, 0, 0}},
+        {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}},
+    };
+    ESP_LOGI(TAG, "V3 direct tune rf=%u Hz ppm=%d nco=%06x input=Q",
+             static_cast<unsigned>(frequency_hz), static_cast<int>(h->freq_correction_ppm),
+             static_cast<unsigned>(nco));
+    return run_records(h, records, std::size(records));
+}
+
+static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
+{
+    for (size_t i = 0; i <= kRtlTunerCleanupLast; ++i) {
+        esp_err_t err = run_record(h, kRtlCleanupTransfers[i], false);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    esp_err_t err = run_records(h, kBlogV3DirectEnable, std::size(kBlogV3DirectEnable));
+    if (err == ESP_OK) {
+        err = run_v3_direct_tune(h, frequency_hz);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "V3 RF mode NORMAL_TUNER -> DIRECT_SAMPLING_Q");
+    }
+    return err;
+}
+
+static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
+{
+    for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
+        esp_err_t err = run_record(h, kRtlInitTransfers[i], false);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
+{
+    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
+                                std::size(kBlogV3TunerRepeaterOn));
+    if (err == ESP_OK) {
+        err = run_v3_tuner_reinit(h);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = run_profile_demod_if_restore(h);
+    if (err == ESP_OK) {
+        err = run_records(h, kBlogV3DirectDisable, std::size(kBlogV3DirectDisable));
+    }
+    return err;
 }
 
 /**
@@ -911,6 +982,36 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
         }
     }
     return ESP_OK;
+}
+
+static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
+                                  uint32_t previous_frequency_hz)
+{
+    const bool direct = rtl_profile_uses_v3_direct_sampling(h->profile, frequency_hz);
+    const bool was_direct = previous_frequency_hz != 0 &&
+                            rtl_profile_uses_v3_direct_sampling(h->profile,
+                                                                previous_frequency_hz);
+    if (direct) {
+        return was_direct ? run_v3_direct_tune(h, frequency_hz)
+                          : run_v3_enter_direct(h, frequency_hz);
+    }
+    if (was_direct) {
+        esp_err_t err = run_v3_leave_direct(h);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = run_records(h, kBlogV3TunerRepeaterOn,
+                          std::size(kBlogV3TunerRepeaterOn));
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = run_tune(h, frequency_hz);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "V3 RF mode DIRECT_SAMPLING_Q -> NORMAL_TUNER");
+        }
+        return err;
+    }
+    return run_tune(h, frequency_hz);
 }
 
 /**
@@ -1216,7 +1317,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
         (h->pending_retune_hz != 0) ? h->pending_retune_hz : freq;
 
     h->frontend_applied_valid = false;
-    esp_err_t err = run_tune(h, tune_hz);
+    esp_err_t err = run_profile_tune(h, tune_hz, h->frequency_hz);
     if (err == ESP_OK) {
         err = run_band_frontend(h, tune_hz);
     }
@@ -1224,14 +1325,20 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
         h->frequency_hz = tune_hz;
         h->metrics.frequency_hz = tune_hz;
         h->preferred_frequency_hz = tune_hz;
+        if (rtl_profile_uses_v3_direct_sampling(h->profile, tune_hz)) {
+            /* The tuner is bypassed in V3 Q-branch mode. */
+            h->pending_gain = false;
+            h->pending_gain_mode = false;
+        }
         if (h->pending_retune_hz == tune_hz) {
             h->pending_retune_hz = 0;
         }
-        ESP_LOGI(TAG, "hot retune applied rf=%u Hz tuner=%u Hz",
+        ESP_LOGI(TAG, "hot retune applied rf=%u Hz tuner=%u Hz direct=%d",
                  static_cast<unsigned>(tune_hz),
-                 static_cast<unsigned>(esp_rtl_sdr_tuner_frequency_hz(tune_hz)));
+                 static_cast<unsigned>(rtl_profile_tuner_frequency_hz(h->profile, tune_hz)),
+                 rtl_profile_uses_v3_direct_sampling(h->profile, tune_hz) ? 1 : 0);
     } else {
-        ESP_LOGW(TAG, "hot retune EP0 failed: %s (PLL/route may be partially applied)",
+        ESP_LOGW(TAG, "hot retune EP0 failed: %s (tune/route may be partially applied)",
                  esp_rtl_sdr_err_to_name(err));
         if (h->pending_retune_hz == tune_hz) {
             h->pending_retune_hz = 0;
@@ -2514,8 +2621,8 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
 
         if (rtl_profile_uses_r820t2_i2c_remap(handle->profile)) {
             /* Provisional R820T2 path (Blog V3 + Nooelec): same USB IR template
-             * remapping 0x74→0x34. Experimental/community soak — not Hardware-verified.
-             * No V4 HF Cable-2/GPIO5; RF < 24 MHz already rejected above. */
+             * remapping 0x74→0x34. Blog V3 can switch to its separately captured
+             * direct path; Nooelec remains fail-closed below 24 MHz. */
             ESP_LOGW(TAG,
                      "%s: provisional R820T2 stream (I2C 0x34 remap); "
                      "maintainer-unverified — please report soak results",
@@ -2529,11 +2636,32 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (ret != ESP_OK) {
             break;
         }
-        ret = run_profile_demod_if_restore(handle);
-        if (ret != ESP_OK) {
-            break;
+        const bool cold_tuner_reinit =
+            rtl_profile_needs_cold_tuner_reinit(handle->profile, freq);
+        if (cold_tuner_reinit) {
+            ret = run_records(handle, kBlogV3TunerRepeaterOn,
+                              std::size(kBlogV3TunerRepeaterOn));
+            if (ret == ESP_OK) {
+                ret = run_v3_tuner_reinit(handle);
+            }
+            if (ret != ESP_OK) {
+                break;
+            }
         }
-        ret = run_tune(handle, freq);
+        if (!rtl_profile_uses_v3_direct_sampling(handle->profile, freq)) {
+            ret = run_profile_demod_if_restore(handle);
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+        if (cold_tuner_reinit) {
+            ret = run_records(handle, kBlogV3TunerRepeaterOn,
+                              std::size(kBlogV3TunerRepeaterOn));
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+        ret = run_profile_tune(handle, freq, 0);
         if (ret != ESP_OK) {
             break;
         }
@@ -3931,6 +4059,13 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
             set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
             return ESP_RTL_SDR_ERR_NOT_CLAIMED;
         }
+        const uint32_t rf_hz = handle->pending_retune_hz != 0
+                                   ? handle->pending_retune_hz
+                                   : handle->frequency_hz;
+        if (rtl_profile_uses_v3_direct_sampling(handle->profile, rf_hz)) {
+            set_error_unlocked(handle, ESP_RTL_SDR_ERR_UNSUPPORTED);
+            return ESP_RTL_SDR_ERR_UNSUPPORTED;
+        }
         /* Default get() is AUTO before any EP0. First AUTO after claim must write. */
         const bool already =
             (mode == ESP_RTL_SDR_GAIN_MODE_AUTO) ? handle->tuner_auto_applied
@@ -3995,6 +4130,13 @@ esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth
         if (!handle->iface_claimed || handle->dev == nullptr) {
             set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
             return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        }
+        const uint32_t rf_hz = handle->pending_retune_hz != 0
+                                   ? handle->pending_retune_hz
+                                   : handle->frequency_hz;
+        if (rtl_profile_uses_v3_direct_sampling(handle->profile, rf_hz)) {
+            set_error_unlocked(handle, ESP_RTL_SDR_ERR_UNSUPPORTED);
+            return ESP_RTL_SDR_ERR_UNSUPPORTED;
         }
         handle->gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL;
         handle->pending_gain_mode = false; /* cancel queued AUTO */

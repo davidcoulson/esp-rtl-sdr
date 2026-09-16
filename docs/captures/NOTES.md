@@ -1,5 +1,16 @@
 # Capture evidence — 2026-09-11 official-driver AGC loop discovery
 
+## LF/HF follow-up — 2026-09-14
+
+A new labeled first-party V3c campaign captured Q-branch cold tunes at eight
+LF/HF frequencies and both normal/direct hot-transition directions. The
+derived sequence, NCO values, capture hashes, and evidence boundary are in
+[`v3c_lf_hf_direct_sampling_2026-09-14.txt`](v3c_lf_hf_direct_sampling_2026-09-14.txt).
+The implementation reuses the existing captured tuner cleanup/reinit tables.
+PC-side IQ reads prove the device accepted the mode/tune sequence and delivered
+bulk samples; they do not prove ESP32-P4 operation, RF reception, or DDH47
+decoding. The Blog V4 sub-500 kHz path remains host/build-verified only.
+
 ## Purpose
 
 Root-cause why the `blog_v3_r820t2` profile streams without crashing but
@@ -530,3 +541,116 @@ This does not yet claim calibrated dB accuracy. The 99.1 MHz station is strong
 enough to clip at several settings, and the corrected candidate has not yet
 been flashed. Final acceptance requires a controlled weaker signal sweep on the
 real V3c, followed by a Blog V4 non-regression check.
+
+## V3c cold normal-tuner spectrum asymmetry (2026-09-15)
+
+OrcSDR captured 4,800,000-byte CU8 streams before FFT, filtering,
+demodulation, or UI rendering at 2.4 MS/s. With the same 27-inch-per-leg dipole
+and exact 99.100 MHz target, a V4 cold control measured 0.434 dB median
+spectrum-half separation. A V3c cold normal-tuner start measured 10.565 dB,
+with zero overruns, drops, or short transfers. Crossing the same running V3c
+through direct-Q at 10 MHz and returning immediately to 99.100 MHz reduced the
+separation to 0.431 dB.
+
+Diagnostic write shadowing added no hardware reads or writes and isolated the
+first differing owned state:
+
+```text
+cold BAD:           t05=e3 t06=30 t07=75 t0c=68 t17=20
+direct-return GOOD: t05=83 t06=30 t07=75 t0c=68 t17=20
+both demod:         d06=80 d08=4d d15=01 d19=38 d1a=11 d1b=12 db1=1a
+```
+
+The shared V4 initialization tail ends with tuner register 0x05 at `0xE3`.
+The already-working V3c direct-Q-to-normal path replays captured initialization
+records 363 through 419 and ends at `0x83`. Cold V3c normal-tuner startup now
+reuses that entire bounded sequence after sample-rate setup, followed by the
+existing 3.570 MHz demodulator-IF restore and exact-frequency tune. The first
+hardware candidate exposed one missing ordering detail: the captured tuner
+repeater command must run both before the replay slice and again immediately
+before exact tuning, matching the already-working direct-Q return path. Adding
+that existing captured command restored stream startup; no register value was
+added or inferred, and gain calibration remains separate.
+
+Accepted pre-fix CU8 SHA-256 values:
+
+- V4 cold 99.1 control: `a1bdf7ec48967a29728deb2dd8de1cd3970f76d60910d9256aaa48f0d2774067`
+- V3c cold BAD 99.1: `3f969c510bb7e3557542dde9d6b320d293622479b4d63e1b92cb8ac27c0cd661`
+- V3c normal-to-direct-Q 10 MHz: `6d46037000b4876e720facf221fbf09d66a89e49bbc8238253c6444e6cd0dbd5`
+- V3c direct-Q-to-normal GOOD 99.1: `69b0e6cce2076aa4f7f3544a8a98592fa0024ee97298c2a4794ce15b566af54d`
+
+Post-fix V3c results on the clean candidate, using the FM-suitable
+27-inch-per-leg dipole at 99.100 MHz:
+
+- Boot returned directly to Home and the physical spectrum appeared balanced
+  (user-confirmed separately from serial and raw-IQ evidence).
+- Cold start after a full power cycle and cold start after USB reattach both
+  reached exact 99.100 MHz at 2.4 MS/s with zero overruns, drops, and short
+  transfers. Median-half separation was 1.166 dB after power cycle and 0.023 dB
+  after reattach; half-power delta was -0.333 dB and 0.875 dB respectively.
+- At explicit 22.9 dB manual gain, a repeated cold capture measured 0.436 dB
+  median-half separation and 1.338 dB half-power delta. The direct-Q return
+  measured 0.689 dB and 1.493 dB. Both were transport-clean and ended at the
+  same reported manual gain.
+- The 99.100 MHz -> 10 MHz direct-Q -> 99.100 MHz transition was exact and
+  transport-clean. The 10 MHz dipole result is transition evidence only; that
+  antenna is unsuitable for a 10 MHz reception claim.
+- Clipping remains an open acceptance gate: the repeated cold 22.9 dB capture
+  measured 0.101271%, just above the strict <0.1% requirement, while the
+  returned capture measured 0.075958%. A final cold repeat measured 0.340042%
+  clipping while remaining balanced at 0.194 dB median-half separation and
+  -0.652 dB half-power delta. This does not reintroduce spectrum asymmetry and
+  does not justify changing the gain table in this fix.
+
+Accepted post-fix CU8 SHA-256 values:
+
+- Power-cycle cold 99.1: `038b9e877ca654557b652dbd8551f66592e603cde7a99241e6cd41c8b1f94b88`
+- USB-reattach dipole 99.1: `118a26c71cae6f3e8be899450c6ce0fe5087baf2050c0f097726c6b3f8afb431`
+- Cold 22.9 dB 99.1 repeat: `ceb9e64cc531b51a373941e29cb5049d48e4c8636bebdd3c68839219eb8cabcd`
+- Direct-Q 10 MHz transition: `8047684037a753a3b2ef25e5c88b96758d51442a3b679ecbc83476823553b378`
+- Returned 22.9 dB 99.1: `b14cb407ed1e3250e3867b463a47785376156bd636de4650b134f775066f09e2`
+- Final cold 22.9 dB 99.1: `5b3ae0ccbd0101383f3620c09a6cc47be135c55e59c62b9c0d86faaacd6b442c`
+
+The V4 FM non-regression used the same FM-suitable dipole. A cold 99.100 MHz
+capture identified `blog_v4_r828d`, reported exact frequency at 2.4 MS/s, and
+recorded zero overruns, drops, short transfers, or clipping. Median spectrum-
+half separation was 0.859 dB and half-power delta was -1.129 dB. CU8 SHA-256:
+`9a8f0e2be6a478c37d892efdcbcba907666fcb2676878b813720105cb6b5aab4`.
+Separately, the user confirmed clear audio, RDS station text "99.1 The Beat of
+Eugene", and PTY "Adult Hit".
+
+With the MLA-30+ active loop, the V4 cold 1.450 MHz capture reported exact
+frequency at 2.4 MS/s through `HF_UPCONVERTER`, with zero overruns, drops,
+short transfers, or clipping. CU8 SHA-256:
+`8efac3ba6afae7074a90abb0ab5355ba31ea44c722bbb510a0ad333d9d67a3b7`.
+The exact-frequency route suite then crossed 28.8 MHz in both directions with
+continuous IQ and zero transport faults. Separately, the user confirmed
+understandable 1.450 MHz audio and the correct on-screen frequency/route.
+
+Separately, the user confirmed normal understandable V3c audio, complete RDS
+information, and a physically restored two-sided spectrum at 99.1 MHz. The
+user also confirmed that the V4 99.1 MHz physical spectrum looked normal.
+
+The strict V3c cold 22.9 dB clipping threshold remains open. True LF reception
+also remains unverified because no appropriate LF antenna and signal source
+were used.
+
+### V3c 99.1 MHz clipping sweep
+
+A follow-up cold-start sweep used the same V3c and FM-suitable 27-inch-per-leg
+dipole. Every point reported exact 99.100 MHz, balanced spectrum halves, and
+zero overruns, drops, or short transfers:
+
+| Nominal gain | Clipping | Median-half separation | Half-power delta |
+| ---: | ---: | ---: | ---: |
+| 0.0 dB | 0.000000% | 0.634 dB | -0.155 dB |
+| 0.9 dB | 0.000000% | 0.885 dB | -0.501 dB |
+| 7.7 dB | 0.000000% | 0.026 dB | -0.439 dB |
+| 14.4 dB | 0.007021% | 0.303 dB | -0.351 dB |
+| 22.9 dB | 0.340042% | 0.194 dB | -0.652 dB |
+
+The highest tested setting below both the 0.1% requirement and the preferred
+0.02% margin was 14.4 dB. This isolates the failure as strong-signal clipping
+at the forced 22.9 dB setting, not a recurrence of the one-sided-spectrum
+initialization defect. Making 22.9 dB itself pass would require separate
+IF/VGA attenuation evidence or external RF attenuation; this fix does neither.

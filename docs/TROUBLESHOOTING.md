@@ -24,7 +24,7 @@ Truth of claims: [`../PROJECT_TRUTH.md`](../PROJECT_TRUTH.md).
 | `ERR_NOT_V4` / `UNSUPPORTED_DEVICE` | Stick present, identity rejected | Need official Blog V4 `0bda:2838` + strings; generic eBay RTL not claimed |
 | `ERR_BUSY` on start | Already streaming / stopping | `stop` first; check `get_state` |
 | `ERR_BAD_RATE` | Outside windows / quantize fail | See [`RATES.md`](RATES.md); low min **225001** Hz |
-| `ERR_BAD_FREQ` | LO policy reject | 24 MHz…1766 MHz, 1 kHz quant; not 0 |
+| `ERR_BAD_FREQ` | Frequency/profile policy reject | Arithmetic range is exact-Hz 24 kHz…1766 MHz; Nooelec still rejects below 24 MHz |
 | `ERR_REENTRANT` | Lifecycle from callback | Defer start/stop/uninstall/reset to app task |
 | `ERR_USB` / `TIMEOUT` | Control or bulk path | Cable, power, hub; retry; check logs |
 | `ERR_FAULT` | Handle faulted | `reset` if idle, else `uninstall` |

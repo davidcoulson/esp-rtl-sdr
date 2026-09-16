@@ -57,7 +57,7 @@ Expected: `RESULT passed=N failed=0` and exit code 0.
 | Capabilities | full “on” mask; GAIN/BIAS/DS/IQ_ACQUIRE **off** |
 | Rates | all named macros; window edges; gap reject; quantize idempotent |
 | Recommended list | non-empty; sorted; INVALID_SIZE partial fill |
-| Frequency | quantize 1 kHz; min/max edges; presets |
+| Frequency | exact-Hz normalization; min/max and profile boundaries; presets |
 | Config validate | xfer 512-multiple; count; timeout; core id; stream rate/freq/max_bytes |
 | Names | all states; key err codes; NOT_V4 alias |
 | Passport opts | defaults; MAX_ENTRIES |

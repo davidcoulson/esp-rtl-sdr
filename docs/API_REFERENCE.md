@@ -1,6 +1,6 @@
 # esp_rtl_sdr — API Reference
 
-> **Version tracked:** `0.8.0-rc2` (see `ESP_RTL_SDR_VERSION_*` in [`include/esp_rtl_sdr.h`](../include/esp_rtl_sdr.h))
+> **Version tracked:** `0.8.0-rc3` (see `ESP_RTL_SDR_VERSION_*` in [`include/esp_rtl_sdr.h`](../include/esp_rtl_sdr.h))
 > **Header of record:** [`include/esp_rtl_sdr.h`](../include/esp_rtl_sdr.h)  
 > **Design contract (invariants, ABI growth):** [`API.md`](API.md)  
 > **What works on hardware right now:** [`../PROJECT_TRUTH.md`](../PROJECT_TRUTH.md) wins on any claim conflict.
@@ -229,8 +229,9 @@ Any in-window rate is quantized to an exact RTL2832 ratio (`quantize_sample_rate
 
 | Item | Value |
 |---|---|
-| Range | 24 MHz … 1766 MHz (`FREQ_MIN_HZ` … `FREQ_MAX_HZ`) |
-| Quantization | 1 kHz (`FREQ_QUANT_HZ`) |
+| Arithmetic range | 24 kHz … 1766 MHz (`FREQ_MIN_HZ` … `FREQ_MAX_HZ`) |
+| Device range | Profile-specific; Blog V4 accepts the full arithmetic range, Blog V3/V3c uses Q-branch direct sampling below 24 MHz, and Nooelec rejects below 24 MHz |
+| Quantization | Exact Hz (`FREQ_QUANT_HZ` = 1) |
 | PPM | Software LO offset, ±200 |
 
 ### Ownership of USB Host stack
@@ -306,7 +307,7 @@ uint32_t esp_rtl_sdr_get_capabilities(void);
 | `ESP_RTL_SDR_CAP_METRICS` | 3 | **On** | `get_metrics` |
 | `ESP_RTL_SDR_CAP_CUSTOM_HZ` | 4 | **On** | `PRESET_CUSTOM_HZ` |
 | `ESP_RTL_SDR_CAP_BIAS_TEE` | 5 | **On** | Measured SYS bias ON/OFF (Blog V4) |
-| `ESP_RTL_SDR_CAP_DIRECT_SAMPLING` | 6 | **Off** | Not claimed |
+| `ESP_RTL_SDR_CAP_DIRECT_SAMPLING` | 6 | **Profile-specific** | Blog V3/V3c Q branch below 24 MHz |
 | `ESP_RTL_SDR_CAP_IQ_ACQUIRE` | 7 | **Off** | Borrow mode only |
 | `ESP_RTL_SDR_CAP_FREQ_CORRECTION` | 8 | **On** | Software ppm |
 | `ESP_RTL_SDR_CAP_MULTI_DEVICE` | 9 | **On** | Enumerate / select |
@@ -364,8 +365,8 @@ if ((esp_rtl_sdr_get_capabilities() & need) != need) {
 | `ESP_RTL_SDR_RATE_STABLE_MAX_HZ` | 2560000 |
 | `ESP_RTL_SDR_XTAL_HZ` | 28800000 |
 | `ESP_RTL_SDR_PPM_MIN` / `MAX` | −200 / +200 |
-| `ESP_RTL_SDR_FREQ_MIN_HZ` / `MAX` | 24e6 / 1766e6 |
-| `ESP_RTL_SDR_FREQ_QUANT_HZ` | 1000 |
+| `ESP_RTL_SDR_FREQ_MIN_HZ` / `MAX` | 24e3 / 1766e6 |
+| `ESP_RTL_SDR_FREQ_QUANT_HZ` | 1 |
 | `ESP_RTL_SDR_PRESET_KZEL_HZ` | 96100000 |
 | `ESP_RTL_SDR_PRESET_NOAA_HZ` | 162400000 |
 
@@ -746,7 +747,9 @@ ESP_ERROR_CHECK(esp_rtl_sdr_get_supported_rates(rates,
 bool esp_rtl_sdr_normalize_frequency(uint32_t in_hz, uint32_t *out_hz);
 ```
 
-Clamp + quantize to policy. Returns `false` if out of absolute range or `out_hz` is NULL.
+Validate and normalize to the exact-Hz arithmetic policy. Returns `false` if
+outside 24 kHz…1766 MHz or `out_hz` is NULL. A later start/retune can still
+reject a frequency that the selected device profile does not support.
 
 ### `esp_rtl_sdr_preset_frequency_hz`
 
@@ -1246,10 +1249,10 @@ P4 re-soak and multimeter DC are still lab-open — see [`PHASE3_CAPTURE_REPORT.
 
 | Function | Behavior |
 |---|---|
-| `set_tuner_gain_mode(MANUAL)` | Restore last ladder step (or 0.0 dB); no-op if already MANUAL |
+| `set_tuner_gain_mode(MANUAL)` | Restore last ladder step (or 0.0 dB); no-op if already MANUAL; unsupported while V3 direct sampling bypasses the tuner |
 | `set_tuner_gain_mode(AUTO)` | **0.7.8+** measured IR `05=E8 07=78 0C=6B` (`CAP_GAIN_AUTO`) |
 | `get_tuner_gain_mode` | Last **requested** mode — not register readback |
-| `set_tuner_gain` | Nearest measured step; forces MANUAL; cancels queued AUTO |
+| `set_tuner_gain` | Nearest measured step; forces MANUAL; cancels queued AUTO; unsupported while V3 direct sampling bypasses the tuner |
 | `get_tuner_gain` | Last requested/accepted step (0 if never set) — software shadow |
 | `get_tuner_gains` | 28 steps: 0…496 tenths dB (0.0…49.6 dB) |
 | `set_bias_tee` | SYS sequence `3004/3003/3001/3000` (ON: 3001=0x19, OFF: 0x18) |

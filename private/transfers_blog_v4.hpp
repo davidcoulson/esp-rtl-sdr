@@ -552,6 +552,12 @@ static_assert(sizeof(kRtlCleanupTransfers) / sizeof(kRtlCleanupTransfers[0]) == 
 constexpr size_t kRtlStandardIfFirst = 98;
 constexpr size_t kRtlStandardIfLast = 103;
 
+/** Captured R820-family tuner reinitialization slice used after direct sampling. */
+constexpr size_t kRtlTunerReinitFirst = 363;
+constexpr size_t kRtlTunerReinitLast = 419;
+/** Cleanup records through I2C repeater OFF; excludes the V4-only SYS write. */
+constexpr size_t kRtlTunerCleanupLast = 13;
+
 /** Measured sample-rate slice inside init (indices inclusive). */
 constexpr size_t kRtlSampleRateFirst = 462;
 constexpr size_t kRtlSampleRateLast = 477;

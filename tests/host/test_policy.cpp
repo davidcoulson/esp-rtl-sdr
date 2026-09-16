@@ -116,8 +116,7 @@ static void test_capabilities(void)
     /* 0.7.8 measured Tuner AUTO + RTL digital AGC */
     EXPECT_TRUE((c & ESP_RTL_SDR_CAP_GAIN_AUTO) != 0);
     EXPECT_TRUE((c & ESP_RTL_SDR_CAP_RTL_AGC) != 0);
-    /* Still reserved */
-    EXPECT_TRUE((c & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) == 0);
+    EXPECT_TRUE((c & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0);
     EXPECT_TRUE((c & ESP_RTL_SDR_CAP_IQ_ACQUIRE) == 0);
 }
 
@@ -381,14 +380,14 @@ static void test_frequency(void)
 {
     uint32_t q = 0;
     EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(96123456, &q));
-    EXPECT_EQ_U(q, 96123000);
+    EXPECT_EQ_U(q, 96123456);
 
     /* Already quantized */
     EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(100000000, &q));
     EXPECT_EQ_U(q, 100000000);
 
-    /* Range edges — full V4 span incl. HF (0.7.7) */
-    EXPECT_EQ_U(ESP_RTL_SDR_FREQ_MIN_HZ, 500000u);
+    /* Range edges — experimental V4 LF span plus exact-Hz requests. */
+    EXPECT_EQ_U(ESP_RTL_SDR_FREQ_MIN_HZ, 24000u);
     EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(ESP_RTL_SDR_FREQ_MIN_HZ, &q));
     EXPECT_EQ_U(q, ESP_RTL_SDR_FREQ_MIN_HZ);
     EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(ESP_RTL_SDR_FREQ_MAX_HZ, &q));
@@ -413,10 +412,14 @@ static void test_frequency(void)
     EXPECT_EQ_U(esp_rtl_sdr_tuner_frequency_hz(5000000u), 33800000u);
     EXPECT_EQ_U(esp_rtl_sdr_tuner_frequency_hz(100000000u), 100000000u);
 
-    /* Quant step */
-    EXPECT_EQ_U(ESP_RTL_SDR_FREQ_QUANT_HZ, 1000u);
+    /* Exact-Hz requests are preserved. */
+    EXPECT_EQ_U(ESP_RTL_SDR_FREQ_QUANT_HZ, 1u);
     EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(100000999, &q));
-    EXPECT_EQ_U(q, 100000000);
+    EXPECT_EQ_U(q, 100000999);
+    for (const uint32_t exact_hz : {135600u, 147300u, 472500u, 1000123u}) {
+        EXPECT_TRUE(esp_rtl_sdr_normalize_frequency(exact_hz, &q));
+        EXPECT_EQ_U(q, exact_hz);
+    }
 
     uint32_t preset = 0;
     EXPECT_EQ_I(esp_rtl_sdr_preset_frequency_hz(ESP_RTL_SDR_PRESET_KZEL_96_1, &preset),
@@ -540,6 +543,9 @@ static void test_config_validate(void)
     st.preset = ESP_RTL_SDR_PRESET_CUSTOM_HZ;
     st.frequency_hz = 1000;
     EXPECT_EQ_I(esp_rtl_sdr_stream_config_validate(&st), ESP_RTL_SDR_ERR_BAD_FREQ);
+
+    st.frequency_hz = 147300;
+    EXPECT_EQ_I(esp_rtl_sdr_stream_config_validate(&st), ESP_OK);
 
     st.frequency_hz = 100000000;
     st.sample_rate_sps = ESP_RTL_SDR_RATE_2048K;
