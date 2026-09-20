@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — concurrent multi-receiver foundation (`esp-rtl-sdr-signal-anomaly`)
+
+### Added
+
+- Shared USB host session (refcount) so multiple handles do not each call
+  `usb_host_install` / uninstall under each other.
+- Exclusive USB-address claim table: two handles cannot open the same dongle.
+- `bind_device_index` / `bind_serial` config fields (`ESP_RTL_SDR_BIND_ANY`
+  default keeps single-dongle behaviour).
+- Identity, capture metadata, stream stats, hub stats APIs.
+- IQ block append-only `device_id`, gain, bandwidth, flags. Timestamp remains
+  USB-completion `esp_timer_get_time()`.
+- `[RTLn]` log prefix on open / disconnect / bulk errors.
+- Host tests: `tests/host/test_multi_device.cpp`.
+- Harness: `examples/multi_rtlsdr_test/` with hub Kconfig enabled.
+- Docs: `MULTI_DEVICE_ARCHITECTURE.md`, `WAVESHARE_P4_MULTI_RTL_PROTOTYPE.md`,
+  `MULTI_DEVICE_PERFORMANCE.md`.
+
+### Not in this change
+
+- Anomaly detection, ML, novelty scores.
+- Hardware-measured 2- and 3-dongle throughput (procedure only).
+- Sample-sync / phase coherence (not claimed).
+
 ## 0.8.0-rc3 (2026-09-15) — V3c cold-start and LF/HF acceptance
 
 ### Fixed
