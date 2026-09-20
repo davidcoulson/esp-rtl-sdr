@@ -37,8 +37,16 @@
 #include "measured_gain_bias_v4.hpp"
 #include "gain_r820t2.hpp"
 #include "reentrancy.hpp"
+#include "rtl_multi.hpp"
 
 static const char *TAG = "esp_rtl_sdr";
+
+#define RTL_LOGI(h, fmt, ...)                                                                      \
+    ESP_LOGI(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
+#define RTL_LOGW(h, fmt, ...)                                                                      \
+    ESP_LOGW(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
+#define RTL_LOGE(h, fmt, ...)                                                                      \
+    ESP_LOGE(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
 
 static constexpr uint32_t kHandleMagic = 0x52345634u;
 static constexpr TickType_t kQueryLockTicks = pdMS_TO_TICKS(50);
@@ -182,6 +190,72 @@ esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
     return ESP_OK;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Shared USB host session (refcount + exclusive address claims)              */
+/* -------------------------------------------------------------------------- */
+
+struct UsbSession {
+    SemaphoreHandle_t lock = nullptr;
+    int refcount = 0;
+    bool host_installed = false;
+    bool external_host = false; /* app called usb_host_install */
+    volatile bool bringing_up = false;
+    volatile bool host_task_run = false;
+    TaskHandle_t host_task = nullptr;
+    TaskHandle_t host_join_waiter = nullptr;
+    RtlClaimTable claims{};
+    bool slot_used[ESP_RTL_SDR_MAX_DEVICES]{};
+    uint32_t new_dev_events = 0;
+    uint32_t gone_events = 0;
+    uint32_t claim_conflicts = 0;
+};
+
+static UsbSession s_usb_session;
+
+static bool session_lock(void)
+{
+    if (s_usb_session.lock == nullptr) {
+        s_usb_session.lock = xSemaphoreCreateMutex();
+        if (s_usb_session.lock == nullptr) {
+            return false;
+        }
+    }
+    return xSemaphoreTake(s_usb_session.lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void session_unlock(void)
+{
+    if (s_usb_session.lock != nullptr) {
+        xSemaphoreGive(s_usb_session.lock);
+    }
+}
+
+static void session_fill_hub_stats(esp_rtl_sdr_hub_stats_t *out)
+{
+    esp_rtl_sdr_hub_stats_default(out);
+    if (!session_lock()) {
+        return;
+    }
+    out->session_refcount = static_cast<uint32_t>(s_usb_session.refcount);
+    out->claimed_rtl_count = static_cast<uint32_t>(rtl_claim_count(&s_usb_session.claims));
+    out->new_dev_events = s_usb_session.new_dev_events;
+    out->gone_events = s_usb_session.gone_events;
+    out->claim_conflicts = s_usb_session.claim_conflicts;
+    out->host_installed = s_usb_session.host_installed || s_usb_session.external_host;
+    session_unlock();
+}
+
+static int session_alloc_slot(void)
+{
+    return rtl_logical_alloc(s_usb_session.slot_used);
+}
+
+static void session_free_slot(int slot)
+{
+    rtl_logical_free(s_usb_session.slot_used, slot);
+    rtl_claim_release_owner(&s_usb_session.claims, static_cast<uint8_t>(slot));
+}
+
 /** Extra high-band steps when passport recommended_only == false. */
 static const uint32_t kPassportExtraRates[] = {
     1200000u, 1536000u, 2000000u, 2800000u,
@@ -189,6 +263,8 @@ static const uint32_t kPassportExtraRates[] = {
 
 struct DeviceCandidate {
     uint8_t addr = 0;
+    uint8_t parent_addr = 0;
+    uint8_t hub_port = 0;
     esp_rtl_sdr_device_info_t info{};
     RtlProfileId profile = RtlProfileId::Unknown;
     bool valid = false;
@@ -202,6 +278,10 @@ struct IqSlot {
     uint32_t frequency_hz = 0;
     uint32_t sample_rate_sps = 0;
     int64_t host_timestamp_us = 0;
+    uint8_t device_id = 0;
+    int gain_tenth_db = 0;
+    uint32_t bandwidth_hz = 0;
+    uint32_t flags = 0;
 };
 
 struct esp_rtl_sdr_handle {
@@ -290,9 +370,20 @@ struct esp_rtl_sdr_handle {
     /** Multi-device: candidates from last refresh; selection preferences. */
     DeviceCandidate candidates[ESP_RTL_SDR_MAX_DEVICES]{};
     size_t candidate_count = 0;
-    size_t preferred_device_index = 0;
+    size_t preferred_device_index = ESP_RTL_SDR_BIND_ANY;
     char preferred_serial[32]{};
     uint8_t open_addr = 0;
+    uint8_t logical_index = 0xFF;
+    uint8_t usb_parent_addr = 0;
+    uint8_t usb_hub_port = 0;
+    uint8_t enum_index = 0;
+    char log_id[12]{"RTL?"};
+
+    uint32_t usb_xfer_count = 0;
+    uint32_t usb_xfer_errors = 0;
+    uint32_t usb_timeouts = 0;
+    uint32_t queue_high_water = 0;
+    int64_t last_xfer_timestamp_us = 0;
 
     /** Last rate passport from probe_rates (for NEED_MAX_STABLE). */
     esp_rtl_sdr_rate_passport_t passport{};
@@ -608,6 +699,29 @@ static void apply_profile_to_handle(esp_rtl_sdr_handle *h, RtlProfileId profile,
     h->gain_mode = rtl_profile_default_gain_mode(profile);
     h->info = info;
     h->info.present = (profile != RtlProfileId::Unknown);
+}
+
+static void close_opened_device(esp_rtl_sdr_handle *h)
+{
+    if (h == nullptr) {
+        return;
+    }
+    const uint8_t addr = h->open_addr;
+    if (h->iface_claimed && h->dev != nullptr && h->client != nullptr) {
+        usb_host_interface_release(h->client, h->dev, 0);
+        h->iface_claimed = false;
+    }
+    if (h->dev != nullptr && h->client != nullptr) {
+        usb_host_device_close(h->client, h->dev);
+        h->dev = nullptr;
+    }
+    h->open_addr = 0;
+    h->usb_parent_addr = 0;
+    h->usb_hub_port = 0;
+    if (addr != 0 && session_lock()) {
+        rtl_claim_release(&s_usb_session.claims, addr, h->logical_index);
+        session_unlock();
+    }
 }
 
 static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t dev, uint8_t bm,
@@ -1133,6 +1247,15 @@ static void bulk_cb(usb_transfer_t *xfer)
         return;
     }
 
+    h->usb_xfer_count++;
+    if (xfer->status == USB_TRANSFER_STATUS_TIMED_OUT) {
+        h->usb_timeouts++;
+        h->usb_xfer_errors++;
+    } else if (xfer->status != USB_TRANSFER_STATUS_COMPLETED &&
+               xfer->status != USB_TRANSFER_STATUS_CANCELED) {
+        h->usb_xfer_errors++;
+    }
+
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > 0 &&
         h->streaming && !h->pause_resubmit) {
         IqSlot *slot = nullptr;
@@ -1145,9 +1268,25 @@ static void bulk_cb(usb_transfer_t *xfer)
             slot->frequency_hz = h->frequency_hz;
             slot->sample_rate_sps = h->sample_rate_sps;
             slot->host_timestamp_us = esp_timer_get_time();
+            slot->device_id = h->logical_index;
+            slot->gain_tenth_db = h->gain_tenth_db;
+            slot->bandwidth_hz = h->sample_rate_sps;
+            slot->flags = 0;
+            if (n != static_cast<size_t>(h->bulk_len)) {
+                slot->flags |= ESP_RTL_SDR_IQ_FLAG_SHORT_TRANSFER;
+                h->metrics.short_transfers++;
+            }
+            h->last_xfer_timestamp_us = slot->host_timestamp_us;
+            if (h->filled_q != nullptr) {
+                const UBaseType_t waiting = uxQueueMessagesWaiting(h->filled_q);
+                if (static_cast<uint32_t>(waiting) + 1u > h->queue_high_water) {
+                    h->queue_high_water = static_cast<uint32_t>(waiting) + 1u;
+                }
+            }
             if (xQueueSend(h->filled_q, &slot, 0) != pdTRUE) {
                 (void)xQueueSend(h->free_q, &slot, 0);
                 h->metrics.overruns++;
+                slot->flags |= ESP_RTL_SDR_IQ_FLAG_OVERRUN;
             } else {
                 h->metrics.bytes_total += copy;
                 h->metrics.blocks_total++;
@@ -1181,14 +1320,14 @@ static void bulk_cb(usb_transfer_t *xfer)
         }
     } else if (xfer->status != USB_TRANSFER_STATUS_CANCELED &&
                xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        ESP_LOGW(TAG, "bulk status=%d bytes=%d", xfer->status, xfer->actual_num_bytes);
+        RTL_LOGW(h, "bulk status=%d bytes=%d", xfer->status, xfer->actual_num_bytes);
     }
 
     /* Resubmit only while streaming and not draining for stop/retune. */
     if (h->streaming && !h->pause_resubmit) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "bulk resubmit failed: %s", esp_err_to_name(ret));
+            RTL_LOGE(h, "bulk resubmit failed: %s", esp_err_to_name(ret));
             h->streaming = false;
             if (h->live_urbs > 0) {
                 h->live_urbs--;
@@ -1617,6 +1756,10 @@ static void delivery_task_fn(void *arg)
         block.frequency_hz = slot->frequency_hz;
         block.sample_rate_sps = slot->sample_rate_sps;
         block.host_timestamp_us = slot->host_timestamp_us;
+        block.device_id = slot->device_id;
+        block.gain_tenth_db = slot->gain_tenth_db;
+        block.bandwidth_hz = slot->bandwidth_hz;
+        block.flags = slot->flags;
 
         esp_rtl_sdr_event_cb_t cb = nullptr;
         void *ctx = nullptr;
@@ -1810,6 +1953,26 @@ static void str_desc_ascii(const usb_str_desc_t *d, char *out, size_t out_sz)
     out[n] = '\0';
 }
 
+static void fill_topology(const usb_device_info_t *info, uint8_t *parent_addr, uint8_t *hub_port)
+{
+    if (parent_addr != nullptr) {
+        *parent_addr = 0;
+    }
+    if (hub_port != nullptr) {
+        *hub_port = 0;
+    }
+    if (info == nullptr || info->parent.dev_hdl == nullptr) {
+        return;
+    }
+    if (hub_port != nullptr) {
+        *hub_port = info->parent.port_num;
+    }
+    usb_device_info_t pinfo{};
+    if (usb_host_device_info(info->parent.dev_hdl, &pinfo) == ESP_OK && parent_addr != nullptr) {
+        *parent_addr = pinfo.dev_addr;
+    }
+}
+
 static RtlProfileId identify_profile(esp_rtl_sdr_handle *h, usb_device_handle_t dev,
                                      const usb_device_desc_t *dd, const usb_device_info_t *info,
                                      esp_rtl_sdr_device_info_t *out)
@@ -1852,13 +2015,42 @@ static bool probe_candidate(esp_rtl_sdr_handle *h, uint8_t addr, DeviceCandidate
     /* Already owning this address. */
     if (h->dev != nullptr && h->open_addr == addr) {
         out->addr = addr;
+        out->parent_addr = h->usb_parent_addr;
+        out->hub_port = h->usb_hub_port;
         out->info = h->info;
         out->profile = h->profile;
         out->valid = true;
         return true;
     }
+    if (keep_open) {
+        if (!session_lock()) {
+            return false;
+        }
+        const bool taken =
+            rtl_claim_taken_by_other(&s_usb_session.claims, addr, h->logical_index);
+        if (taken) {
+            s_usb_session.claim_conflicts++;
+            session_unlock();
+            RTL_LOGW(h, "USB addr=%u already claimed by another handle",
+                     static_cast<unsigned>(addr));
+            return false;
+        }
+        if (!rtl_claim_try(&s_usb_session.claims, addr, h->logical_index)) {
+            s_usb_session.claim_conflicts++;
+            session_unlock();
+            RTL_LOGW(h, "USB addr=%u claim table full", static_cast<unsigned>(addr));
+            return false;
+        }
+        session_unlock();
+    }
     usb_device_handle_t dev = nullptr;
     if (usb_host_device_open(h->client, addr, &dev) != ESP_OK) {
+        if (keep_open) {
+            if (session_lock()) {
+                rtl_claim_release(&s_usb_session.claims, addr, h->logical_index);
+                session_unlock();
+            }
+        }
         return false;
     }
     const usb_device_desc_t *dd = nullptr;
@@ -1866,25 +2058,50 @@ static bool probe_candidate(esp_rtl_sdr_handle *h, uint8_t addr, DeviceCandidate
     if (usb_host_get_device_descriptor(dev, &dd) != ESP_OK ||
         usb_host_device_info(dev, &info) != ESP_OK) {
         usb_host_device_close(h->client, dev);
+        if (keep_open) {
+            if (session_lock()) {
+                rtl_claim_release(&s_usb_session.claims, addr, h->logical_index);
+                session_unlock();
+            }
+        }
         return false;
     }
     esp_rtl_sdr_device_info_t di{};
     const RtlProfileId profile = identify_profile(h, dev, dd, &info, &di);
     if (profile == RtlProfileId::Unknown) {
         usb_host_device_close(h->client, dev);
+        if (keep_open) {
+            if (session_lock()) {
+                rtl_claim_release(&s_usb_session.claims, addr, h->logical_index);
+                session_unlock();
+            }
+        }
         return false;
     }
+    uint8_t parent_addr = 0;
+    uint8_t hub_port = 0;
+    fill_topology(&info, &parent_addr, &hub_port);
     out->addr = addr;
+    out->parent_addr = parent_addr;
+    out->hub_port = hub_port;
     out->info = di;
     out->profile = profile;
     out->valid = true;
     if (keep_open && h->dev == nullptr) {
         h->dev = dev;
         h->open_addr = addr;
+        h->usb_parent_addr = parent_addr;
+        h->usb_hub_port = hub_port;
         apply_profile_to_handle(h, profile, di);
         return true;
     }
     usb_host_device_close(h->client, dev);
+    if (keep_open) {
+        if (session_lock()) {
+            rtl_claim_release(&s_usb_session.claims, addr, h->logical_index);
+            session_unlock();
+        }
+    }
     return true;
 }
 
@@ -1915,6 +2132,16 @@ static bool serial_matches_preferred(const esp_rtl_sdr_handle *h, const char *se
     return serial != nullptr && std::strcmp(h->preferred_serial, serial) == 0;
 }
 
+static bool candidate_claimed_by_other(const esp_rtl_sdr_handle *h, uint8_t addr)
+{
+    if (!session_lock()) {
+        return true;
+    }
+    const bool taken = rtl_claim_taken_by_other(&s_usb_session.claims, addr, h->logical_index);
+    session_unlock();
+    return taken;
+}
+
 /** Open preferred candidate. If fire_events is false, caller emits after unlock. */
 static void open_selected_candidate(esp_rtl_sdr_handle *h, bool fire_events = true)
 {
@@ -1932,23 +2159,41 @@ static void open_selected_candidate(esp_rtl_sdr_handle *h, bool fire_events = tr
             }
         }
         if (!found) {
-            ESP_LOGW(TAG, "preferred serial not found; no device open");
+            RTL_LOGW(h, "preferred serial not found; no device open");
             return;
         }
-    }
-    if (idx >= h->candidate_count) {
-        idx = 0;
+    } else if (idx == ESP_RTL_SDR_BIND_ANY || idx >= h->candidate_count) {
+        idx = SIZE_MAX;
+        for (size_t i = 0; i < h->candidate_count; ++i) {
+            if (!candidate_claimed_by_other(h, h->candidates[i].addr)) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == SIZE_MAX) {
+            RTL_LOGW(h, "no unclaimed RTL-SDR candidate");
+            return;
+        }
+    } else if (candidate_claimed_by_other(h, h->candidates[idx].addr)) {
+        RTL_LOGW(h, "candidate index %u addr=%u claimed by another handle",
+                 static_cast<unsigned>(idx), static_cast<unsigned>(h->candidates[idx].addr));
+        return;
     }
     DeviceCandidate cand{};
     if (!probe_candidate(h, h->candidates[idx].addr, &cand, true)) {
-        ESP_LOGW(TAG, "failed to open candidate index %u", static_cast<unsigned>(idx));
+        RTL_LOGW(h, "failed to open candidate index %u addr=%u", static_cast<unsigned>(idx),
+                 static_cast<unsigned>(h->candidates[idx].addr));
         return;
     }
     h->preferred_device_index = idx;
-    ESP_LOGI(TAG, "open %s %s serial=%s hs=%d index=%u", cand.info.manufacturer,
-             cand.info.product, cand.info.serial, static_cast<int>(cand.info.high_speed),
-             static_cast<unsigned>(idx));
-    ESP_LOGI(TAG, "profile=%s caps=0x%08x", rtl_profile_name(cand.profile),
+    h->enum_index = static_cast<uint8_t>(idx);
+    char path[24];
+    esp_rtl_sdr_format_usb_path(cand.parent_addr, cand.hub_port, path, sizeof(path));
+    RTL_LOGI(h, "USB device opened addr=%u path=%s serial=%s hs=%d index=%u",
+             static_cast<unsigned>(cand.addr), path, cand.info.serial,
+             static_cast<int>(cand.info.high_speed), static_cast<unsigned>(idx));
+    RTL_LOGI(h, "tuner=%s manufacturer=%s product=%s caps=0x%08x",
+             rtl_profile_name(cand.profile), cand.info.manufacturer, cand.info.product,
              static_cast<unsigned>(rtl_profile_device_capabilities(cand.profile)));
 
     if (fire_events) {
@@ -1966,9 +2211,14 @@ static void try_open_device(esp_rtl_sdr_handle *h, uint8_t addr)
     if (h->dev != nullptr) {
         return;
     }
+    if (candidate_claimed_by_other(h, addr)) {
+        RTL_LOGI(h, "usb probe skip addr=%u (claimed by another handle)",
+                 static_cast<unsigned>(addr));
+        return;
+    }
     DeviceCandidate cand{};
     if (!probe_candidate(h, addr, &cand, false)) {
-        ESP_LOGW(TAG, "reject USB addr=%u (not accepted profile)", static_cast<unsigned>(addr));
+        RTL_LOGW(h, "reject USB addr=%u (not accepted profile)", static_cast<unsigned>(addr));
         return;
     }
     /* Rebuild list and open preferred (may be this device or another). */
@@ -1978,7 +2228,7 @@ static void try_open_device(esp_rtl_sdr_handle *h, uint8_t addr)
         open_selected_candidate(h);
         return;
     }
-    /* Prefer explicit index when serial unset. */
+    /* Prefer explicit index when serial unset and bind is not ANY. */
     size_t match_idx = 0;
     for (size_t i = 0; i < h->candidate_count; ++i) {
         if (h->candidates[i].addr == addr) {
@@ -1986,16 +2236,20 @@ static void try_open_device(esp_rtl_sdr_handle *h, uint8_t addr)
             break;
         }
     }
-    if (h->preferred_serial[0] == '\0' && match_idx != h->preferred_device_index &&
-        h->candidate_count > 1) {
+    if (h->preferred_serial[0] == '\0' && h->preferred_device_index != ESP_RTL_SDR_BIND_ANY &&
+        match_idx != h->preferred_device_index && h->candidate_count > 1) {
         open_selected_candidate(h);
         return;
     }
     if (probe_candidate(h, addr, &cand, true)) {
         h->preferred_device_index = match_idx;
-        ESP_LOGI(TAG, "open %s %s serial=%s hs=%d", cand.info.manufacturer, cand.info.product,
-                 cand.info.serial, static_cast<int>(cand.info.high_speed));
-        ESP_LOGI(TAG, "profile=%s caps=0x%08x", rtl_profile_name(cand.profile),
+        h->enum_index = static_cast<uint8_t>(match_idx);
+        char path[24];
+        esp_rtl_sdr_format_usb_path(cand.parent_addr, cand.hub_port, path, sizeof(path));
+        RTL_LOGI(h, "USB device opened addr=%u path=%s serial=%s hs=%d",
+                 static_cast<unsigned>(cand.addr), path, cand.info.serial,
+                 static_cast<int>(cand.info.high_speed));
+        RTL_LOGI(h, "tuner=%s caps=0x%08x", rtl_profile_name(cand.profile),
                  static_cast<unsigned>(rtl_profile_device_capabilities(cand.profile)));
         esp_rtl_sdr_event_cb_t cb = h->cfg.event_cb;
         void *ctx = h->cfg.event_ctx;
@@ -2016,28 +2270,39 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
         /* ESP-IDF's own enumeration (enum.c) survived long enough to deliver
          * this event, so the fault-guard's risky window is over for now. */
         usb_fault_guard_disarm();
+        if (session_lock()) {
+            s_usb_session.new_dev_events++;
+            session_unlock();
+        }
         const uint8_t addr = event->new_dev.address;
         const bool queued = h->probe_q != nullptr && xQueueSend(h->probe_q, &addr, 0) == pdTRUE;
-        ESP_LOGI(TAG, "usb new_device addr=%u queued=%d", static_cast<unsigned>(addr),
+        RTL_LOGI(h, "usb new_device addr=%u queued=%d", static_cast<unsigned>(addr),
                  static_cast<int>(queued));
         if (!queued) {
-            ESP_LOGE(TAG, "usb probe_queue_full addr=%u", static_cast<unsigned>(addr));
+            RTL_LOGE(h, "usb probe_queue_full addr=%u", static_cast<unsigned>(addr));
         }
     } else if (event->event == USB_HOST_CLIENT_EVENT_DEV_GONE &&
                event->dev_gone.dev_hdl == h->dev) {
+        if (session_lock()) {
+            s_usb_session.gone_events++;
+            session_unlock();
+        }
         h->device_gone = true;
     }
 }
 
 static void host_lib_task_fn(void *arg)
 {
-    auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
-    while (h->tasks_run) {
+    (void)arg;
+    while (s_usb_session.host_task_run) {
         uint32_t flags = 0;
         /* 50 ms: faster join on uninstall than 100 ms. */
         usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
     }
-    worker_task_exit(h);
+    if (s_usb_session.host_join_waiter != nullptr) {
+        xTaskNotifyGive(s_usb_session.host_join_waiter);
+    }
+    vTaskDelete(nullptr);
 }
 
 static void client_task_fn(void *arg)
@@ -2047,18 +2312,10 @@ static void client_task_fn(void *arg)
         usb_host_client_handle_events(h->client, pdMS_TO_TICKS(20));
         if (h->device_gone) {
             h->device_gone = false;
-            ESP_LOGW(TAG, "usb disconnected profile=%s addr=%u",
+            RTL_LOGW(h, "usb disconnected profile=%s addr=%u (other handles unaffected)",
                      rtl_profile_name(h->profile), static_cast<unsigned>(h->open_addr));
             h->streaming = false;
-            if (h->iface_claimed && h->dev != nullptr) {
-                usb_host_interface_release(h->client, h->dev, 0);
-                h->iface_claimed = false;
-            }
-            if (h->dev != nullptr) {
-                usb_host_device_close(h->client, h->dev);
-                h->dev = nullptr;
-                h->open_addr = 0;
-            }
+            close_opened_device(h);
             clear_profile_runtime_state(h);
             h->info = {};
             h->info.present = false;
@@ -2074,11 +2331,11 @@ static void client_task_fn(void *arg)
         uint8_t addr = 0;
         while (xQueueReceive(h->probe_q, &addr, 0) == pdTRUE) {
             if (addr == 0) {
-                ESP_LOGI(TAG, "usb probe_rescan");
+                RTL_LOGI(h, "usb probe_rescan");
                 rebuild_candidate_list(h);
                 open_selected_candidate(h);
             } else {
-                ESP_LOGI(TAG, "usb probe_begin addr=%u", static_cast<unsigned>(addr));
+                RTL_LOGI(h, "usb probe_begin addr=%u", static_cast<unsigned>(addr));
                 try_open_device(h, addr);
             }
         }
@@ -2086,35 +2343,150 @@ static void client_task_fn(void *arg)
     worker_task_exit(h);
 }
 
-static esp_err_t start_usb_stack(esp_rtl_sdr_handle *h)
+static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
 {
-    h->tasks_run = true;
-    h->worker_task_count = 0;
-    h->owns_host = !h->cfg.host_library_already_installed;
-    h->probe_q = xQueueCreate(kProbeQueueDepth, sizeof(uint8_t));
-    if (h->probe_q == nullptr) {
+    if (!session_lock()) {
         return ESP_ERR_NO_MEM;
     }
+    const int slot = session_alloc_slot();
+    if (slot < 0) {
+        session_unlock();
+        ESP_LOGE(TAG, "too many concurrent RTL handles (max %u)",
+                 static_cast<unsigned>(ESP_RTL_SDR_MAX_DEVICES));
+        return ESP_ERR_NO_MEM;
+    }
+    h->logical_index = static_cast<uint8_t>(slot);
+    std::snprintf(h->log_id, sizeof(h->log_id), "RTL%u",
+                  static_cast<unsigned>(slot) % ESP_RTL_SDR_MAX_DEVICES);
 
-    if (h->owns_host) {
+    while (s_usb_session.bringing_up) {
+        session_unlock();
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (!session_lock()) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    const bool first = (s_usb_session.refcount == 0);
+    if (first) {
+        s_usb_session.external_host = h->cfg.host_library_already_installed;
+        rtl_claim_clear(&s_usb_session.claims);
+        s_usb_session.new_dev_events = 0;
+        s_usb_session.gone_events = 0;
+        s_usb_session.claim_conflicts = 0;
+        if (!s_usb_session.external_host) {
+            s_usb_session.bringing_up = true;
+        }
+    }
+    s_usb_session.refcount++;
+    const bool need_install = first && !s_usb_session.external_host;
+    session_unlock();
+
+    h->owns_host = false;
+    h->host_task = nullptr;
+
+    if (need_install) {
         usb_host_config_t hc{};
         hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
         /*
          * Do not set peripheral_map here: field is not present on all IDF 5.3/5.4
          * headers. Default install selects the primary HS host on ESP32-P4.
-         * Re-add with #ifdef when a stable API field exists for dual-controller boards.
          */
         esp_err_t ret = usb_host_install(&hc);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "usb_host_install: %s", esp_err_to_name(ret));
+            if (session_lock()) {
+                s_usb_session.refcount--;
+                s_usb_session.bringing_up = false;
+                session_free_slot(slot);
+                session_unlock();
+            }
+            h->logical_index = 0xFF;
             return ret;
         }
-        h->host_installed = true;
-        if (xTaskCreatePinnedToCore(host_lib_task_fn, "rtl_usb_lib", 4096, h, kUsbPrio,
-                                    &h->host_task, kUsbCore) != pdPASS) {
+        if (session_lock()) {
+            s_usb_session.host_installed = true;
+            s_usb_session.host_task_run = true;
+            session_unlock();
+        }
+        if (xTaskCreatePinnedToCore(host_lib_task_fn, "rtl_usb_lib", 4096, nullptr, kUsbPrio,
+                                    &s_usb_session.host_task, kUsbCore) != pdPASS) {
+            (void)usb_host_uninstall();
+            if (session_lock()) {
+                s_usb_session.host_installed = false;
+                s_usb_session.host_task_run = false;
+                s_usb_session.bringing_up = false;
+                s_usb_session.refcount--;
+                session_free_slot(slot);
+                session_unlock();
+            }
+            h->logical_index = 0xFF;
             return ESP_ERR_NO_MEM;
         }
-        h->worker_task_count++;
+        if (session_lock()) {
+            s_usb_session.bringing_up = false;
+            session_unlock();
+        }
+        RTL_LOGI(h, "USB host session started (shared)");
+    } else {
+        RTL_LOGI(h, "USB host session joined refcount now includes this handle");
+    }
+    return ESP_OK;
+}
+
+static void session_release(esp_rtl_sdr_handle *h)
+{
+    if (h == nullptr) {
+        return;
+    }
+    const int slot = (h->logical_index < ESP_RTL_SDR_MAX_DEVICES) ? h->logical_index : -1;
+    bool last = false;
+    bool we_installed = false;
+    if (session_lock()) {
+        if (slot >= 0) {
+            session_free_slot(slot);
+        }
+        if (slot >= 0 && s_usb_session.refcount > 0) {
+            s_usb_session.refcount--;
+        }
+        last = (s_usb_session.refcount == 0);
+        we_installed = last && s_usb_session.host_installed && !s_usb_session.external_host;
+        session_unlock();
+    }
+    h->logical_index = 0xFF;
+    std::snprintf(h->log_id, sizeof(h->log_id), "RTL?");
+
+    if (!we_installed) {
+        return;
+    }
+
+    s_usb_session.host_join_waiter = xTaskGetCurrentTaskHandle();
+    s_usb_session.host_task_run = false;
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+    s_usb_session.host_join_waiter = nullptr;
+    s_usb_session.host_task = nullptr;
+
+    const esp_err_t uerr = usb_host_uninstall();
+    if (uerr != ESP_OK) {
+        ESP_LOGE(TAG, "usb_host_uninstall failed (%s)", esp_err_to_name(uerr));
+    }
+    if (session_lock()) {
+        s_usb_session.host_installed = false;
+        session_unlock();
+    }
+}
+
+static esp_err_t start_usb_stack(esp_rtl_sdr_handle *h)
+{
+    h->tasks_run = true;
+    h->worker_task_count = 0;
+    h->probe_q = xQueueCreate(kProbeQueueDepth, sizeof(uint8_t));
+    if (h->probe_q == nullptr) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t ret = session_acquire(h);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     usb_host_client_config_t cc{};
@@ -2122,7 +2494,7 @@ static esp_err_t start_usb_stack(esp_rtl_sdr_handle *h)
     cc.max_num_event_msg = 8;
     cc.async.client_event_callback = client_event_cb;
     cc.async.callback_arg = h;
-    esp_err_t ret = usb_host_client_register(&cc, &h->client);
+    ret = usb_host_client_register(&cc, &h->client);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -2132,7 +2504,10 @@ static esp_err_t start_usb_stack(esp_rtl_sdr_handle *h)
         h->cfg.usb_task_priority ? h->cfg.usb_task_priority : kClientPrio;
     const BaseType_t core =
         (h->cfg.usb_task_core_id == 0xFF) ? kUsbCore : h->cfg.usb_task_core_id;
-    if (xTaskCreatePinnedToCore(client_task_fn, "rtl_usb_cli", 6144, h, prio, &h->client_task,
+    char cli_name[12];
+    std::snprintf(cli_name, sizeof(cli_name), "rtl_cli%u",
+                  static_cast<unsigned>(h->logical_index));
+    if (xTaskCreatePinnedToCore(client_task_fn, cli_name, 6144, h, prio, &h->client_task,
                                 core) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
@@ -2191,6 +2566,11 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     clear_profile_runtime_state(h);
     h->info = {};
     h->info.present = false;
+    h->preferred_device_index = h->cfg.bind_device_index;
+    if (h->cfg.bind_serial[0] != '\0') {
+        std::snprintf(h->preferred_serial, sizeof(h->preferred_serial), "%s",
+                      h->cfg.bind_serial);
+    }
 
     if (usb_host_transfer_alloc(kCtrlXferBytes, 0, &h->ctrl_xfer) != ESP_OK) {
         h->magic = 0;
@@ -2225,10 +2605,12 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
         return ret;
     }
 
-    ESP_LOGI(TAG, "install v%s caps=0x%08x xfer=%ux%u", esp_rtl_sdr_get_version_string(),
+    RTL_LOGI(h, "install v%s caps=0x%08x xfer=%ux%u bind=%s",
+             esp_rtl_sdr_get_version_string(),
              static_cast<unsigned>(esp_rtl_sdr_get_capabilities()),
              static_cast<unsigned>(config->transfer_count),
-             static_cast<unsigned>(config->transfer_bytes));
+             static_cast<unsigned>(config->transfer_bytes),
+             h->preferred_device_index == ESP_RTL_SDR_BIND_ANY ? "any" : "index");
     *out_handle = h;
     return ESP_OK;
 }
@@ -2275,34 +2657,12 @@ esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
     handle->delivery_task = nullptr;
     handle->worker_task_count = 0;
 
-    if (handle->iface_claimed && handle->dev != nullptr) {
-        usb_host_interface_release(handle->client, handle->dev, 0);
-        handle->iface_claimed = false;
-    }
-    if (handle->dev != nullptr) {
-        usb_host_device_close(handle->client, handle->dev);
-        handle->dev = nullptr;
-    }
+    close_opened_device(handle);
     if (handle->client_registered) {
         usb_host_client_deregister(handle->client);
         handle->client_registered = false;
     }
-    if (handle->owns_host && handle->host_installed) {
-        const esp_err_t uerr = usb_host_uninstall();
-        if (uerr != ESP_OK) {
-            /* Fail-closed: do not clear live_urbs or free the pool while the
-             * host may still own transfers. Leave handle intact for retry. */
-            ESP_LOGE(TAG, "usb_host_uninstall failed (%s); keep pool/live_urbs",
-                     esp_err_to_name(uerr));
-            {
-                HandleLock lk(handle, kUninstallLockTicks);
-                (void)lk.ok();
-                handle->destroying = false; /* allow uninstall retry */
-            }
-            return ESP_RTL_SDR_ERR_USB;
-        }
-        handle->host_installed = false;
-    }
+    session_release(handle);
 
     /* Host/HCD torn down (or never owned) - safe to clear stuck live_urbs. */
     if (handle->live_urbs > 0) {
@@ -2437,6 +2797,124 @@ esp_err_t esp_rtl_sdr_get_metrics(esp_rtl_sdr_handle_t handle,
                 (handle->metrics.bytes_total * 500ull) / out_metrics->uptime_ms);
         }
     }
+    return ESP_OK;
+}
+
+esp_err_t esp_rtl_sdr_get_identity(esp_rtl_sdr_handle_t handle, esp_rtl_sdr_identity_t *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    HandleLock lk(handle, kQueryLockTicks);
+    if (!lk.ok()) {
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    esp_rtl_sdr_identity_default(out);
+    out->logical_index = handle->logical_index;
+    out->usb_addr = handle->open_addr;
+    out->parent_addr = handle->usb_parent_addr;
+    out->hub_port = handle->usb_hub_port;
+    out->enum_index = handle->enum_index;
+    out->vid = handle->info.vid;
+    out->pid = handle->info.pid;
+    std::snprintf(out->serial, sizeof(out->serial), "%s", handle->info.serial);
+    std::snprintf(out->manufacturer, sizeof(out->manufacturer), "%s", handle->info.manufacturer);
+    std::snprintf(out->product, sizeof(out->product), "%s", handle->info.product);
+    esp_rtl_sdr_format_usb_path(handle->usb_parent_addr, handle->usb_hub_port, out->usb_path,
+                                sizeof(out->usb_path));
+    out->high_speed = handle->info.high_speed;
+    out->present = handle->info.present && handle->dev != nullptr;
+    out->profile = rtl_profile_to_public(handle->profile);
+    return ESP_OK;
+}
+
+esp_err_t esp_rtl_sdr_get_logical_index(esp_rtl_sdr_handle_t handle, uint8_t *out_index)
+{
+    if (out_index == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    HandleLock lk(handle, kQueryLockTicks);
+    if (!lk.ok()) {
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    *out_index = handle->logical_index;
+    return ESP_OK;
+}
+
+esp_err_t esp_rtl_sdr_get_capture_meta(esp_rtl_sdr_handle_t handle,
+                                       esp_rtl_sdr_capture_meta_t *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    HandleLock lk(handle, kQueryLockTicks);
+    if (!lk.ok()) {
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    const uint32_t center = handle->frequency_hz != 0 ? handle->frequency_hz
+                                                      : handle->preferred_frequency_hz;
+    const uint32_t tuner = esp_rtl_sdr_tuner_frequency_hz(center);
+    esp_rtl_sdr_fill_capture_meta(
+        out, handle->logical_index, handle->open_addr, handle->usb_hub_port, handle->iq_sequence,
+        handle->last_xfer_timestamp_us, 0, center, tuner, handle->sample_rate_sps,
+        static_cast<uint8_t>(handle->gain_mode), handle->gain_tenth_db,
+        static_cast<int>(handle->freq_correction_ppm), rtl_profile_to_public(handle->profile),
+        handle->bias_tee_want, handle->state, handle->metrics.consumer_drops,
+        handle->usb_xfer_errors, 0);
+    return ESP_OK;
+}
+
+esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
+                                       esp_rtl_sdr_stream_stats_t *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    HandleLock lk(handle, kQueryLockTicks);
+    if (!lk.ok()) {
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    esp_rtl_sdr_stream_stats_default(out);
+    out->device_id = handle->logical_index;
+    out->bytes_received = handle->metrics.bytes_total;
+    out->samples_received = handle->metrics.bytes_total / 2u;
+    out->usb_transfer_count = handle->usb_xfer_count;
+    out->usb_transfer_errors = handle->usb_xfer_errors;
+    out->usb_timeouts = handle->usb_timeouts;
+    out->short_transfers = handle->metrics.short_transfers;
+    out->buffer_overruns = handle->metrics.overruns;
+    out->dropped_buffers = handle->metrics.consumer_drops;
+    out->queue_high_water = handle->queue_high_water;
+    out->last_transfer_timestamp_us = handle->last_xfer_timestamp_us;
+    if (handle->state == ESP_RTL_SDR_STATE_STREAMING && handle->stream_start_ms != 0) {
+        out->stream_uptime_ms = now_ms() - handle->stream_start_ms;
+        if (out->stream_uptime_ms > 0) {
+            out->effective_sample_rate = static_cast<uint32_t>(
+                (handle->metrics.bytes_total * 500ull) / out->stream_uptime_ms);
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t esp_rtl_sdr_get_hub_stats(esp_rtl_sdr_handle_t handle, esp_rtl_sdr_hub_stats_t *out)
+{
+    (void)handle;
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    session_fill_hub_stats(out);
     return ESP_OK;
 }
 
@@ -2688,7 +3166,10 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
 
         if (handle->delivery_task == nullptr) {
             handle->tasks_run = true;
-            if (xTaskCreatePinnedToCore(delivery_task_fn, "rtl_iq_del", 6144, handle,
+            char del_name[12];
+            std::snprintf(del_name, sizeof(del_name), "rtl_iq%u",
+                          static_cast<unsigned>(handle->logical_index));
+            if (xTaskCreatePinnedToCore(delivery_task_fn, del_name, 6144, handle,
                                         kDeliveryPrio, &handle->delivery_task,
                                         kDeliveryCore) != pdPASS) {
                 ret = ESP_ERR_NO_MEM;
@@ -2707,7 +3188,18 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->metrics.blocks_total = 0;
         handle->metrics.overruns = 0;
         handle->metrics.consumer_drops = 0;
+        handle->metrics.short_transfers = 0;
+        handle->usb_xfer_count = 0;
+        handle->usb_xfer_errors = 0;
+        handle->usb_timeouts = 0;
+        handle->queue_high_water = 0;
+        handle->last_xfer_timestamp_us = 0;
+        handle->iq_sequence = 0;
         handle->stream_start_ms = now_ms();
+        RTL_LOGI(handle, "stream start freq=%u sps=%u urbs=%ux%u",
+                 static_cast<unsigned>(freq), static_cast<unsigned>(local.sample_rate_sps),
+                 static_cast<unsigned>(handle->cfg.transfer_count),
+                 static_cast<unsigned>(handle->cfg.transfer_bytes));
         handle->pending_retune_hz = 0;
         handle->retune_busy = false;
         handle->pause_resubmit = false;
@@ -3207,6 +3699,41 @@ esp_err_t esp_rtl_sdr_get_device_at(esp_rtl_sdr_handle_t handle, size_t index,
     return ESP_OK;
 }
 
+esp_err_t esp_rtl_sdr_get_candidate_identity(esp_rtl_sdr_handle_t handle, size_t index,
+                                             esp_rtl_sdr_identity_t *out)
+{
+    if (out == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    HandleLock lk(handle, kQueryLockTicks);
+    if (!lk.ok()) {
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    if (index >= handle->candidate_count || !handle->candidates[index].valid) {
+        return ESP_RTL_SDR_ERR_BAD_DEVICE;
+    }
+    const DeviceCandidate &c = handle->candidates[index];
+    esp_rtl_sdr_identity_default(out);
+    out->logical_index = handle->logical_index;
+    out->usb_addr = c.addr;
+    out->parent_addr = c.parent_addr;
+    out->hub_port = c.hub_port;
+    out->enum_index = static_cast<uint8_t>(index);
+    out->vid = c.info.vid;
+    out->pid = c.info.pid;
+    std::snprintf(out->serial, sizeof(out->serial), "%s", c.info.serial);
+    std::snprintf(out->manufacturer, sizeof(out->manufacturer), "%s", c.info.manufacturer);
+    std::snprintf(out->product, sizeof(out->product), "%s", c.info.product);
+    esp_rtl_sdr_format_usb_path(c.parent_addr, c.hub_port, out->usb_path, sizeof(out->usb_path));
+    out->high_speed = c.info.high_speed;
+    out->present = c.info.present;
+    out->profile = rtl_profile_to_public(c.profile);
+    return ESP_OK;
+}
+
 esp_err_t esp_rtl_sdr_select_device(esp_rtl_sdr_handle_t handle, size_t index)
 {
     if (!handle_ok(handle)) {
@@ -3245,9 +3772,7 @@ esp_err_t esp_rtl_sdr_select_device(esp_rtl_sdr_handle_t handle, size_t index)
             return ESP_OK;
         }
         if (handle->dev != nullptr) {
-            usb_host_device_close(handle->client, handle->dev);
-            handle->dev = nullptr;
-            handle->open_addr = 0;
+            close_opened_device(handle);
             clear_profile_runtime_state(handle);
             handle->info = {};
             handle->info.present = false;
@@ -3318,9 +3843,7 @@ esp_err_t esp_rtl_sdr_select_device_serial(esp_rtl_sdr_handle_t handle, const ch
             return ESP_OK;
         }
         if (handle->dev != nullptr) {
-            usb_host_device_close(handle->client, handle->dev);
-            handle->dev = nullptr;
-            handle->open_addr = 0;
+            close_opened_device(handle);
             clear_profile_runtime_state(handle);
             handle->info = {};
             handle->info.present = false;

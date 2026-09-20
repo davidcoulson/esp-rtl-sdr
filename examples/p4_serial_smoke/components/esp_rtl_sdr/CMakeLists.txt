@@ -9,6 +9,7 @@ idf_component_register(
     SRCS
         "${ESP_RTL_SDR_ROOT}/src/esp_rtl_sdr.cpp"
         "${ESP_RTL_SDR_ROOT}/src/esp_rtl_sdr_policy.cpp"
+        "${ESP_RTL_SDR_ROOT}/src/esp_rtl_sdr_multi.cpp"
     INCLUDE_DIRS
         "${ESP_RTL_SDR_ROOT}/include"
     PRIV_INCLUDE_DIRS
