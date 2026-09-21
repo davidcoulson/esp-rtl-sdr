@@ -343,6 +343,14 @@ struct esp_rtl_sdr_handle {
     volatile uint32_t live_urbs = 0;
     /** When true, bulk_cb must not resubmit (stop or retune drain). */
     volatile bool pause_resubmit = false;
+    /** Set by bulk_cb when a resubmit fails, meaning the bulk IN endpoint has
+     * been halted by a transfer error. Cleared by the delivery task once the
+     * endpoint is cleared and the URBs are back in flight. */
+    volatile bool ep_stall_recover = false;
+    volatile uint32_t ep_recoveries = 0;
+    /** ep_recoveries value when data last arrived; used to give up if
+     * recovery keeps failing rather than looping forever. */
+    volatile uint32_t ep_recoveries_at_data = 0;
     SemaphoreHandle_t bulk_done_sem = nullptr;
 
     IqSlot ring[kRingDepth]{};
@@ -1285,6 +1293,7 @@ static void bulk_cb(usb_transfer_t *xfer)
                 h->metrics.short_transfers++;
             }
             h->last_xfer_timestamp_us = slot->host_timestamp_us;
+            h->ep_recoveries_at_data = h->ep_recoveries;
             if (h->filled_q != nullptr) {
                 const UBaseType_t waiting = uxQueueMessagesWaiting(h->filled_q);
                 if (static_cast<uint32_t>(waiting) + 1u > h->queue_high_water) {
@@ -1335,8 +1344,22 @@ static void bulk_cb(usb_transfer_t *xfer)
     if (h->streaming && !h->pause_resubmit) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
-            RTL_LOGE(h, "bulk resubmit failed: %s", esp_err_to_name(ret));
-            h->streaming = false;
+            /* A bulk transfer error halts the endpoint, and every later
+             * submit on that pipe then fails. Killing the stream here made a
+             * single error permanent: all bulk_num URBs share h->streaming,
+             * so one failed resubmit retired every one of them and the device
+             * went silent while still reporting STATE_STREAMING.
+             *
+             * That is rare with one dongle and common with two, because they
+             * share a bus. It is what stalled the second receiver at a fixed
+             * byte count with usb_errors=1 and drops=0.
+             *
+             * Ask the delivery task to clear the endpoint and resubmit
+             * instead. usb_host_endpoint_clear() must not be called from this
+             * callback - it runs on the USB client task. */
+            RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
+                     esp_err_to_name(ret));
+            h->ep_stall_recover = true;
             if (h->live_urbs > 0) {
                 h->live_urbs--;
             }
@@ -1423,6 +1446,45 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
             h->live_urbs++;
         }
     }
+}
+
+/**
+ * Clear a halted bulk IN endpoint and put the URBs back in flight.
+ *
+ * Must run on a task, never on the USB client task: usb_host_endpoint_clear()
+ * is not callable from a transfer callback. The delivery task already does
+ * EP0 work for this reason, so it owns this too.
+ *
+ * Gives up after kEpRecoverAttempts consecutive tries with no data in
+ * between, so a genuinely unplugged or wedged device surfaces as a stopped
+ * stream rather than looping here forever.
+ */
+static constexpr uint32_t kEpRecoverAttempts = 8;
+
+static void bulk_recover_stall(esp_rtl_sdr_handle *h)
+{
+    if (h == nullptr || h->bulk == nullptr) {
+        return;
+    }
+    h->ep_stall_recover = false;
+    if (h->ep_recoveries - h->ep_recoveries_at_data >= kEpRecoverAttempts) {
+        RTL_LOGE(h, "bulk EP recovery failed %u times with no data; stopping",
+                 static_cast<unsigned>(kEpRecoverAttempts));
+        h->streaming = false;
+        return;
+    }
+    h->ep_recoveries++;
+    h->pause_resubmit = true;
+    (void)drain_live_urbs(h, 100, 100);
+    if (h->dev != nullptr) {
+        usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+        usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+        usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+    }
+    bulk_resume(h);
+    RTL_LOGW(h, "bulk EP recovered (attempt %u, live_urbs=%u)",
+             static_cast<unsigned>(h->ep_recoveries),
+             static_cast<unsigned>(h->live_urbs));
 }
 
 /**
@@ -1738,6 +1800,11 @@ static void delivery_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
     while (h->tasks_run) {
+        /* A halted bulk IN endpoint can only be cleared from a task. */
+        if (h->streaming && h->ep_stall_recover && !h->pause_resubmit &&
+            !h->retune_busy && !h->ep0_sideband_busy) {
+            bulk_recover_stall(h);
+        }
         /* Async EP0 off the USB client task (retune first, then gain/bias). */
         if (h->streaming && h->pending_retune_hz != 0 && !h->retune_busy &&
             !h->ep0_sideband_busy) {
