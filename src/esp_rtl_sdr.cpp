@@ -97,19 +97,25 @@ struct UsbFaultGuardState {
      * post-install settle window elapsed with nothing attached. Read at the
      * next boot — see usb_fault_guard_boot_check(). */
     bool pending_risk;
-    bool safe_mode_active_this_boot;
-    esp_timer_handle_t timer;
 };
 
+/* Only magic/panic_count/pending_risk may live in RTC_NOINIT. esp_timer
+ * handles and this-boot flags are process-lifetime state: retaining a timer
+ * handle across reboot made fault_guard_reset() call esp_timer_stop/delete
+ * on a stale pointer (MTVAL ~0xe127....), which is the recurring first-boot
+ * Load access fault after clearing the fault guard once. */
 RTC_NOINIT_ATTR static UsbFaultGuardState s_usb_fault_guard;
-static_assert(sizeof(UsbFaultGuardState) == 16,
-              "fault guard must stay within its retained-state allocation");
+static_assert(sizeof(UsbFaultGuardState) == 12,
+              "fault guard RTC payload is magic+panic_count+pending_risk");
+
+static bool s_usb_fault_guard_safe_mode_this_boot = false;
+static esp_timer_handle_t s_usb_fault_guard_timer = nullptr;
 
 static void usb_fault_guard_disarm(void)
 {
     __atomic_store_n(&s_usb_fault_guard.pending_risk, false, __ATOMIC_RELEASE);
     esp_timer_handle_t timer =
-        __atomic_exchange_n(&s_usb_fault_guard.timer, nullptr, __ATOMIC_ACQ_REL);
+        __atomic_exchange_n(&s_usb_fault_guard_timer, nullptr, __ATOMIC_ACQ_REL);
     if (timer != nullptr) {
         esp_timer_stop(timer);
         esp_timer_delete(timer);
@@ -136,7 +142,7 @@ static void usb_fault_guard_arm(void)
     };
     esp_timer_handle_t timer = nullptr;
     if (esp_timer_create(&args, &timer) == ESP_OK) {
-        __atomic_store_n(&s_usb_fault_guard.timer, timer, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_usb_fault_guard_timer, timer, __ATOMIC_RELEASE);
         /* Observed panics land ~3.3-3.4 s after usb_host_install(); 8 s is a
          * generous margin for a slow-enumerating device before we stop
          * treating "no crash yet" as still-at-risk. */
@@ -150,12 +156,16 @@ static void usb_fault_guard_arm(void)
  */
 static bool usb_fault_guard_boot_check(void)
 {
+    /* Timer handles live in BSS and are already null after reboot; never
+     * esp_timer_delete a value recovered from RTC. */
+    s_usb_fault_guard_timer = nullptr;
+    s_usb_fault_guard_safe_mode_this_boot = false;
+
     if (s_usb_fault_guard.magic != kUsbFaultGuardMagic) {
         /* First install() since power-on (RTC memory contents undefined). */
         s_usb_fault_guard.magic = kUsbFaultGuardMagic;
         s_usb_fault_guard.panic_count = 0;
         s_usb_fault_guard.pending_risk = false;
-        s_usb_fault_guard.timer = nullptr;
     } else if (s_usb_fault_guard.pending_risk) {
         /* Last boot crashed (or is otherwise gone) while we were still in
          * the risky enumeration window. Only count it if the crash was a
@@ -165,19 +175,17 @@ static bool usb_fault_guard_boot_check(void)
         } else {
             s_usb_fault_guard.panic_count = 0;
         }
-        s_usb_fault_guard.timer = nullptr;
     } else if (s_usb_fault_guard.panic_count < kUsbFaultGuardPanicThreshold) {
         /* Previous boot's risky window closed cleanly (or none happened). */
         s_usb_fault_guard.panic_count = 0;
     }
     s_usb_fault_guard.pending_risk = false;
-    s_usb_fault_guard.safe_mode_active_this_boot = false;
     return s_usb_fault_guard.panic_count >= kUsbFaultGuardPanicThreshold;
 }
 
 bool esp_rtl_sdr_usb_safe_mode_active(void)
 {
-    return s_usb_fault_guard.safe_mode_active_this_boot;
+    return s_usb_fault_guard_safe_mode_this_boot;
 }
 
 esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
@@ -185,7 +193,7 @@ esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
     s_usb_fault_guard.magic = kUsbFaultGuardMagic;
     s_usb_fault_guard.panic_count = 0;
     s_usb_fault_guard.pending_risk = false;
-    s_usb_fault_guard.safe_mode_active_this_boot = false;
+    s_usb_fault_guard_safe_mode_this_boot = false;
     usb_fault_guard_disarm();
     return ESP_OK;
 }
@@ -2580,7 +2588,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     }
 
     if (usb_fault_guard_boot_check()) {
-        s_usb_fault_guard.safe_mode_active_this_boot = true;
+        s_usb_fault_guard_safe_mode_this_boot = true;
         ESP_LOGE(TAG,
                  "USB fault guard latched: %u consecutive enumeration-time panics; "
                  "skipping usb_host_install this boot. Call "
@@ -2593,7 +2601,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
         delete h;
         return ESP_RTL_SDR_ERR_USB_SAFE_MODE;
     }
-    s_usb_fault_guard.safe_mode_active_this_boot = false;
+    s_usb_fault_guard_safe_mode_this_boot = false;
 
     usb_fault_guard_arm();
     esp_err_t ret = start_usb_stack(h);
