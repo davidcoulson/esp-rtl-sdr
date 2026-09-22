@@ -857,8 +857,31 @@ static esp_err_t run_record(esp_rtl_sdr_handle *h, const RtlControlRecord &rec,
                             bool expect_stall)
 {
     const RtlControlRecord mapped = map_tuner_record_for_profile(h, rec);
-    return ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index, mapped.data,
-                       mapped.length, expect_stall);
+    const esp_err_t err = ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index,
+                                      mapped.data, mapped.length, expect_stall);
+    if (err != ESP_OK && !expect_stall) {
+        /* Name the record the device rejected.
+         *
+         * Profiles that borrow another board's init template (the R820T2
+         * 0x74->0x34 remap used by Blog V3 and Nooelec) will have records
+         * their silicon does not accept, and "Dev N EP 0 STALL" from USBH
+         * alone cannot say which. Without this, closing those gaps means
+         * guessing at register tables - which is exactly what this driver
+         * has deliberately avoided doing.
+         *
+         * Logged at warning level and the error is still returned; this only
+         * adds attribution, it does not change control flow. */
+        RTL_LOGW(h,
+                 "ctrl record rejected: profile=%s req=0x%02x value=0x%04x "
+                 "index=0x%04x len=%u data0=0x%02x -> %s%s",
+                 rtl_profile_name(h->profile), mapped.request_type,
+                 static_cast<unsigned>(mapped.value),
+                 static_cast<unsigned>(mapped.index),
+                 static_cast<unsigned>(mapped.length),
+                 static_cast<unsigned>(mapped.data[0]), esp_err_to_name(err),
+                 h->ctrl_stall ? " (STALL)" : "");
+    }
+    return err;
 }
 
 /*
