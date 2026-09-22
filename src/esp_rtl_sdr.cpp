@@ -4034,6 +4034,70 @@ esp_err_t esp_rtl_sdr_usb_device_count(size_t *out_count)
     return ESP_OK;
 }
 
+/* USB 2.0 ch11 hub class. Not pulled from usb_types_ch11.h so this builds
+ * against IDF versions that keep those headers private. */
+static constexpr uint8_t kHubClass           = 0x09;
+static constexpr uint8_t kReqTypeSetPortFeat = 0x23; /* host->dev, class, other */
+static constexpr uint8_t kReqClearFeature    = 0x01;
+static constexpr uint8_t kReqSetFeature      = 0x03;
+static constexpr uint16_t kFeatPortPower     = 8;
+
+esp_err_t esp_rtl_sdr_hub_port_power_cycle(esp_rtl_sdr_handle_t handle, uint32_t off_ms)
+{
+    if (!handle_ok(handle)) {
+        return ESP_RTL_SDR_ERR_STALE_HANDLE;
+    }
+    esp_rtl_sdr_handle *h = handle;
+    if (h->client == nullptr) {
+        return ESP_RTL_SDR_ERR_NOT_READY;
+    }
+    if (off_ms == 0) {
+        off_ms = 300;
+    }
+
+    uint8_t addrs[ESP_RTL_SDR_MAX_DEVICES * 4];
+    int n = 0;
+    if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &n) != ESP_OK || n <= 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    int hubs = 0;
+    for (int i = 0; i < n; ++i) {
+        usb_device_handle_t dev = nullptr;
+        if (usb_host_device_open(h->client, addrs[i], &dev) != ESP_OK) {
+            continue;
+        }
+        const usb_device_desc_t *dd = nullptr;
+        if (usb_host_get_device_descriptor(dev, &dd) != ESP_OK || dd == nullptr ||
+            dd->bDeviceClass != kHubClass) {
+            usb_host_device_close(h->client, dev);
+            continue;
+        }
+
+        /* bNbrPorts lives in the hub descriptor. Reading it needs another
+         * class request, and a wrong port number is harmless (the hub
+         * stalls it), so probe a fixed small range instead of adding a
+         * descriptor round trip to a recovery path. */
+        const uint8_t kMaxPorts = 8;
+        ESP_LOGW(TAG, "hub at addr %u: dropping downstream port power for %u ms",
+                 static_cast<unsigned>(addrs[i]), static_cast<unsigned>(off_ms));
+        for (uint8_t port = 1; port <= kMaxPorts; ++port) {
+            (void)ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqClearFeature,
+                                     kFeatPortPower, port, nullptr, 0, true);
+        }
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+        for (uint8_t port = 1; port <= kMaxPorts; ++port) {
+            (void)ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqSetFeature,
+                                     kFeatPortPower, port, nullptr, 0, true);
+        }
+        ESP_LOGW(TAG, "hub at addr %u: downstream port power restored",
+                 static_cast<unsigned>(addrs[i]));
+        usb_host_device_close(h->client, dev);
+        hubs++;
+    }
+    return (hubs > 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
 esp_err_t esp_rtl_sdr_refresh_device_list(esp_rtl_sdr_handle_t handle)
 {
     if (!handle_ok(handle)) {

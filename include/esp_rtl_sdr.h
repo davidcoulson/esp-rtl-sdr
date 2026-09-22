@@ -1045,6 +1045,31 @@ esp_err_t esp_rtl_sdr_get_device_count(esp_rtl_sdr_handle_t handle, size_t *out_
 esp_err_t esp_rtl_sdr_usb_device_count(size_t *out_count);
 
 /**
+ * Power-cycle the downstream ports of any external hub on the bus.
+ *
+ * Toggling the ESP32-P4 ROOT port does nothing useful when the hub is
+ * self-powered: it cannot remove power from such a hub, so the devices
+ * behind it keep whatever stale state they had. This instead asks the hub
+ * itself, over hub-class control requests, to drop and restore power on its
+ * own downstream ports - which does reach the dongles.
+ *
+ * Why it is needed: after a warm MCU reset the devices behind the hub are
+ * still powered and still configured from the previous session. IDF creates
+ * a device tree node for the first one and then the whole USB host stack
+ * goes silent - no descriptor read, no address assignment, no timeout, no
+ * retry - and the remaining hub ports are never scanned, so only one device
+ * is ever seen and none complete enumeration.
+ *
+ * @param handle  any installed handle; only its USB client is used
+ * @param off_ms  how long to leave port power off (100-1000 is sensible)
+ *
+ * Returns ESP_ERR_NOT_FOUND when no hub could be opened, which is itself
+ * the useful answer - it means this recovery is unavailable and the port
+ * power must be removed some other way.
+ */
+esp_err_t esp_rtl_sdr_hub_port_power_cycle(esp_rtl_sdr_handle_t handle, uint32_t off_ms);
+
+/**
  * Snapshot candidate info at index [0, count).
  * Does not change which device is open.
  */
