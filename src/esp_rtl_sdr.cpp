@@ -3196,13 +3196,29 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->iface_claimed = true;
 
         if (rtl_profile_uses_r820t2_i2c_remap(handle->profile)) {
-            /* Provisional R820T2 path (Blog V3 + Nooelec): same USB IR template
-             * remapping 0x74→0x34. Blog V3 can switch to its separately captured
-             * direct path; Nooelec remains fail-closed below 24 MHz. */
-            ESP_LOGW(TAG,
-                     "%s: provisional R820T2 stream (I2C 0x34 remap); "
-                     "maintainer-unverified — please report soak results",
-                     rtl_profile_name(handle->profile));
+            /* Shared R820T2 path (Blog V3 + Nooelec): same USB IR template
+             * remapping 0x74->0x34. Blog V3 can switch to its separately
+             * captured direct-sampling path; Nooelec remains fail-closed
+             * below 24 MHz.
+             *
+             * Blog V3 is soak-verified as of 2026-09-21: 1.62 GB at
+             * 1.024 MS/s over 787 s, concurrently with a Blog V4 at
+             * 2.4 MS/s behind an external USB hub, with usb_transfer_errors
+             * = 0 and IQ age never above 5 ms. Measured rate 2.06 MB/s
+             * against 2.048 nominal. Zero init records were rejected.
+             *
+             * Nooelec has no such soak and keeps the warning. */
+            if (handle->profile == RtlProfileId::BlogV3) {
+                ESP_LOGI(TAG,
+                         "%s: R820T2 stream (I2C 0x34 remap); soak-verified "
+                         "2026-09-21 (1.62 GB, 787 s, 0 usb errors)",
+                         rtl_profile_name(handle->profile));
+            } else {
+                ESP_LOGW(TAG,
+                         "%s: provisional R820T2 stream (I2C 0x34 remap); "
+                         "maintainer-unverified - please report soak results",
+                         rtl_profile_name(handle->profile));
+            }
         }
         ret = run_init_table(handle);
         if (ret != ESP_OK) {

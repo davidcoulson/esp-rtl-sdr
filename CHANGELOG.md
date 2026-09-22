@@ -2,6 +2,45 @@
 
 ## Unreleased — concurrent multi-receiver foundation (`esp-rtl-sdr-signal-anomaly`)
 
+### Fixed
+
+- **A halted bulk IN endpoint no longer kills the stream.** A transfer error
+  halts the endpoint, after which every `usb_host_transfer_submit()` on that
+  pipe fails. `bulk_cb` responded by setting `streaming = false`, and since
+  all URBs share that flag one failed resubmit retired every one of them -
+  permanently, while `esp_rtl_sdr_get_state()` still reported
+  `STATE_STREAMING`, so nothing upstream could see it. `bulk_cb` now flags
+  recovery and the delivery task clears the endpoint and resubmits via
+  `bulk_resume()`; the clear must happen on a task, not in the transfer
+  callback. Gives up after 8 consecutive attempts with no data so an
+  unplugged device still surfaces as stopped.
+- Rare with one dongle, common with two sharing a bus.
+
+### Added
+
+- `run_record()` logs the profile, request type, value, index, length and
+  first data byte of any control record a device rejects, plus whether it
+  STALLed. Profiles that borrow another board's init template will contain
+  records their silicon does not accept, and `Dev N EP 0 STALL` from USBH
+  does not say which - so closing those gaps meant guessing. Attribution,
+  not invention.
+
+### Changed
+
+- **Blog V3 R820T2 streaming promoted from provisional to soak-verified**
+  (2026-09-21). 1.62 GB at 1.024 MS/s over 787 s, concurrently with a Blog
+  V4 at 2.4 MS/s behind an external USB hub: `usb_transfer_errors = 0`, IQ
+  age never above 5 ms, measured 2.06 MB/s against 2.048 nominal, and zero
+  init records rejected. It still runs the shared R820T2 template with the
+  0x74->0x34 remap - there is no first-party V3 VHF/UHF capture - but the
+  path is now evidenced rather than assumed. Nooelec shares the template,
+  has no such soak, and keeps the provisional warning.
+
+  Note for anyone chasing a similar fault: the EP0 STALLs seen during V3
+  setup are the tuner-identification walk across I2C addresses and are
+  expected. A Blog V4 throws six of them during its own probe and streams
+  perfectly. They are not evidence of a bad init table.
+
 ### Added
 
 - Shared USB host session (refcount) so multiple handles do not each call
