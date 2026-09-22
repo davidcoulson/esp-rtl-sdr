@@ -1280,7 +1280,8 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 /* -------------------------------------------------------------------------- */
 
 /* Defined below; bulk_cb's read-only fast path fills the ring directly. */
-static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
+static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes,
+                           TickType_t wait_ticks);
 
 static void bulk_cb(usb_transfer_t *xfer)
 {
@@ -1329,7 +1330,7 @@ static void bulk_cb(usb_transfer_t *xfer)
             h->metrics.bytes_total += n;
             h->metrics.blocks_total++;
 
-            (void)pull_ring_push(h, xfer->data_buffer, n);
+            (void)pull_ring_push(h, xfer->data_buffer, n, 0);
 
             if (h->streaming && !h->pause_resubmit) {
                 esp_err_t rs = usb_host_transfer_submit(xfer);
@@ -1650,7 +1651,8 @@ static size_t pull_ring_space(const esp_rtl_sdr_handle *h)
     return h->pull_cap - h->pull_count;
 }
 
-static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes)
+static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes,
+                           TickType_t wait_ticks)
 {
     if (h == nullptr || h->pull_buf == nullptr || h->pull_mux == nullptr || data == nullptr ||
         bytes == 0) {
@@ -1658,12 +1660,13 @@ static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
     }
 
     /*
-     * Never wait in the USB completion path. The reader now holds this mutex
-     * only for one or two bounded memcpy() operations, so contention should
-     * be brief. If it still collides, account for one lost input buffer
-     * instead of silently blocking usb_host_client_handle_events().
+     * The USB completion path passes wait_ticks=0 so it never waits here.
+     * Delivery-task callers retain their small bounded wait. The reader now
+     * holds this mutex only for one or two bounded memcpy() operations, so
+     * callback contention should be brief. If it still collides, account for
+     * one lost input buffer instead of silently blocking USB event service.
      */
-    if (xSemaphoreTake(h->pull_mux, 0) != pdTRUE) {
+    if (xSemaphoreTake(h->pull_mux, wait_ticks) != pdTRUE) {
         h->metrics.overruns++;
         h->metrics.consumer_drops++;
         return false;
@@ -1967,7 +1970,7 @@ static void delivery_task_fn(void *arg)
         /* Lazy pull ring: allocate only when mode uses read() and IQ arrives. */
         if (esp_rtl_sdr_delivery_mode_uses_read(mode)) {
             if (ensure_pull_ring(h) == ESP_OK) {
-                pull_ring_push(h, slot->data, slot->bytes);
+                (void)pull_ring_push(h, slot->data, slot->bytes, pdMS_TO_TICKS(5));
             } else {
                 HandleLock lk(h, kQueryLockTicks);
                 if (lk.ok()) {
