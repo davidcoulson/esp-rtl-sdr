@@ -400,7 +400,34 @@ typedef struct {
     uint32_t blocks_total;
     uint32_t short_transfers;
     uint32_t overruns;       /**< USB side could not keep consumer fed / free slots */
-    uint32_t consumer_drops; /**< app too slow (if ring drops newest/oldest) */
+    /**
+     * DEPRECATED, MIXED UNITS. Historically incremented by 1 when no free
+     * IqSlot existed AND by a byte count when the pull ring overwrote old
+     * data, then exported as dropped_buffers. A value here can therefore be
+     * a count of buffers, a count of bytes, or a sum of both, which made
+     * figures like 81920 (= 5 x 16384) look like tens of thousands of lost
+     * buffers when they were five ring losses counted in bytes.
+     *
+     * Kept so existing readers do not break. Use the separated counters
+     * below; each has one unit and one cause.
+     */
+    uint32_t consumer_drops;
+    /** No free IqSlot at completion time. Unit: blocks. */
+    uint32_t slot_starve_blocks;
+    /** Pull ring full, oldest data overwritten. Unit: blocks / bytes. */
+    uint32_t ring_overrun_blocks;
+    uint64_t ring_overrun_bytes;
+    /**
+     * pull_ring_push() could not take pull_mux and discarded a completed
+     * block. Previously invisible: the USB callback had already done all
+     * the work and the data vanished with no counter at all.
+     */
+    uint32_t pull_lock_miss_blocks;
+    uint64_t pull_lock_miss_bytes;
+    /** Bytes handed to the application by read(). Unit: bytes. */
+    uint64_t bytes_consumed;
+    /** Peak pull-ring occupancy in bytes, for pressure visibility. */
+    uint32_t ring_high_water;
     uint8_t sample_min;
     uint8_t sample_max;
     float sample_mean; /**< not double: stable ABI, enough precision */
@@ -505,8 +532,18 @@ typedef struct {
     uint32_t usb_timeouts; /**< IDF USB host has no transfer timeouts yet; stays 0 */
     uint32_t short_transfers;
     uint32_t buffer_overruns;
+    /** DEPRECATED, MIXED UNITS - mirrors metrics.consumer_drops. */
     uint32_t dropped_buffers;
     uint32_t queue_high_water;
+    /* Separated loss accounting. Each has one unit and one cause, so every
+     * byte's fate is attributable. */
+    uint32_t slot_starve_blocks;
+    uint32_t ring_overrun_blocks;
+    uint64_t ring_overrun_bytes;
+    uint32_t pull_lock_miss_blocks;
+    uint64_t pull_lock_miss_bytes;
+    uint64_t bytes_consumed;
+    uint32_t ring_high_water_bytes;
     uint32_t stream_uptime_ms;
     uint32_t effective_sample_rate;
     int64_t last_transfer_timestamp_us;

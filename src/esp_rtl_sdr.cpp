@@ -1427,8 +1427,12 @@ static void bulk_cb(usb_transfer_t *xfer)
                 }
             }
         } else {
+            /* No free IqSlot. One BLOCK lost - the legacy counter adds 1
+             * here and a byte count elsewhere, which is what made it
+             * uninterpretable. */
             h->metrics.overruns++;
             h->metrics.consumer_drops++;
+            h->metrics.slot_starve_blocks++;
         }
     } else if (xfer->status != USB_TRANSFER_STATUS_CANCELED &&
                xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
@@ -1676,6 +1680,12 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
         return;
     }
     if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(5)) != pdTRUE) {
+        /* A completed block is being thrown away because the reader holds
+         * the ring. The USB callback has already done all the work by this
+         * point, so this is the most expensive possible way to lose data -
+         * and until now it had no counter at all. */
+        h->metrics.pull_lock_miss_blocks++;
+        h->metrics.pull_lock_miss_bytes += bytes;
         return;
     }
     size_t remaining = bytes;
@@ -1692,7 +1702,12 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
             }
             h->pull_r = (h->pull_r + drop) % h->pull_cap;
             h->pull_count -= drop;
+            /* Legacy field keeps its historical (byte) behaviour so existing
+             * readers do not shift under them; the separated counters below
+             * are the ones with a defined unit. */
             h->metrics.consumer_drops += static_cast<uint32_t>(drop);
+            h->metrics.ring_overrun_bytes += drop;
+            h->metrics.ring_overrun_blocks++;
         }
         const size_t space = pull_ring_space(h);
         if (space == 0) {
@@ -1709,6 +1724,9 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
             h->pull_w = chunk - first;
         }
         h->pull_count += chunk;
+        if (h->pull_count > h->metrics.ring_high_water) {
+            h->metrics.ring_high_water = static_cast<uint32_t>(h->pull_count);
+        }
         off += chunk;
         remaining -= chunk;
     }
@@ -3080,6 +3098,13 @@ esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
     esp_rtl_sdr_stream_stats_default(out);
     out->device_id = handle->logical_index;
     out->bytes_received = handle->metrics.bytes_total;
+    out->slot_starve_blocks = handle->metrics.slot_starve_blocks;
+    out->ring_overrun_blocks = handle->metrics.ring_overrun_blocks;
+    out->ring_overrun_bytes = handle->metrics.ring_overrun_bytes;
+    out->pull_lock_miss_blocks = handle->metrics.pull_lock_miss_blocks;
+    out->pull_lock_miss_bytes = handle->metrics.pull_lock_miss_bytes;
+    out->bytes_consumed = handle->metrics.bytes_consumed;
+    out->ring_high_water_bytes = handle->metrics.ring_high_water;
     out->samples_received = handle->metrics.bytes_total / 2u;
     out->usb_transfer_count = handle->usb_xfer_count;
     out->usb_transfer_errors = handle->usb_xfer_errors;
@@ -3421,6 +3446,13 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->metrics.frequency_hz = freq;
         handle->metrics.sample_rate_sps = local.sample_rate_sps;
         handle->metrics.bytes_total = 0;
+        handle->metrics.bytes_consumed = 0;
+        handle->metrics.slot_starve_blocks = 0;
+        handle->metrics.ring_overrun_blocks = 0;
+        handle->metrics.ring_overrun_bytes = 0;
+        handle->metrics.pull_lock_miss_blocks = 0;
+        handle->metrics.pull_lock_miss_bytes = 0;
+        handle->metrics.ring_high_water = 0;
         handle->metrics.blocks_total = 0;
         handle->metrics.overruns = 0;
         handle->metrics.consumer_drops = 0;
@@ -3778,10 +3810,40 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             }
             continue;
         }
-        while (copied < max_bytes && handle->pull_count > 0) {
-            out_buf[copied++] = handle->pull_buf[handle->pull_r];
-            handle->pull_r = (handle->pull_r + 1) % handle->pull_cap;
-            handle->pull_count--;
+        /* Bulk drain: at most two memcpy for the ring wrap.
+         *
+         * This loop used to copy ONE BYTE per iteration, with a modulo on
+         * pull_r and a decrement of pull_count each time, all inside the
+         * mutex. At three receivers and 14.4 MB/s that is ~14.4 million
+         * iterations and 14.4 million modulo operations per second, held
+         * against the same lock pull_ring_push() needs from the USB
+         * completion callback - so the hot producer path was waiting on the
+         * slowest possible consumer implementation.
+         *
+         * pull_ring_push() has always used chunked memcpy; only this side
+         * was byte-wise. The asymmetry was the bug.
+         *
+         * n is masked even to keep CU8 I/Q pairs together. Pushes are
+         * always multiples of 512 so pull_count stays even in practice;
+         * the mask is a guard, not a correction. */
+        {
+            size_t want = max_bytes - copied;
+            size_t n = (want < handle->pull_count) ? want : handle->pull_count;
+            n &= ~(size_t)1;
+            if (n > 0) {
+                const size_t first = handle->pull_cap - handle->pull_r;
+                const size_t c1 = (n < first) ? n : first;
+                std::memcpy(out_buf + copied, handle->pull_buf + handle->pull_r,
+                            c1);
+                if (n > c1) {
+                    std::memcpy(out_buf + copied + c1, handle->pull_buf,
+                                n - c1);
+                }
+                handle->pull_r = (handle->pull_r + n) % handle->pull_cap;
+                handle->pull_count -= n;
+                copied += n;
+                handle->metrics.bytes_consumed += n;
+            }
         }
         xSemaphoreGive(handle->pull_mux);
 
