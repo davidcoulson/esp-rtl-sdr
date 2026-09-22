@@ -2215,6 +2215,27 @@ static void rebuild_candidate_list(esp_rtl_sdr_handle *h)
         return;
     }
     for (int i = 0; i < n && h->candidate_count < ESP_RTL_SDR_MAX_DEVICES; ++i) {
+        /* Never probe a device another handle already owns.
+         *
+         * probe_candidate() opens the device and runs EP0 control
+         * transfers. On a device with an active bulk stream that halts its
+         * pipe, and the next resubmit fails with ESP_ERR_INVALID_STATE -
+         * the stream dies silently while still reporting STATE_STREAMING.
+         * With one dongle this almost never showed; with two it killed the
+         * second receiver 5.15 s after start, once per rescan.
+         *
+         * Applications were left choosing between hot-plug discovery and
+         * stable streams. They should not have to: a claimed address is
+         * already identified by its owner, so it is carried through as a
+         * candidate without being touched. Only unclaimed addresses get
+         * the invasive probe. */
+        if (rtl_claim_taken_by_other(&s_usb_session.claims, addrs[i],
+                                     h->logical_index)) {
+            DeviceCandidate held{};
+            held.addr = addrs[i];
+            h->candidates[h->candidate_count++] = held;
+            continue;
+        }
         DeviceCandidate cand{};
         if (probe_candidate(h, addrs[i], &cand, false)) {
             h->candidates[h->candidate_count++] = cand;
