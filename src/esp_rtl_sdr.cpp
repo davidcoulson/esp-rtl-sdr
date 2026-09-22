@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <atomic>
 #include <cstring>
 #include <iterator>
 #include <new>
@@ -423,9 +424,15 @@ struct esp_rtl_sdr_handle {
     /** Sync-read pull ring (CU8 bytes). Filled by delivery task. */
     uint8_t *pull_buf = nullptr;
     size_t pull_cap = 0;
-    size_t pull_r = 0;
-    size_t pull_w = 0;
-    size_t pull_count = 0;
+    /* Single-producer / single-consumer ring.
+     *
+     * pull_w is written ONLY by the USB completion callback, pull_r ONLY by
+     * esp_rtl_sdr_read(). Occupancy is derived from the pair, so neither
+     * side writes the other's index and no mutex is needed on either path.
+     * One slot is left empty so full and empty are distinguishable without
+     * a shared count - that count was the field that forced the lock. */
+    std::atomic<size_t> pull_r{0};
+    std::atomic<size_t> pull_w{0};
     SemaphoreHandle_t pull_mux = nullptr;
     SemaphoreHandle_t pull_sem = nullptr;
 };
@@ -1325,6 +1332,53 @@ static void bulk_cb(usb_transfer_t *xfer)
 
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > 0 &&
         h->streaming && !h->pause_resubmit) {
+        /* Read-only delivery: copy straight from the URB into the ring.
+         *
+         * This used to take an IqSlot, memcpy URB -> slot, populate slot
+         * metadata, then push slot -> ring and immediately recycle the
+         * slot. In READ mode none of that metadata is ever read - it exists
+         * for the callback delivery path - so the slot was a pure extra
+         * copy plus two queue operations per block, in a context that must
+         * stay short.
+         *
+         * Ownership: pull_ring_push() copies out of xfer->data_buffer and
+         * returns before the URB is resubmitted below, so the controller
+         * cannot overwrite the buffer while anything still reads it. This
+         * is one copy fewer, not zero-copy, which is the honest trade -
+         * handing the URB buffer itself onward would require ownership
+         * tracking the driver does not have.
+         *
+         * Delivery modes that use the callback are untouched and still go
+         * through the slot path. */
+        if (h->pull_buf != nullptr &&
+            esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
+            !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode)) {
+            const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
+            pull_ring_push(h, xfer->data_buffer, n);
+            h->metrics.bytes_total += n;
+            h->metrics.blocks_total++;
+            h->last_xfer_timestamp_us = esp_timer_get_time();
+            h->ep_recoveries_at_data = h->ep_recoveries;
+            if (n != static_cast<size_t>(h->bulk_len)) {
+                h->metrics.short_transfers++;
+            }
+            if (h->streaming && !h->pause_resubmit) {
+                const esp_err_t rs = usb_host_transfer_submit(xfer);
+                if (rs != ESP_OK) {
+                    RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
+                             esp_err_to_name(rs));
+                    h->ep_stall_recover = true;
+                    if (h->live_urbs > 0) {
+                        h->live_urbs--;
+                    }
+                    xSemaphoreGive(h->bulk_done_sem);
+                }
+            } else if (h->live_urbs > 0) {
+                h->live_urbs--;
+                xSemaphoreGive(h->bulk_done_sem);
+            }
+            return;
+        }
         IqSlot *slot = nullptr;
         if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
@@ -1668,69 +1722,65 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     return err;
 }
 
+static size_t pull_ring_used(const esp_rtl_sdr_handle *h)
+{
+    const size_t w = h->pull_w.load(std::memory_order_acquire);
+    const size_t r = h->pull_r.load(std::memory_order_acquire);
+    return (w >= r) ? (w - r) : (h->pull_cap - r + w);
+}
+
 static size_t pull_ring_space(const esp_rtl_sdr_handle *h)
 {
-    return h->pull_cap - h->pull_count;
+    /* -1: one slot stays empty so w == r means empty, never full. */
+    return h->pull_cap - 1 - pull_ring_used(h);
 }
 
 static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes)
 {
-    if (h == nullptr || h->pull_buf == nullptr || h->pull_mux == nullptr || data == nullptr ||
-        bytes == 0) {
+    if (h == nullptr || h->pull_buf == nullptr || data == nullptr || bytes == 0) {
         return;
     }
-    if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(5)) != pdTRUE) {
-        /* A completed block is being thrown away because the reader holds
-         * the ring. The USB callback has already done all the work by this
-         * point, so this is the most expensive possible way to lose data -
-         * and until now it had no counter at all. */
-        h->metrics.pull_lock_miss_blocks++;
-        h->metrics.pull_lock_miss_bytes += bytes;
+    /* Runs in the USB completion callback, which ESP-IDF invokes from
+     * usb_host_client_handle_events(). Blocking here stops that client's
+     * other USB events being serviced, so this path takes no lock at all.
+     *
+     * It previously waited up to 5 ms for pull_mux and silently discarded
+     * the block on timeout - the most expensive possible way to lose data,
+     * after the callback had already copied it.
+     *
+     * Overrun policy changed with the lock removal: the producer used to
+     * drop the OLDEST bytes, which meant writing pull_r and made the ring
+     * multi-writer. It now refuses the newest instead, leaving pull_r to
+     * the consumer alone. Both are counted the same way. */
+    const size_t space = pull_ring_space(h);
+    size_t n = (bytes < space) ? bytes : space;
+    n &= ~(size_t)1;                    /* keep CU8 I/Q pairs together */
+    if (n < bytes) {
+        const size_t lost = bytes - n;
+        h->metrics.consumer_drops += static_cast<uint32_t>(lost);
+        h->metrics.ring_overrun_bytes += lost;
+        h->metrics.ring_overrun_blocks++;
+    }
+    if (n == 0) {
         return;
     }
-    size_t remaining = bytes;
-    size_t off = 0;
-    while (remaining > 0) {
-        if (pull_ring_space(h) == 0) {
-            /* Drop oldest sample pair region (at least 1 byte) for room. */
-            size_t drop = remaining;
-            if (drop > h->pull_count) {
-                drop = h->pull_count;
-            }
-            if (drop == 0) {
-                break;
-            }
-            h->pull_r = (h->pull_r + drop) % h->pull_cap;
-            h->pull_count -= drop;
-            /* Legacy field keeps its historical (byte) behaviour so existing
-             * readers do not shift under them; the separated counters below
-             * are the ones with a defined unit. */
-            h->metrics.consumer_drops += static_cast<uint32_t>(drop);
-            h->metrics.ring_overrun_bytes += drop;
-            h->metrics.ring_overrun_blocks++;
-        }
-        const size_t space = pull_ring_space(h);
-        if (space == 0) {
-            break;
-        }
-        size_t chunk = remaining < space ? remaining : space;
-        const size_t first = h->pull_cap - h->pull_w;
-        if (chunk <= first) {
-            std::memcpy(h->pull_buf + h->pull_w, data + off, chunk);
-            h->pull_w = (h->pull_w + chunk) % h->pull_cap;
-        } else {
-            std::memcpy(h->pull_buf + h->pull_w, data + off, first);
-            std::memcpy(h->pull_buf, data + off + first, chunk - first);
-            h->pull_w = chunk - first;
-        }
-        h->pull_count += chunk;
-        if (h->pull_count > h->metrics.ring_high_water) {
-            h->metrics.ring_high_water = static_cast<uint32_t>(h->pull_count);
-        }
-        off += chunk;
-        remaining -= chunk;
+
+    const size_t w = h->pull_w.load(std::memory_order_relaxed);
+    const size_t first = h->pull_cap - w;
+    if (n <= first) {
+        std::memcpy(h->pull_buf + w, data, n);
+    } else {
+        std::memcpy(h->pull_buf + w, data, first);
+        std::memcpy(h->pull_buf, data + first, n - first);
     }
-    xSemaphoreGive(h->pull_mux);
+    /* Release: the copy above must be visible before the reader sees the
+     * advanced write index. */
+    h->pull_w.store((w + n) % h->pull_cap, std::memory_order_release);
+
+    const size_t used = pull_ring_used(h);
+    if (used > h->metrics.ring_high_water) {
+        h->metrics.ring_high_water = static_cast<uint32_t>(used);
+    }
     if (h->pull_sem != nullptr) {
         xSemaphoreGive(h->pull_sem);
     }
@@ -1742,7 +1792,11 @@ static void pull_ring_reset(esp_rtl_sdr_handle *h)
         return;
     }
     if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(50)) == pdTRUE) {
-        h->pull_r = h->pull_w = h->pull_count = 0;
+        /* Callers must guarantee no producer is in flight: either before the
+         * bulk pool is allocated, or after it has been freed. The mutex no
+         * longer provides that - the USB callback does not take it. */
+        h->pull_r.store(0, std::memory_order_relaxed);
+        h->pull_w.store(0, std::memory_order_relaxed);
         xSemaphoreGive(h->pull_mux);
     }
     if (h->pull_sem != nullptr) {
@@ -1761,7 +1815,9 @@ static void destroy_pull_ring_unlocked(esp_rtl_sdr_handle *h)
         free(h->pull_buf);
         h->pull_buf = nullptr;
     }
-    h->pull_cap = h->pull_r = h->pull_w = h->pull_count = 0;
+    h->pull_cap = 0;
+    h->pull_r.store(0, std::memory_order_relaxed);
+    h->pull_w.store(0, std::memory_order_relaxed);
     if (h->pull_mux != nullptr) {
         vSemaphoreDelete(h->pull_mux);
         h->pull_mux = nullptr;
@@ -1896,7 +1952,10 @@ static esp_err_t ensure_pull_ring(esp_rtl_sdr_handle *h)
     /* Publish fully-formed ring only after all pieces exist. */
     h->pull_buf = buf;
     h->pull_cap = need;
-    h->pull_r = h->pull_w = h->pull_count = 0;
+    h->pull_r.store(0, std::memory_order_relaxed);
+    h->pull_w.store(0, std::memory_order_relaxed);
+    /* pull_mux is retained for ABI/struct stability but is no longer taken
+     * on either hot path; the ring is SPSC and lock-free. */
     h->pull_mux = mux;
     h->pull_sem = sem;
     return ESP_OK;
@@ -3196,8 +3255,14 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
 
     if (drained) {
         free_bulk_pool(h);
+        /* Only safe once the bulk pool is gone. The producer no longer takes
+         * pull_mux, so resetting the indices while a URB is still in flight
+         * would race the completion callback: the indices stay in range, but
+         * occupancy and ring contents become meaningless. If we did not
+         * drain, leave the ring alone - stream start resets it before the
+         * first URB is submitted. */
+        pull_ring_reset(h);
     }
-    pull_ring_reset(h);
     h->stream_start_ms = 0;
     if (drained) {
         h->state = ESP_RTL_SDR_STATE_IDLE;
@@ -3801,51 +3866,32 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
     size_t copied = 0;
 
     for (;;) {
-        if (xSemaphoreTake(handle->pull_mux, pdMS_TO_TICKS(20)) != pdTRUE) {
-            if (timeout_ms == 0) {
-                break;
-            }
-            if (xTaskGetTickCount() >= deadline) {
-                break;
-            }
-            continue;
-        }
-        /* Bulk drain: at most two memcpy for the ring wrap.
-         *
-         * This loop used to copy ONE BYTE per iteration, with a modulo on
-         * pull_r and a decrement of pull_count each time, all inside the
-         * mutex. At three receivers and 14.4 MB/s that is ~14.4 million
-         * iterations and 14.4 million modulo operations per second, held
-         * against the same lock pull_ring_push() needs from the USB
-         * completion callback - so the hot producer path was waiting on the
-         * slowest possible consumer implementation.
-         *
-         * pull_ring_push() has always used chunked memcpy; only this side
-         * was byte-wise. The asymmetry was the bug.
-         *
-         * n is masked even to keep CU8 I/Q pairs together. Pushes are
-         * always multiples of 512 so pull_count stays even in practice;
-         * the mask is a guard, not a correction. */
+        /* Consumer half of the SPSC ring: reads pull_w, owns pull_r, takes
+         * no lock. The producer runs in the USB completion callback, so any
+         * lock here would be waited on from a context ESP-IDF says must not
+         * block. */
         {
+            const size_t r = handle->pull_r.load(std::memory_order_relaxed);
+            const size_t w = handle->pull_w.load(std::memory_order_acquire);
+            const size_t used = (w >= r) ? (w - r) : (handle->pull_cap - r + w);
             size_t want = max_bytes - copied;
-            size_t n = (want < handle->pull_count) ? want : handle->pull_count;
-            n &= ~(size_t)1;
+            size_t n = (want < used) ? want : used;
+            n &= ~(size_t)1;            /* keep CU8 I/Q pairs together */
             if (n > 0) {
-                const size_t first = handle->pull_cap - handle->pull_r;
+                const size_t first = handle->pull_cap - r;
                 const size_t c1 = (n < first) ? n : first;
-                std::memcpy(out_buf + copied, handle->pull_buf + handle->pull_r,
-                            c1);
+                std::memcpy(out_buf + copied, handle->pull_buf + r, c1);
                 if (n > c1) {
-                    std::memcpy(out_buf + copied + c1, handle->pull_buf,
-                                n - c1);
+                    std::memcpy(out_buf + copied + c1, handle->pull_buf, n - c1);
                 }
-                handle->pull_r = (handle->pull_r + n) % handle->pull_cap;
-                handle->pull_count -= n;
+                /* Release: the copy must complete before the producer sees
+                 * the space freed. */
+                handle->pull_r.store((r + n) % handle->pull_cap,
+                                     std::memory_order_release);
                 copied += n;
                 handle->metrics.bytes_consumed += n;
             }
         }
-        xSemaphoreGive(handle->pull_mux);
 
         if (copied > 0) {
             *out_bytes = copied;
