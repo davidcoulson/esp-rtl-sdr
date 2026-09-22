@@ -1279,6 +1279,9 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 /* Bulk + ring                                                                */
 /* -------------------------------------------------------------------------- */
 
+/* Defined below; bulk_cb's read-only fast path fills the ring directly. */
+static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
+
 static void bulk_cb(usb_transfer_t *xfer)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(xfer->context);
@@ -1317,6 +1320,50 @@ static void bulk_cb(usb_transfer_t *xfer)
             }
             h->last_xfer_timestamp_us = slot->host_timestamp_us;
             h->ep_recoveries_at_data = h->ep_recoveries;
+
+            /* Read-only delivery: fill the pull ring here and recycle the
+             * slot immediately, instead of routing it through filled_q and
+             * the delivery task.
+             *
+             * DELIVERY_READ never invoked the IQ callback, but the delivery
+             * task still ran for every block: pop from filled_q, take the
+             * handle lock, compute health, memcpy into the pull ring, push
+             * the slot back to free_q. So a byte was copied three times
+             * (URB -> slot, slot -> pull ring, pull ring -> caller) and
+             * crossed two queues and a mutex before the application saw it.
+             * At three receivers and 14.4 MB/s that is ~43 MB/s of memcpy
+             * on a 360 MHz core plus per-block scheduling, which is where
+             * the aggregate stalled around 8 MB/s while two receivers ran
+             * 9.9 MB/s clean.
+             *
+             * This path drops one copy, both queue round trips and the
+             * delivery-task wakeup. Modes that use the callback are
+             * untouched - they still need the slot delivered on a task,
+             * because a callback must not run in this context. */
+            if (esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
+                !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode) &&
+                h->pull_buf != nullptr) {
+                pull_ring_push(h, slot->data, slot->bytes);
+                h->metrics.bytes_total += slot->bytes;
+                h->metrics.blocks_total++;
+                (void)xQueueSend(h->free_q, &slot, 0);
+                if (h->streaming && !h->pause_resubmit) {
+                    esp_err_t rs = usb_host_transfer_submit(xfer);
+                    if (rs != ESP_OK) {
+                        RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
+                                 esp_err_to_name(rs));
+                        h->ep_stall_recover = true;
+                        if (h->live_urbs > 0) {
+                            h->live_urbs--;
+                        }
+                        xSemaphoreGive(h->bulk_done_sem);
+                    }
+                } else if (h->live_urbs > 0) {
+                    h->live_urbs--;
+                    xSemaphoreGive(h->bulk_done_sem);
+                }
+                return;
+            }
             if (h->filled_q != nullptr) {
                 const UBaseType_t waiting = uxQueueMessagesWaiting(h->filled_q);
                 if (static_cast<uint32_t>(waiting) + 1u > h->queue_high_water) {
