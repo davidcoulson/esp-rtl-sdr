@@ -1029,6 +1029,22 @@ esp_err_t esp_rtl_sdr_refresh_device_list(esp_rtl_sdr_handle_t handle);
 esp_err_t esp_rtl_sdr_get_device_count(esp_rtl_sdr_handle_t handle, size_t *out_count);
 
 /**
+ * Number of devices currently on the USB bus, whatever they are.
+ *
+ * This is the raw host device list - hubs, non-RTL devices and RTL dongles
+ * that have not finished enumerating all count. It is deliberately NOT the
+ * accepted-candidate count from esp_rtl_sdr_get_device_count().
+ *
+ * It exists so a caller can tell "the bus is empty" apart from "the bus is
+ * busy enumerating and no RTL device has been accepted yet". Those look
+ * identical through the candidate count, and confusing them makes recovery
+ * logic tear down enumeration that was still in progress.
+ *
+ * Needs no handle: it asks the USB host library, not a device.
+ */
+esp_err_t esp_rtl_sdr_usb_device_count(size_t *out_count);
+
+/**
  * Snapshot candidate info at index [0, count).
  * Does not change which device is open.
  */

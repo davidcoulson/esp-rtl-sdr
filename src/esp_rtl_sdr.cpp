@@ -4016,6 +4016,24 @@ esp_err_t esp_rtl_sdr_get_freq_correction(esp_rtl_sdr_handle_t handle, int *out_
     return ESP_OK;
 }
 
+esp_err_t esp_rtl_sdr_usb_device_count(size_t *out_count)
+{
+    if (out_count == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_count = 0;
+    uint8_t addrs[ESP_RTL_SDR_MAX_DEVICES * 4];
+    int n = 0;
+    const esp_err_t ret = usb_host_device_addr_list_fill(sizeof(addrs), addrs, &n);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (n > 0) {
+        *out_count = static_cast<size_t>(n);
+    }
+    return ESP_OK;
+}
+
 esp_err_t esp_rtl_sdr_refresh_device_list(esp_rtl_sdr_handle_t handle)
 {
     if (!handle_ok(handle)) {
