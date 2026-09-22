@@ -97,25 +97,19 @@ struct UsbFaultGuardState {
      * post-install settle window elapsed with nothing attached. Read at the
      * next boot — see usb_fault_guard_boot_check(). */
     bool pending_risk;
+    bool safe_mode_active_this_boot;
+    esp_timer_handle_t timer;
 };
 
-/* Only magic/panic_count/pending_risk may live in RTC_NOINIT. esp_timer
- * handles and this-boot flags are process-lifetime state: retaining a timer
- * handle across reboot made fault_guard_reset() call esp_timer_stop/delete
- * on a stale pointer (MTVAL ~0xe127....), which is the recurring first-boot
- * Load access fault after clearing the fault guard once. */
 RTC_NOINIT_ATTR static UsbFaultGuardState s_usb_fault_guard;
-static_assert(sizeof(UsbFaultGuardState) == 12,
-              "fault guard RTC payload is magic+panic_count+pending_risk");
-
-static bool s_usb_fault_guard_safe_mode_this_boot = false;
-static esp_timer_handle_t s_usb_fault_guard_timer = nullptr;
+static_assert(sizeof(UsbFaultGuardState) == 16,
+              "fault guard must stay within its retained-state allocation");
 
 static void usb_fault_guard_disarm(void)
 {
     __atomic_store_n(&s_usb_fault_guard.pending_risk, false, __ATOMIC_RELEASE);
     esp_timer_handle_t timer =
-        __atomic_exchange_n(&s_usb_fault_guard_timer, nullptr, __ATOMIC_ACQ_REL);
+        __atomic_exchange_n(&s_usb_fault_guard.timer, nullptr, __ATOMIC_ACQ_REL);
     if (timer != nullptr) {
         esp_timer_stop(timer);
         esp_timer_delete(timer);
@@ -142,7 +136,7 @@ static void usb_fault_guard_arm(void)
     };
     esp_timer_handle_t timer = nullptr;
     if (esp_timer_create(&args, &timer) == ESP_OK) {
-        __atomic_store_n(&s_usb_fault_guard_timer, timer, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_usb_fault_guard.timer, timer, __ATOMIC_RELEASE);
         /* Observed panics land ~3.3-3.4 s after usb_host_install(); 8 s is a
          * generous margin for a slow-enumerating device before we stop
          * treating "no crash yet" as still-at-risk. */
@@ -156,16 +150,12 @@ static void usb_fault_guard_arm(void)
  */
 static bool usb_fault_guard_boot_check(void)
 {
-    /* Timer handles live in BSS and are already null after reboot; never
-     * esp_timer_delete a value recovered from RTC. */
-    s_usb_fault_guard_timer = nullptr;
-    s_usb_fault_guard_safe_mode_this_boot = false;
-
     if (s_usb_fault_guard.magic != kUsbFaultGuardMagic) {
         /* First install() since power-on (RTC memory contents undefined). */
         s_usb_fault_guard.magic = kUsbFaultGuardMagic;
         s_usb_fault_guard.panic_count = 0;
         s_usb_fault_guard.pending_risk = false;
+        s_usb_fault_guard.timer = nullptr;
     } else if (s_usb_fault_guard.pending_risk) {
         /* Last boot crashed (or is otherwise gone) while we were still in
          * the risky enumeration window. Only count it if the crash was a
@@ -175,17 +165,19 @@ static bool usb_fault_guard_boot_check(void)
         } else {
             s_usb_fault_guard.panic_count = 0;
         }
+        s_usb_fault_guard.timer = nullptr;
     } else if (s_usb_fault_guard.panic_count < kUsbFaultGuardPanicThreshold) {
         /* Previous boot's risky window closed cleanly (or none happened). */
         s_usb_fault_guard.panic_count = 0;
     }
     s_usb_fault_guard.pending_risk = false;
+    s_usb_fault_guard.safe_mode_active_this_boot = false;
     return s_usb_fault_guard.panic_count >= kUsbFaultGuardPanicThreshold;
 }
 
 bool esp_rtl_sdr_usb_safe_mode_active(void)
 {
-    return s_usb_fault_guard_safe_mode_this_boot;
+    return s_usb_fault_guard.safe_mode_active_this_boot;
 }
 
 esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
@@ -193,7 +185,7 @@ esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
     s_usb_fault_guard.magic = kUsbFaultGuardMagic;
     s_usb_fault_guard.panic_count = 0;
     s_usb_fault_guard.pending_risk = false;
-    s_usb_fault_guard_safe_mode_this_boot = false;
+    s_usb_fault_guard.safe_mode_active_this_boot = false;
     usb_fault_guard_disarm();
     return ESP_OK;
 }
@@ -343,14 +335,6 @@ struct esp_rtl_sdr_handle {
     volatile uint32_t live_urbs = 0;
     /** When true, bulk_cb must not resubmit (stop or retune drain). */
     volatile bool pause_resubmit = false;
-    /** Set by bulk_cb when a resubmit fails, meaning the bulk IN endpoint has
-     * been halted by a transfer error. Cleared by the delivery task once the
-     * endpoint is cleared and the URBs are back in flight. */
-    volatile bool ep_stall_recover = false;
-    volatile uint32_t ep_recoveries = 0;
-    /** ep_recoveries value when data last arrived; used to give up if
-     * recovery keeps failing rather than looping forever. */
-    volatile uint32_t ep_recoveries_at_data = 0;
     SemaphoreHandle_t bulk_done_sem = nullptr;
 
     IqSlot ring[kRingDepth]{};
@@ -857,31 +841,8 @@ static esp_err_t run_record(esp_rtl_sdr_handle *h, const RtlControlRecord &rec,
                             bool expect_stall)
 {
     const RtlControlRecord mapped = map_tuner_record_for_profile(h, rec);
-    const esp_err_t err = ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index,
-                                      mapped.data, mapped.length, expect_stall);
-    if (err != ESP_OK && !expect_stall) {
-        /* Name the record the device rejected.
-         *
-         * Profiles that borrow another board's init template (the R820T2
-         * 0x74->0x34 remap used by Blog V3 and Nooelec) will have records
-         * their silicon does not accept, and "Dev N EP 0 STALL" from USBH
-         * alone cannot say which. Without this, closing those gaps means
-         * guessing at register tables - which is exactly what this driver
-         * has deliberately avoided doing.
-         *
-         * Logged at warning level and the error is still returned; this only
-         * adds attribution, it does not change control flow. */
-        RTL_LOGW(h,
-                 "ctrl record rejected: profile=%s req=0x%02x value=0x%04x "
-                 "index=0x%04x len=%u data0=0x%02x -> %s%s",
-                 rtl_profile_name(h->profile), mapped.request_type,
-                 static_cast<unsigned>(mapped.value),
-                 static_cast<unsigned>(mapped.index),
-                 static_cast<unsigned>(mapped.length),
-                 static_cast<unsigned>(mapped.data[0]), esp_err_to_name(err),
-                 h->ctrl_stall ? " (STALL)" : "");
-    }
-    return err;
+    return ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index, mapped.data,
+                       mapped.length, expect_stall);
 }
 
 /*
@@ -1316,7 +1277,6 @@ static void bulk_cb(usb_transfer_t *xfer)
                 h->metrics.short_transfers++;
             }
             h->last_xfer_timestamp_us = slot->host_timestamp_us;
-            h->ep_recoveries_at_data = h->ep_recoveries;
             if (h->filled_q != nullptr) {
                 const UBaseType_t waiting = uxQueueMessagesWaiting(h->filled_q);
                 if (static_cast<uint32_t>(waiting) + 1u > h->queue_high_water) {
@@ -1367,22 +1327,8 @@ static void bulk_cb(usb_transfer_t *xfer)
     if (h->streaming && !h->pause_resubmit) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
-            /* A bulk transfer error halts the endpoint, and every later
-             * submit on that pipe then fails. Killing the stream here made a
-             * single error permanent: all bulk_num URBs share h->streaming,
-             * so one failed resubmit retired every one of them and the device
-             * went silent while still reporting STATE_STREAMING.
-             *
-             * That is rare with one dongle and common with two, because they
-             * share a bus. It is what stalled the second receiver at a fixed
-             * byte count with usb_errors=1 and drops=0.
-             *
-             * Ask the delivery task to clear the endpoint and resubmit
-             * instead. usb_host_endpoint_clear() must not be called from this
-             * callback - it runs on the USB client task. */
-            RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
-                     esp_err_to_name(ret));
-            h->ep_stall_recover = true;
+            RTL_LOGE(h, "bulk resubmit failed: %s", esp_err_to_name(ret));
+            h->streaming = false;
             if (h->live_urbs > 0) {
                 h->live_urbs--;
             }
@@ -1469,45 +1415,6 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
             h->live_urbs++;
         }
     }
-}
-
-/**
- * Clear a halted bulk IN endpoint and put the URBs back in flight.
- *
- * Must run on a task, never on the USB client task: usb_host_endpoint_clear()
- * is not callable from a transfer callback. The delivery task already does
- * EP0 work for this reason, so it owns this too.
- *
- * Gives up after kEpRecoverAttempts consecutive tries with no data in
- * between, so a genuinely unplugged or wedged device surfaces as a stopped
- * stream rather than looping here forever.
- */
-static constexpr uint32_t kEpRecoverAttempts = 8;
-
-static void bulk_recover_stall(esp_rtl_sdr_handle *h)
-{
-    if (h == nullptr || h->bulk == nullptr) {
-        return;
-    }
-    h->ep_stall_recover = false;
-    if (h->ep_recoveries - h->ep_recoveries_at_data >= kEpRecoverAttempts) {
-        RTL_LOGE(h, "bulk EP recovery failed %u times with no data; stopping",
-                 static_cast<unsigned>(kEpRecoverAttempts));
-        h->streaming = false;
-        return;
-    }
-    h->ep_recoveries++;
-    h->pause_resubmit = true;
-    (void)drain_live_urbs(h, 100, 100);
-    if (h->dev != nullptr) {
-        usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
-        usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
-        usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
-    }
-    bulk_resume(h);
-    RTL_LOGW(h, "bulk EP recovered (attempt %u, live_urbs=%u)",
-             static_cast<unsigned>(h->ep_recoveries),
-             static_cast<unsigned>(h->live_urbs));
 }
 
 /**
@@ -1823,11 +1730,6 @@ static void delivery_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
     while (h->tasks_run) {
-        /* A halted bulk IN endpoint can only be cleared from a task. */
-        if (h->streaming && h->ep_stall_recover && !h->pause_resubmit &&
-            !h->retune_busy && !h->ep0_sideband_busy) {
-            bulk_recover_stall(h);
-        }
         /* Async EP0 off the USB client task (retune first, then gain/bias). */
         if (h->streaming && h->pending_retune_hz != 0 && !h->retune_busy &&
             !h->ep0_sideband_busy) {
@@ -2215,27 +2117,6 @@ static void rebuild_candidate_list(esp_rtl_sdr_handle *h)
         return;
     }
     for (int i = 0; i < n && h->candidate_count < ESP_RTL_SDR_MAX_DEVICES; ++i) {
-        /* Never probe a device another handle already owns.
-         *
-         * probe_candidate() opens the device and runs EP0 control
-         * transfers. On a device with an active bulk stream that halts its
-         * pipe, and the next resubmit fails with ESP_ERR_INVALID_STATE -
-         * the stream dies silently while still reporting STATE_STREAMING.
-         * With one dongle this almost never showed; with two it killed the
-         * second receiver 5.15 s after start, once per rescan.
-         *
-         * Applications were left choosing between hot-plug discovery and
-         * stable streams. They should not have to: a claimed address is
-         * already identified by its owner, so it is carried through as a
-         * candidate without being touched. Only unclaimed addresses get
-         * the invasive probe. */
-        if (rtl_claim_taken_by_other(&s_usb_session.claims, addrs[i],
-                                     h->logical_index)) {
-            DeviceCandidate held{};
-            held.addr = addrs[i];
-            h->candidates[h->candidate_count++] = held;
-            continue;
-        }
         DeviceCandidate cand{};
         if (probe_candidate(h, addrs[i], &cand, false)) {
             h->candidates[h->candidate_count++] = cand;
@@ -2699,7 +2580,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     }
 
     if (usb_fault_guard_boot_check()) {
-        s_usb_fault_guard_safe_mode_this_boot = true;
+        s_usb_fault_guard.safe_mode_active_this_boot = true;
         ESP_LOGE(TAG,
                  "USB fault guard latched: %u consecutive enumeration-time panics; "
                  "skipping usb_host_install this boot. Call "
@@ -2712,7 +2593,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
         delete h;
         return ESP_RTL_SDR_ERR_USB_SAFE_MODE;
     }
-    s_usb_fault_guard_safe_mode_this_boot = false;
+    s_usb_fault_guard.safe_mode_active_this_boot = false;
 
     usb_fault_guard_arm();
     esp_err_t ret = start_usb_stack(h);
@@ -3217,40 +3098,13 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->iface_claimed = true;
 
         if (rtl_profile_uses_r820t2_i2c_remap(handle->profile)) {
-            /* Shared R820T2 path (Blog V3 + Nooelec): same USB IR template
-             * remapping 0x74->0x34. Blog V3 can switch to its separately
-             * captured direct-sampling path; Nooelec remains fail-closed
-             * below 24 MHz.
-             *
-             * Blog V3 is soak-verified as of 2026-09-21: 1.62 GB at
-             * 1.024 MS/s over 787 s, concurrently with a Blog V4 at
-             * 2.4 MS/s behind an external USB hub, with usb_transfer_errors
-             * = 0 and IQ age never above 5 ms. Measured rate 2.06 MB/s
-             * against 2.048 nominal. Zero init records were rejected.
-             *
-             * Nooelec has no such soak and keeps the warning. */
-            if (handle->profile == RtlProfileId::BlogV3) {
-                ESP_LOGI(TAG,
-                         "%s: R820T2 stream (I2C 0x34 remap); soak-verified "
-                         "2026-09-21 (1.62 GB, 787 s, 0 usb errors)",
-                         rtl_profile_name(handle->profile));
-            } else if (handle->profile == RtlProfileId::BlogV4L) {
-                /* R828S on the V4L answers where an R820T/R860 would, so it
-                 * shares this remapped stream path. What it does NOT share
-                 * is the V3's HF handling: the V4L reaches HF through an
-                 * upconverter, so direct sampling is disabled for it and
-                 * tuning below the native floor fails closed until that
-                 * upconverter's control is captured. */
-                ESP_LOGW(TAG,
-                         "%s: R828S on the shared R820T2 stream path "
-                         "(I2C 0x34 remap); VHF/UHF only, HF fails closed",
-                         rtl_profile_name(handle->profile));
-            } else {
-                ESP_LOGW(TAG,
-                         "%s: provisional R820T2 stream (I2C 0x34 remap); "
-                         "maintainer-unverified - please report soak results",
-                         rtl_profile_name(handle->profile));
-            }
+            /* Provisional R820T2 path (Blog V3 + Nooelec): same USB IR template
+             * remapping 0x74→0x34. Blog V3 can switch to its separately captured
+             * direct path; Nooelec remains fail-closed below 24 MHz. */
+            ESP_LOGW(TAG,
+                     "%s: provisional R820T2 stream (I2C 0x34 remap); "
+                     "maintainer-unverified — please report soak results",
+                     rtl_profile_name(handle->profile));
         }
         ret = run_init_table(handle);
         if (ret != ESP_OK) {
