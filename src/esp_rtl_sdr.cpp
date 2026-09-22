@@ -3345,10 +3345,28 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (ret != ESP_OK) {
             break;
         }
-        /* Pull ring is lazy: allocated on first IQ push or first read() when mode
-         * uses READ/BOTH. CALLBACK-only never allocates the large pull buffer. */
-        if (esp_rtl_sdr_delivery_mode_uses_read(handle->cfg.delivery_mode) &&
-            handle->pull_buf != nullptr) {
+        /* Allocate the pull ring before the first URB is submitted.
+         *
+         * It used to be lazy - created on the first IQ push or the first
+         * read() - which left a window at stream start where blocks arrived
+         * with nowhere to go. Every stream start therefore shed a burst of
+         * buffers before settling: measured at 999,424 bytes (61 x 16 KiB)
+         * on one receiver at boot, with zero drops afterwards. It looked
+         * like an ongoing fault because the counter is cumulative.
+         *
+         * bulk_cb's read-only fast path also needs pull_buf to exist, or it
+         * falls back to the slow queue path for exactly those first blocks -
+         * the ones least able to afford it.
+         *
+         * CALLBACK-only still never allocates the large buffer. */
+        if (esp_rtl_sdr_delivery_mode_uses_read(handle->cfg.delivery_mode)) {
+            const esp_err_t pr = ensure_pull_ring(handle);
+            if (pr != ESP_OK) {
+                RTL_LOGE(handle, "pull ring alloc failed: %s",
+                         esp_err_to_name(pr));
+                ret = pr;
+                break;
+            }
             pull_ring_reset(handle);
         }
         ret = alloc_bulk_pool(handle, static_cast<uint32_t>(handle->cfg.transfer_count),
