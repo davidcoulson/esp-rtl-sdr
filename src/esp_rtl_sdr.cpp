@@ -1280,7 +1280,7 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 /* -------------------------------------------------------------------------- */
 
 /* Defined below; bulk_cb's read-only fast path fills the ring directly. */
-static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
+static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
 
 static void bulk_cb(usb_transfer_t *xfer)
 {
@@ -1300,6 +1300,55 @@ static void bulk_cb(usb_transfer_t *xfer)
 
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED && xfer->actual_num_bytes > 0 &&
         h->streaming && !h->pause_resubmit) {
+        const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
+
+        /*
+         * READ-only hot path.
+         *
+         * Do not bounce a completed URB through IqSlot/free_q/filled_q when
+         * the caller only consumes esp_rtl_sdr_read(). That extra slot copy
+         * and two queue operations are pure transport overhead.
+         *
+         * pull_ring_push() is deliberately a zero-wait try-lock when called
+         * from this USB completion context. ESP-IDF invokes transfer
+         * callbacks from usb_host_client_handle_events(); stalling this task
+         * delays service for the other URBs/devices on the same client.
+         *
+         * bytes_total counts USB ingress, even if the consumer ring cannot
+         * accept this block. consumer_drops/overruns record that loss.
+         */
+        if (esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
+            !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode) &&
+            h->pull_buf != nullptr) {
+            ++h->iq_sequence;
+            if (n != static_cast<size_t>(h->bulk_len)) {
+                h->metrics.short_transfers++;
+            }
+            h->last_xfer_timestamp_us = esp_timer_get_time();
+            h->ep_recoveries_at_data = h->ep_recoveries;
+            h->metrics.bytes_total += n;
+            h->metrics.blocks_total++;
+
+            (void)pull_ring_push(h, xfer->data_buffer, n);
+
+            if (h->streaming && !h->pause_resubmit) {
+                esp_err_t rs = usb_host_transfer_submit(xfer);
+                if (rs != ESP_OK) {
+                    RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
+                             esp_err_to_name(rs));
+                    h->ep_stall_recover = true;
+                    if (h->live_urbs > 0) {
+                        h->live_urbs--;
+                    }
+                    xSemaphoreGive(h->bulk_done_sem);
+                }
+            } else if (h->live_urbs > 0) {
+                h->live_urbs--;
+                xSemaphoreGive(h->bulk_done_sem);
+            }
+            return;
+        }
+
         IqSlot *slot = nullptr;
         if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
@@ -1321,49 +1370,6 @@ static void bulk_cb(usb_transfer_t *xfer)
             h->last_xfer_timestamp_us = slot->host_timestamp_us;
             h->ep_recoveries_at_data = h->ep_recoveries;
 
-            /* Read-only delivery: fill the pull ring here and recycle the
-             * slot immediately, instead of routing it through filled_q and
-             * the delivery task.
-             *
-             * DELIVERY_READ never invoked the IQ callback, but the delivery
-             * task still ran for every block: pop from filled_q, take the
-             * handle lock, compute health, memcpy into the pull ring, push
-             * the slot back to free_q. So a byte was copied three times
-             * (URB -> slot, slot -> pull ring, pull ring -> caller) and
-             * crossed two queues and a mutex before the application saw it.
-             * At three receivers and 14.4 MB/s that is ~43 MB/s of memcpy
-             * on a 360 MHz core plus per-block scheduling, which is where
-             * the aggregate stalled around 8 MB/s while two receivers ran
-             * 9.9 MB/s clean.
-             *
-             * This path drops one copy, both queue round trips and the
-             * delivery-task wakeup. Modes that use the callback are
-             * untouched - they still need the slot delivered on a task,
-             * because a callback must not run in this context. */
-            if (esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
-                !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode) &&
-                h->pull_buf != nullptr) {
-                pull_ring_push(h, slot->data, slot->bytes);
-                h->metrics.bytes_total += slot->bytes;
-                h->metrics.blocks_total++;
-                (void)xQueueSend(h->free_q, &slot, 0);
-                if (h->streaming && !h->pause_resubmit) {
-                    esp_err_t rs = usb_host_transfer_submit(xfer);
-                    if (rs != ESP_OK) {
-                        RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
-                                 esp_err_to_name(rs));
-                        h->ep_stall_recover = true;
-                        if (h->live_urbs > 0) {
-                            h->live_urbs--;
-                        }
-                        xSemaphoreGive(h->bulk_done_sem);
-                    }
-                } else if (h->live_urbs > 0) {
-                    h->live_urbs--;
-                    xSemaphoreGive(h->bulk_done_sem);
-                }
-                return;
-            }
             if (h->filled_q != nullptr) {
                 const UBaseType_t waiting = uxQueueMessagesWaiting(h->filled_q);
                 if (static_cast<uint32_t>(waiting) + 1u > h->queue_high_water) {
@@ -1644,20 +1650,33 @@ static size_t pull_ring_space(const esp_rtl_sdr_handle *h)
     return h->pull_cap - h->pull_count;
 }
 
-static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes)
+static bool pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes)
 {
     if (h == nullptr || h->pull_buf == nullptr || h->pull_mux == nullptr || data == nullptr ||
         bytes == 0) {
-        return;
+        return false;
     }
-    if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(5)) != pdTRUE) {
-        return;
+
+    /*
+     * Never wait in the USB completion path. The reader now holds this mutex
+     * only for one or two bounded memcpy() operations, so contention should
+     * be brief. If it still collides, account for one lost input buffer
+     * instead of silently blocking usb_host_client_handle_events().
+     */
+    if (xSemaphoreTake(h->pull_mux, 0) != pdTRUE) {
+        h->metrics.overruns++;
+        h->metrics.consumer_drops++;
+        return false;
     }
+
+    bool evicted_old_data = false;
     size_t remaining = bytes;
     size_t off = 0;
     while (remaining > 0) {
         if (pull_ring_space(h) == 0) {
-            /* Drop oldest sample pair region (at least 1 byte) for room. */
+            /* Make room by evicting oldest bytes. Count the incident once as
+             * one dropped input-buffer event; do not mix byte counts into the
+             * public dropped_buffers counter. */
             size_t drop = remaining;
             if (drop > h->pull_count) {
                 drop = h->pull_count;
@@ -1667,12 +1686,18 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
             }
             h->pull_r = (h->pull_r + drop) % h->pull_cap;
             h->pull_count -= drop;
-            h->metrics.consumer_drops += static_cast<uint32_t>(drop);
+            if (!evicted_old_data) {
+                h->metrics.overruns++;
+                h->metrics.consumer_drops++;
+                evicted_old_data = true;
+            }
         }
+
         const size_t space = pull_ring_space(h);
         if (space == 0) {
             break;
         }
+
         size_t chunk = remaining < space ? remaining : space;
         const size_t first = h->pull_cap - h->pull_w;
         if (chunk <= first) {
@@ -1687,10 +1712,18 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
         off += chunk;
         remaining -= chunk;
     }
+
+    const bool complete = (remaining == 0);
+    if (!complete && !evicted_old_data) {
+        h->metrics.overruns++;
+        h->metrics.consumer_drops++;
+    }
+
     xSemaphoreGive(h->pull_mux);
-    if (h->pull_sem != nullptr) {
+    if (complete && h->pull_sem != nullptr) {
         xSemaphoreGive(h->pull_sem);
     }
+    return complete;
 }
 
 static void pull_ring_reset(esp_rtl_sdr_handle *h)
@@ -3735,10 +3768,29 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             }
             continue;
         }
-        while (copied < max_bytes && handle->pull_count > 0) {
-            out_buf[copied++] = handle->pull_buf[handle->pull_r];
-            handle->pull_r = (handle->pull_r + 1) % handle->pull_cap;
-            handle->pull_count--;
+        if (copied < max_bytes && handle->pull_count > 0) {
+            size_t take = max_bytes - copied;
+            if (take > handle->pull_count) {
+                take = handle->pull_count;
+            }
+
+            /* Ring drain in at most two contiguous copies. The old loop did
+             * one byte copy, modulo and counter update per byte while holding
+             * pull_mux -- millions of iterations per second at SDR rates. */
+            size_t first = handle->pull_cap - handle->pull_r;
+            if (first > take) {
+                first = take;
+            }
+            std::memcpy(out_buf + copied, handle->pull_buf + handle->pull_r, first);
+
+            const size_t second = take - first;
+            if (second > 0) {
+                std::memcpy(out_buf + copied + first, handle->pull_buf, second);
+            }
+
+            handle->pull_r = (handle->pull_r + take) % handle->pull_cap;
+            handle->pull_count -= take;
+            copied += take;
         }
         xSemaphoreGive(handle->pull_mux);
 
