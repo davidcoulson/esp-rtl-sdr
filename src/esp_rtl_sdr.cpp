@@ -1164,6 +1164,31 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
         }
         return err;
     }
+    /* Open the I2C repeater before touching the tuner.
+     *
+     * The RTL2832U reaches the tuner through a repeater gate. It was only
+     * opened on the cold-init path and when leaving direct sampling, so an
+     * ordinary VHF/UHF hot retune wrote tuner registers with the gate in
+     * whatever state the previous operation left it.
+     *
+     * Measured on a Blog V3c scanning FM: 430 "Dev 2 EP 0 STALL" and 112
+     * "hot retune EP0 failed" in 75 s, every rejected record an I2C write
+     * to 0x34 carrying an R820T2 register (0x08, 0x09, 0x0c, 0x10, 0x17,
+     * 0x1a, 0x1b). The Blog V4 retunes cleanly through the same code
+     * because its R828D is addressed directly and does not depend on this
+     * gate.
+     *
+     * Re-asserting is idempotent - the records set the bit and read back -
+     * so this costs two control transfers per retune and only applies to
+     * profiles that use the remapped tuner address. */
+    if (rtl_profile_uses_r820t2_i2c_remap(h->profile)) {
+        const esp_err_t rep = run_records(h, kBlogV3TunerRepeaterOn,
+                                          std::size(kBlogV3TunerRepeaterOn));
+        if (rep != ESP_OK) {
+            RTL_LOGW(h, "tuner repeater enable failed: %s",
+                     esp_rtl_sdr_err_to_name(rep));
+        }
+    }
     return run_tune(h, frequency_hz);
 }
 
