@@ -4079,17 +4079,33 @@ esp_err_t esp_rtl_sdr_hub_port_power_cycle(esp_rtl_sdr_handle_t handle, uint32_t
          * stalls it), so probe a fixed small range instead of adding a
          * descriptor round trip to a recovery path. */
         const uint8_t kMaxPorts = 8;
+        /* Report which ports actually accept the request.
+         *
+         * These results used to be discarded, which made it impossible to
+         * tell a hub that implements per-port power switching from one that
+         * merely advertises it. That matters: when the cycle ran, only ONE
+         * downstream device disappeared, and on a hub reporting "all ports
+         * power at once" a real power drop should take every one of them.
+         * So either the hub ignores PORT_POWER or most of these requests
+         * fail - and until they are logged, nobody knows which. */
+        uint8_t off_ok = 0, on_ok = 0;
         ESP_LOGW(TAG, "hub at addr %u: dropping downstream port power for %u ms",
                  static_cast<unsigned>(addrs[i]), static_cast<unsigned>(off_ms));
         for (uint8_t port = 1; port <= kMaxPorts; ++port) {
-            (void)ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqClearFeature,
-                                     kFeatPortPower, port, nullptr, 0, true);
+            if (ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqClearFeature,
+                                   kFeatPortPower, port, nullptr, 0, true) == ESP_OK) {
+                off_ok++;
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(off_ms));
         for (uint8_t port = 1; port <= kMaxPorts; ++port) {
-            (void)ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqSetFeature,
-                                     kFeatPortPower, port, nullptr, 0, true);
+            if (ctrl_submit_device(h, dev, kReqTypeSetPortFeat, kReqSetFeature,
+                                   kFeatPortPower, port, nullptr, 0, true) == ESP_OK) {
+                on_ok++;
+            }
         }
+        ESP_LOGW(TAG, "hub at addr %u: PORT_POWER accepted off=%u/%u on=%u/%u",
+                 static_cast<unsigned>(addrs[i]), off_ok, kMaxPorts, on_ok, kMaxPorts);
         ESP_LOGW(TAG, "hub at addr %u: downstream port power restored",
                  static_cast<unsigned>(addrs[i]));
         usb_host_device_close(h->client, dev);
