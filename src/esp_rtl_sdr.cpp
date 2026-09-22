@@ -2086,7 +2086,35 @@ static void free_bulk_pool(esp_rtl_sdr_handle *h)
 
 static esp_err_t alloc_bulk_pool(esp_rtl_sdr_handle *h, uint32_t num, uint32_t len)
 {
+    /* free_bulk_pool() refuses while live_urbs > 0, and this used to carry
+     * straight on and overwrite h->bulk with a fresh array - leaking the old
+     * array and every usb_transfer_t in it, then allocating a second full
+     * pool on top of the first.
+     *
+     * That is ~64 KiB of DMA-capable memory per restart at 4 x 16384, and it
+     * is not hypothetical: stop() deliberately skips free_bulk_pool when the
+     * drain times out, so exactly the case that leaves URBs live is the case
+     * that reached here. A few stop/start cycles then failed with
+     * ESP_ERR_NO_MEM and the receiver stayed dead while the others ran.
+     *
+     * A stop that timed out has usually completed its URBs by the time
+     * anything restarts the stream, so try to reclaim them first. If they
+     * really are still live, fail loudly rather than leak - the caller gets
+     * an error it can report instead of a receiver that silently never
+     * comes back. */
+    if (h->live_urbs > 0) {
+        (void)drain_live_urbs(h, 800, 300);
+    }
+    if (h->live_urbs > 0) {
+        ESP_LOGE(TAG, "alloc_bulk_pool: %u URBs still live; refusing to leak the pool",
+                 static_cast<unsigned>(h->live_urbs));
+        return ESP_ERR_INVALID_STATE;
+    }
     free_bulk_pool(h);
+    if (h->bulk != nullptr) {
+        ESP_LOGE(TAG, "alloc_bulk_pool: previous pool not released");
+        return ESP_ERR_INVALID_STATE;
+    }
     h->bulk = static_cast<usb_transfer_t **>(calloc(num, sizeof(usb_transfer_t *)));
     if (h->bulk == nullptr) {
         return ESP_ERR_NO_MEM;
