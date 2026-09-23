@@ -300,7 +300,9 @@ inline double rtl_profile_pll_xtal_hz(RtlProfileId profile)
 inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 {
     constexpr double kMeasuredV4IfOffsetHz = 1814972.0;
-    if (profile == RtlProfileId::BlogV3) {
+    /* Soak test: NooelecSmartV5 is the same R820T2 tuner as BlogV3, so try BlogV3's
+     * measured 3.57 MHz instead of the R828D/V4-board value. */
+    if (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5) {
         return static_cast<double>(kBlogV3DemodIfHz);
     }
     return kMeasuredV4IfOffsetHz;
@@ -309,5 +311,7 @@ inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 /** Non-zero only when initialization must restore a profile-specific demod IF. */
 inline uint32_t rtl_profile_demod_if_restore_hz(RtlProfileId profile)
 {
-    return profile == RtlProfileId::BlogV3 ? kBlogV3DemodIfHz : 0u;
+    return (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5)
+               ? kBlogV3DemodIfHz
+               : 0u;
 }
