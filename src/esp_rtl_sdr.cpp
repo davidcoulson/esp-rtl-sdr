@@ -48,6 +48,8 @@ static const char *TAG = "esp_rtl_sdr";
     ESP_LOGW(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
 #define RTL_LOGE(h, fmt, ...)                                                                      \
     ESP_LOGE(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
+#define RTL_LOGD(h, fmt, ...)                                      \
+    ESP_LOGD(TAG, "[%s] " fmt, (h) != nullptr ? (h)->log_id : "RTL?", ##__VA_ARGS__)
 
 static constexpr uint32_t kHandleMagic = 0x52345634u;
 static constexpr TickType_t kQueryLockTicks = pdMS_TO_TICKS(50);
@@ -423,6 +425,19 @@ struct esp_rtl_sdr_handle {
 
     /** Sync-read pull ring (CU8 bytes). Filled by delivery task. */
     uint8_t *pull_buf = nullptr;
+    /* Last value written to each tuner register, and whether it is known.
+     *
+     * A hot retune rewrites the whole 22-record tune template, and each
+     * record costs ~6.85 ms: ~3 ms of USB control overhead plus ~3.85 ms
+     * of RTL2832U I2C repeater transaction. Most of those writes are
+     * constant setup that is identical on every hop.
+     *
+     * Skipping a write whose value is already in the register is safe and
+     * order-preserving: a register written 0x2a then 0x22 then 0x2a still
+     * gets all three writes, because each differs from the one before.
+     * Only exact repeats are dropped. */
+    uint8_t tuner_reg_val[32] = {0};
+    uint32_t tuner_reg_known = 0;   /* bitmask over tuner_reg_val */
     size_t pull_cap = 0;
     /* Single-producer / single-consumer ring.
      *
@@ -694,6 +709,9 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     if (h == nullptr) {
         return;
     }
+    /* Any of these can leave the tuner in a state this cache no longer
+     * describes, so forget it and let the next tune rewrite in full. */
+    h->tuner_reg_known = 0;
     h->profile = RtlProfileId::Unknown;
     h->device_caps = 0;
     h->frontend_applied_valid = false;
@@ -992,6 +1010,7 @@ static esp_err_t run_sample_rate(esp_rtl_sdr_handle *h, uint32_t sample_rate_sps
         }
         esp_err_t e = run_record(h, rec, false);
         if (e != ESP_OK) {
+            h->tuner_reg_known = 0;
             return e;
         }
     }
@@ -1006,6 +1025,13 @@ static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
     if (demod_if_hz == 0) {
         return ESP_OK;
     }
+    /* Time these separately from the tuner writes. Every one of the 22
+     * tuner records in run_tune() costs a uniform ~6.85 ms - too slow for
+     * a USB control transfer and too uniform to be per-register device
+     * work. These are 2832U demod writes that do NOT pass through the I2C
+     * repeater, so if they are fast the repeater is the cost and the fix
+     * is fewer tuner writes, not lower latency. */
+    const int64_t t_if0 = esp_timer_get_time();
     for (size_t i = kRtlStandardIfFirst; i <= kRtlStandardIfLast; ++i) {
         esp_err_t e = run_record(h, kRtlInitTransfers[i], false);
         if (e != ESP_OK) {
@@ -1017,6 +1043,12 @@ static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
              static_cast<unsigned>(rtl_profile_pll_if_offset_hz(h->profile)),
              static_cast<unsigned>(demod_if_hz),
              static_cast<unsigned>(kRtlStandardIfLast - kRtlStandardIfFirst + 1));
+    {
+        const int64_t d = esp_timer_get_time() - t_if0;
+        const size_t n_if = kRtlStandardIfLast - kRtlStandardIfFirst + 1;
+        RTL_LOGD(h, "demod IF records: n=%u total_us=%lld per_us=%lld (no tuner I2C)",
+                 (unsigned)n_if, (long long)d, (long long)(d / (n_if ? n_if : 1)));
+    }
     return ESP_OK;
 }
 
@@ -1119,6 +1151,8 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
              static_cast<unsigned>(frequency_hz), static_cast<unsigned>(tune_hz),
              h != nullptr ? static_cast<int>(h->freq_correction_ppm) : 0, hf ? 1 : 0, r16_setup,
               r16_active, r20, r21, r22, static_cast<unsigned>(if_offset_hz));
+    uint32_t rec_us[std::size(kRtlFinalTuneTemplate)] = {0};
+    int skipped = 0;
     for (size_t i = 0; i < std::size(kRtlFinalTuneTemplate); ++i) {
         RtlControlRecord rec = kRtlFinalTuneTemplate[i];
         if (i == 3 || i == 7) {
@@ -1136,10 +1170,48 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
         if (i == 16) {
             rec.data[1] = r21;
         }
+        /* Skip a tuner write whose value is already in the register.
+         *
+         * Only 0x40 / length-2 records are tuner register writes. The
+         * length-1 pointer writes and the 0xc0 PLL-lock reads are always
+         * run: a read has no cached value and the pointer write is what
+         * makes the following read address register 0. */
+        if (rec.request_type == 0x40 && rec.length == 2 && rec.data[0] < 32) {
+            const uint8_t reg = rec.data[0];
+            if ((h->tuner_reg_known & (1u << reg)) != 0 &&
+                h->tuner_reg_val[reg] == rec.data[1]) {
+                rec_us[i] = 0;
+                skipped++;
+                continue;
+            }
+        }
+        const int64_t t_rec0 = esp_timer_get_time();
         esp_err_t e = run_record(h, rec, false);
+        rec_us[i] = (uint32_t)(esp_timer_get_time() - t_rec0);
+        if (rec.request_type == 0x40 && rec.length == 2 && rec.data[0] < 32) {
+            const uint8_t reg = rec.data[0];
+            h->tuner_reg_val[reg] = rec.data[1];
+            h->tuner_reg_known |= (1u << reg);
+        }
         if (e != ESP_OK) {
             return e;
         }
+    }
+    {
+        /* Per-record timing. run_profile_tune() is 90% of a hot retune
+         * (171 of 190 ms) and the retune blanks the stream, so it is paid
+         * in lost samples. 22 records at ~7.8 ms each is far slower than a
+         * USB control transfer should be, and bus load is not the cause:
+         * with the other two receivers stopped the retune was unchanged. */
+        char tbuf[200];
+        int toff = 0;
+        for (size_t i = 0; i < std::size(kRtlFinalTuneTemplate) &&
+             toff < (int)sizeof(tbuf) - 8; ++i) {
+            toff += snprintf(tbuf + toff, sizeof(tbuf) - (size_t)toff, "%u%s",
+                             (unsigned)rec_us[i],
+                             (i + 1 < std::size(kRtlFinalTuneTemplate)) ? "," : "");
+        }
+        RTL_LOGD(h, "tune record us: %s (skipped %d of %u)", tbuf, skipped, (unsigned)std::size(kRtlFinalTuneTemplate));
     }
     return ESP_OK;
 }
@@ -1189,8 +1261,12 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
      * so this costs two control transfers per retune and only applies to
      * profiles that use the remapped tuner address. */
     if (rtl_profile_uses_r820t2_i2c_remap(h->profile)) {
+        const int64_t t_rep0 = esp_timer_get_time();
         const esp_err_t rep = run_records(h, kBlogV3TunerRepeaterOn,
                                           std::size(kBlogV3TunerRepeaterOn));
+        RTL_LOGD(h, "repeater gate: n=%u total_us=%lld (2832U write, no tuner I2C)",
+                 (unsigned)std::size(kBlogV3TunerRepeaterOn),
+                 (long long)(esp_timer_get_time() - t_rep0));
         if (rep != ESP_OK) {
             RTL_LOGW(h, "tuner repeater enable failed: %s",
                      esp_rtl_sdr_err_to_name(rep));
@@ -1660,6 +1736,15 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     }
     h->retune_busy = true;
 
+    /* Phase timing for the hot retune.
+     *
+     * A retune blanks the stream, so its cost is paid directly in lost
+     * samples: the scanning receiver runs at ~48% duty against a 366 ms
+     * hop because each retune takes ~188 ms. Nobody had measured which
+     * phase that is. */
+    const int64_t t_rt0 = esp_timer_get_time();
+    int64_t t_drained = t_rt0, t_tuned = t_rt0, t_frontend = t_rt0;
+
     if (!bulk_pause_and_drain(h)) {
         h->retune_busy = false;
         return ESP_RTL_SDR_ERR_TIMEOUT;
@@ -1678,11 +1763,14 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     const uint32_t tune_hz =
         (h->pending_retune_hz != 0) ? h->pending_retune_hz : freq;
 
+    t_drained = esp_timer_get_time();
     h->frontend_applied_valid = false;
     esp_err_t err = run_profile_tune(h, tune_hz, h->frequency_hz);
+    t_tuned = esp_timer_get_time();
     if (err == ESP_OK) {
         err = run_band_frontend(h, tune_hz);
     }
+    t_frontend = esp_timer_get_time();
     if (err == ESP_OK) {
         h->frequency_hz = tune_hz;
         h->metrics.frequency_hz = tune_hz;
@@ -1708,6 +1796,11 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     }
 
     bulk_resume(h);
+    const int64_t t_resumed = esp_timer_get_time();
+    RTL_LOGD(h, "retune phases us: drain=%lld tune=%lld frontend=%lld resume=%lld total=%lld",
+             (long long)(t_drained - t_rt0), (long long)(t_tuned - t_drained),
+             (long long)(t_frontend - t_tuned), (long long)(t_resumed - t_frontend),
+             (long long)(t_resumed - t_rt0));
 
     h->retune_busy = false;
 
@@ -3596,6 +3689,9 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (cb) {
             emit_after_unlock(handle, ESP_RTL_SDR_EVT_STREAM_STARTED, nullptr, cb, ctx);
         }
+        /* The tuner is reprogrammed from scratch on a stream start, so any
+         * cached register values from a previous session are stale. */
+        handle->tuner_reg_known = 0;
         ESP_LOGI(TAG, "stream start freq=%u exact_rate=%u urbs=%ux%u",
                  static_cast<unsigned>(freq), static_cast<unsigned>(exact_sps),
                  static_cast<unsigned>(handle->bulk_num),
