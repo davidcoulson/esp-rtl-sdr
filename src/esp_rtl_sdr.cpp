@@ -929,6 +929,62 @@ static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
     return err;
 }
 
+/*
+ * R820T2 RF front-end band select. The replayed Blog V4 capture only ever tunes the PLL
+ * per frequency (r16/r20-r22); the RF mux (r1a[7:6],[1:0]), tracking-filter caps (r1b) and
+ * open-drain input (r17[3]) stay at whatever the capture used -- measured on a real Nooelec
+ * SMArt v5: r1a=0x2a/r1b=0x34, i.e. the polyphase-LPF path with the 90-110 MHz tracking
+ * filter, which leaves the ADC dead flat at 433 MHz. Table is librtlsdr's R820T
+ * freq_ranges[] (tuner_r82xx.c). Base bytes for the masked regs are the capture's final
+ * values, since the R820T2 cannot read back regs >= 0x10 (16-byte I2C read limit).
+ */
+struct R820T2BandRow {
+    uint16_t mhz;
+    uint8_t open_d;      /* r17 mask 0x08 */
+    uint8_t rf_mux_ploy; /* r1a mask 0xc3 */
+    uint8_t tf_c;        /* r1b */
+};
+static constexpr R820T2BandRow kR820T2Bands[] = {
+    {0, 0x08, 0x02, 0xdf},   {50, 0x08, 0x02, 0xbe},  {55, 0x08, 0x02, 0x8b},
+    {60, 0x08, 0x02, 0x7b},  {65, 0x08, 0x02, 0x69},  {70, 0x08, 0x02, 0x58},
+    {75, 0x00, 0x02, 0x44},  {80, 0x00, 0x02, 0x44},  {90, 0x00, 0x02, 0x34},
+    {100, 0x00, 0x02, 0x34}, {110, 0x00, 0x02, 0x24}, {120, 0x00, 0x02, 0x24},
+    {140, 0x00, 0x02, 0x14}, {180, 0x00, 0x02, 0x13}, {220, 0x00, 0x02, 0x13},
+    {250, 0x00, 0x02, 0x11}, {280, 0x00, 0x02, 0x00}, {310, 0x00, 0x41, 0x00},
+    {450, 0x00, 0x41, 0x00}, {588, 0x00, 0x40, 0x00}, {650, 0x00, 0x40, 0x00},
+};
+static constexpr uint8_t kR820T2CaptureReg17 = 0x20;
+static constexpr uint8_t kR820T2CaptureReg1a = 0x2a;
+
+static esp_err_t run_r820t2_band_frontend(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
+{
+    const uint32_t mhz = frequency_hz / 1000000u;
+    const R820T2BandRow *row = &kR820T2Bands[0];
+    for (const R820T2BandRow &r : kR820T2Bands) {
+        if (mhz >= r.mhz) {
+            row = &r;
+        }
+    }
+    const uint8_t r17 = static_cast<uint8_t>((kR820T2CaptureReg17 & ~0x08) | row->open_d);
+    const uint8_t r1a = static_cast<uint8_t>((kR820T2CaptureReg1a & ~0xc3) | row->rf_mux_ploy);
+    const RtlControlRecord recs[] = {
+        {kR820T2TunerI2cValue, 0x0610, 0x40, 2, {0x17, r17, 0, 0, 0, 0, 0, 0}},
+        {kR820T2TunerI2cValue, 0x0610, 0x40, 2, {0x1a, r1a, 0, 0, 0, 0, 0, 0}},
+        {kR820T2TunerI2cValue, 0x0610, 0x40, 2, {0x1b, row->tf_c, 0, 0, 0, 0, 0, 0}},
+    };
+    for (const RtlControlRecord &rec : recs) {
+        esp_err_t e = run_record(h, rec, false);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "r820t2 band reg 0x%02x write failed: %s", rec.data[0],
+                     esp_rtl_sdr_err_to_name(e));
+            return e;
+        }
+    }
+    ESP_LOGI(TAG, "r820t2 band frontend rf=%u MHz row=%u r17=%02x r1a=%02x r1b=%02x",
+             static_cast<unsigned>(mhz), static_cast<unsigned>(row->mhz), r17, r1a, row->tf_c);
+    return ESP_OK;
+}
+
 /**
  * Program R828D PLL for *user RF* frequency_hz.
  * Blog V4 HF (public): RF < 28.8 MHz is upconverted by 28.8 MHz before the tuner.
@@ -977,6 +1033,12 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
             rec.data[1] = r21;
         }
         esp_err_t e = run_record(h, rec, false);
+        if (e != ESP_OK) {
+            return e;
+        }
+    }
+    if (h != nullptr && rtl_profile_uses_r820t2_i2c_remap(profile)) {
+        esp_err_t e = run_r820t2_band_frontend(h, frequency_hz);
         if (e != ESP_OK) {
             return e;
         }
@@ -4315,3 +4377,4 @@ esp_err_t esp_rtl_sdr_get_bias_tee(esp_rtl_sdr_handle_t handle, bool *out_enable
     *out_enable = handle->bias_tee_want;
     return ESP_OK;
 }
+
