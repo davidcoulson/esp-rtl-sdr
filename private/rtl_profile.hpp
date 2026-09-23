@@ -163,9 +163,17 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
                ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
     case RtlProfileId::NooelecSmartV5:
-        /* Provisional: stream/retune/sync-read/passport; no V4 HF or measured gain/bias. */
+        /* Nooelec SMArt v5 uses the same R820T2 tuner and I2C remap path as BlogV3
+         * (rtl_profile_uses_r820t2_i2c_remap() is true for both), and
+         * apply_gain_records() branches on that same predicate to reach
+         * apply_r820t2_gain_records() -- there is no Nooelec-specific gain code path,
+         * it is the identical BlogV3 manual gain-table write. Enabling CAP_GAIN here
+         * to soak-test on real Nooelec SMArt v5 hardware per the maintainer's request
+         * in the capability comment above. Still no AUTO/RTL_AGC/BIAS_TEE/HF_UPCONVERTER
+         * -- unimplemented for this tuner family, not just unverified. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
-               ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT;
+               ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
+               ESP_RTL_SDR_CAP_GAIN;
     default:
         return 0;
     }
