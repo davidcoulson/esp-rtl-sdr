@@ -412,6 +412,11 @@ static void test_r820t2_band_select(void)
     /* row boundaries: exactly on a row start selects that row */
     EXPECT_EQ_U(rtl_r820t2_band_for_hz(310000000u)->mhz, 310u);
     EXPECT_EQ_U(rtl_r820t2_band_for_hz(309999999u)->mhz, 280u);
+    /* keyed on the LO like librtlsdr: RF 307 MHz + 3.57 MHz IF = LO 310.57 MHz -> 310 row */
+    EXPECT_EQ_U(rtl_r820t2_lo_hz(307000000u, 3570000.0), 310570000u);
+    EXPECT_EQ_U(rtl_r820t2_band_for_hz(rtl_r820t2_lo_hz(307000000u, 3570000.0))->mhz, 310u);
+    EXPECT_EQ_U(rtl_r820t2_band_for_hz(rtl_r820t2_lo_hz(433920000u, 3570000.0))->mhz, 310u);
+    EXPECT_EQ_U(rtl_r820t2_band_for_hz(rtl_r820t2_lo_hz(915000000u, 3570000.0))->mhz, 650u);
     EXPECT_EQ_U(rtl_r820t2_band_for_hz(1700000000u)->mhz, 650u);
     /* table is sorted, or the lookup picks the wrong row */
     for (size_t i = 1; i < std::size(kR820T2Bands); ++i) {

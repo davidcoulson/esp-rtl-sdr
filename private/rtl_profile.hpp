@@ -248,9 +248,10 @@ constexpr R820T2BandRow kR820T2Bands[] = {
     {450, 0x00, 0x41, 0x00}, {588, 0x00, 0x40, 0x00}, {650, 0x00, 0x40, 0x00},
 };
 
-inline const R820T2BandRow *rtl_r820t2_band_for_hz(uint32_t rf_hz)
+/** Row for an R820T2 LO frequency. librtlsdr keys the table on the LO (tuner RF + IF), not RF. */
+inline const R820T2BandRow *rtl_r820t2_band_for_hz(uint32_t lo_hz)
 {
-    const uint32_t mhz = rf_hz / 1000000u;
+    const uint32_t mhz = lo_hz / 1000000u;
     const R820T2BandRow *row = &kR820T2Bands[0];
     for (const R820T2BandRow &r : kR820T2Bands) {
         if (mhz >= r.mhz) {
@@ -258,6 +259,12 @@ inline const R820T2BandRow *rtl_r820t2_band_for_hz(uint32_t rf_hz)
         }
     }
     return row;
+}
+
+/** LO the R820T2 runs at for a (ppm-corrected) tuner frequency: tuner + PLL IF offset. */
+inline uint32_t rtl_r820t2_lo_hz(uint32_t tuner_hz, double if_offset_hz)
+{
+    return tuner_hz + static_cast<uint32_t>(if_offset_hz + 0.5);
 }
 
 /** R82xx tuners return every register byte bit-reversed over I2C. */
