@@ -167,9 +167,14 @@ static bool usb_fault_guard_boot_check(void)
     return s_usb_fault_guard.panic_count >= kUsbFaultGuardPanicThreshold;
 }
 
+/* Kept out of RTC_NOINIT memory: before install() runs usb_fault_guard_boot_check(), the
+ * retained field still holds whatever an earlier boot left there, so callers checking this
+ * ahead of install saw "safe mode" on boots where it was not active. */
+static bool s_usb_safe_mode_this_boot = false;
+
 bool esp_rtl_sdr_usb_safe_mode_active(void)
 {
-    return s_usb_fault_guard.safe_mode_active_this_boot;
+    return s_usb_safe_mode_this_boot;
 }
 
 esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
@@ -178,6 +183,7 @@ esp_err_t esp_rtl_sdr_usb_fault_guard_reset(void)
     s_usb_fault_guard.panic_count = 0;
     s_usb_fault_guard.pending_risk = false;
     s_usb_fault_guard.safe_mode_active_this_boot = false;
+    s_usb_safe_mode_this_boot = false;
     usb_fault_guard_disarm();
     return ESP_OK;
 }
@@ -243,6 +249,7 @@ struct esp_rtl_sdr_handle {
     usb_transfer_t *ctrl_xfer = nullptr;
     esp_err_t ctrl_status = ESP_OK;
     bool ctrl_stall = false;
+    uint16_t ctrl_actual = 0; /* bytes received in the data stage of the last control IN */
 
     usb_transfer_t **bulk = nullptr;
     uint32_t bulk_num = 0;
@@ -264,6 +271,8 @@ struct esp_rtl_sdr_handle {
 
     /** LO request; applied after bulk drain (never EP0 mid-bulk). 0 = none. */
     volatile uint32_t pending_retune_hz = 0;
+    /** Sample rate queued while streaming; applied in an EP0 window like a retune. */
+    volatile uint32_t pending_rate_sps = 0;
     /** True while apply_pending_retune() runs (delivery or app task). */
     volatile bool retune_busy = false;
     /**
@@ -572,6 +581,10 @@ static void ctrl_cb(usb_transfer_t *xfer)
     }
     h->ctrl_status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
     h->ctrl_stall = (xfer->status == USB_TRANSFER_STATUS_STALL);
+    /* actual_num_bytes counts the 8-byte setup packet too */
+    h->ctrl_actual = (xfer->actual_num_bytes > static_cast<int>(sizeof(usb_setup_packet_t)))
+                         ? static_cast<uint16_t>(xfer->actual_num_bytes - sizeof(usb_setup_packet_t))
+                         : 0;
     xSemaphoreGive(h->ctrl_sem);
 }
 
@@ -592,6 +605,7 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     h->gain_mode = ESP_RTL_SDR_GAIN_MODE_AUTO;
     h->gain_tenth_db = 0;
     h->pending_retune_hz = 0;
+    h->pending_rate_sps = 0;
     h->pending_gain = false;
     h->pending_gain_mode = false;
     h->pending_bias = false;
@@ -618,6 +632,17 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
     if (h->ctrl_xfer == nullptr || dev == nullptr) {
         return ESP_RTL_SDR_ERR_USB;
     }
+    /* The control transfer buffer holds kCtrlXferBytes including the setup packet. */
+    if (wLength > kCtrlXferBytes - sizeof(usb_setup_packet_t)) {
+        ESP_LOGE(TAG, "ctrl wLength %u exceeds %u-byte buffer", static_cast<unsigned>(wLength),
+                 static_cast<unsigned>(kCtrlXferBytes - sizeof(usb_setup_packet_t)));
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* RTL2832U I2C passthrough (block IICB) reads longer than 16 bytes STALL EP0; measured on
+     * hardware, and repeated STALLs can take the stream down. Refuse them up front. */
+    if ((bm & USB_BM_REQUEST_TYPE_DIR_IN) != 0 && (wIndex & 0xff00u) == 0x0600u && wLength > 16) {
+        return ESP_ERR_INVALID_ARG;
+    }
     xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
 
     esp_err_t final_err = ESP_FAIL;
@@ -641,6 +666,7 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
 
         h->ctrl_status = ESP_FAIL;
         h->ctrl_stall = false;
+        h->ctrl_actual = 0;
         xSemaphoreTake(h->ctrl_sem, 0);
 
         esp_err_t ret = usb_host_transfer_submit_control(h->client, x);
@@ -669,9 +695,19 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
         if (h->ctrl_status == ESP_OK) {
             if ((bm & USB_BM_REQUEST_TYPE_DIR_IN) != 0 && response != nullptr &&
                 response_length > 0) {
-                const uint16_t copy_length =
-                    (response_length < wLength) ? response_length : wLength;
-                std::memcpy(response, x->data_buffer + sizeof(usb_setup_packet_t), copy_length);
+                const uint16_t want = (response_length < wLength) ? response_length : wLength;
+                /* Copy only what the device actually sent; a short read must not hand back
+                 * stale bytes from the previous transfer. */
+                const uint16_t got = (h->ctrl_actual < want) ? h->ctrl_actual : want;
+                std::memcpy(response, x->data_buffer + sizeof(usb_setup_packet_t), got);
+                if (got < want) {
+                    std::memset(response + got, 0, want - got);
+                    final_err = ESP_RTL_SDR_ERR_USB;
+                    ESP_LOGW(TAG, "ctrl IN short read: %u of %u bytes (wValue=0x%04x wIndex=0x%04x)",
+                             static_cast<unsigned>(got), static_cast<unsigned>(want),
+                             static_cast<unsigned>(wValue), static_cast<unsigned>(wIndex));
+                    break;
+                }
             }
             final_err = ESP_OK;
             break;
@@ -1341,6 +1377,58 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
 }
 
 /**
+ * Apply a queued sample rate while streaming: drain bulks, rewrite the resampler (the same
+ * register sequence start() uses, ending in a demod soft reset), resubmit. Replaces a full
+ * stop/start of the stream, which costs about a second of samples on every hop between
+ * bands that use different rates. Same threading rules as apply_pending_retune().
+ */
+static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
+{
+    if (h == nullptr || !h->streaming) {
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    const uint32_t rate = h->pending_rate_sps;
+    if (rate == 0) {
+        return ESP_OK;
+    }
+    if (h->retune_busy) {
+        return ESP_OK; /* a retune/rate apply is in flight; pending remains */
+    }
+    h->retune_busy = true;
+    if (!bulk_pause_and_drain(h)) {
+        h->retune_busy = false;
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    if (!h->streaming) {
+        h->pause_resubmit = false;
+        if (h->pending_rate_sps == rate) {
+            h->pending_rate_sps = 0;
+        }
+        h->retune_busy = false;
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    const uint32_t apply = (h->pending_rate_sps != 0) ? h->pending_rate_sps : rate;
+    esp_err_t err = run_sample_rate(h, apply);
+    if (err == ESP_OK) {
+        h->sample_rate_sps = apply;
+        h->preferred_sample_rate_sps = apply;
+        h->metrics.sample_rate_sps = apply;
+        /* effective_sps is bytes over stream time: restart the window at the new rate */
+        h->metrics.bytes_total = 0;
+        h->stream_start_ms = now_ms();
+        ESP_LOGI(TAG, "hot sample rate applied %u S/s", static_cast<unsigned>(apply));
+    } else {
+        ESP_LOGW(TAG, "hot sample rate EP0 failed: %s", esp_rtl_sdr_err_to_name(err));
+    }
+    if (h->pending_rate_sps == apply) {
+        h->pending_rate_sps = 0;
+    }
+    bulk_resume(h);
+    h->retune_busy = false;
+    return err;
+}
+
+/**
  * Drain outstanding bulks (no resubmit), apply LO, resubmit.
  * Must NOT run on the USB client/host lib tasks (blocks; does EP0).
  * Safe from delivery task or app tasks. Coalesces: if pending changes mid-apply,
@@ -1653,7 +1741,11 @@ static void delivery_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
     while (h->tasks_run) {
-        /* Async EP0 off the USB client task (retune first, then gain/bias). */
+        /* Async EP0 off the USB client task (rate, then retune, then gain/bias). */
+        if (h->streaming && h->pending_rate_sps != 0 && !h->retune_busy &&
+            !h->ep0_sideband_busy) {
+            (void)apply_pending_rate(h);
+        }
         if (h->streaming && h->pending_retune_hz != 0 && !h->retune_busy &&
             !h->ep0_sideband_busy) {
             (void)apply_pending_retune(h);
@@ -2263,6 +2355,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
 
     if (usb_fault_guard_boot_check()) {
         s_usb_fault_guard.safe_mode_active_this_boot = true;
+        s_usb_safe_mode_this_boot = true;
         ESP_LOGE(TAG,
                  "USB fault guard latched: %u consecutive enumeration-time panics; "
                  "skipping usb_host_install this boot. Call "
@@ -2276,6 +2369,7 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
         return ESP_RTL_SDR_ERR_USB_SAFE_MODE;
     }
     s_usb_fault_guard.safe_mode_active_this_boot = false;
+    s_usb_safe_mode_this_boot = false;
 
     usb_fault_guard_arm();
     esp_err_t ret = start_usb_stack(h);
@@ -2522,6 +2616,7 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->streaming = false;
     h->frontend_applied_valid = false;
     h->pending_retune_hz = 0;
+    h->pending_rate_sps = 0;
     h->pending_gain = false;
     h->pending_gain_mode = false;
     h->pending_bias = false;
@@ -3016,10 +3111,25 @@ esp_err_t esp_rtl_sdr_set_sample_rate(esp_rtl_sdr_handle_t handle, uint32_t samp
         set_error_unlocked(handle, re);
         return re;
     }
-    if (handle->state == ESP_RTL_SDR_STATE_STREAMING ||
-        handle->state == ESP_RTL_SDR_STATE_STOPPING) {
+    if (handle->state == ESP_RTL_SDR_STATE_STOPPING) {
         set_error_unlocked(handle, ESP_RTL_SDR_ERR_BUSY);
         return ESP_RTL_SDR_ERR_BUSY;
+    }
+    if (handle->state == ESP_RTL_SDR_STATE_STREAMING && handle->streaming) {
+        if (exact == handle->sample_rate_sps && handle->pending_rate_sps == 0) {
+            set_error_unlocked(handle, ESP_OK);
+            return ESP_OK;
+        }
+        /* Change the rate in place (see apply_pending_rate); deferred to the delivery task
+         * when called from the event callback, like a retune. */
+        handle->pending_rate_sps = exact;
+        const uint32_t depth = __atomic_load_n(&handle->in_callback_depth, __ATOMIC_SEQ_CST);
+        const TaskHandle_t cb = __atomic_load_n(&handle->callback_task, __ATOMIC_SEQ_CST);
+        const bool from_callback =
+            esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle());
+        set_error_unlocked(handle, ESP_OK);
+        lk.release();
+        return from_callback ? ESP_OK : apply_pending_rate(handle);
     }
     handle->preferred_sample_rate_sps = exact;
     handle->sample_rate_sps = exact;
