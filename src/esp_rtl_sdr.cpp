@@ -236,7 +236,7 @@ struct esp_rtl_sdr_handle {
     usb_device_handle_t dev = nullptr;
     bool iface_claimed = false;
     QueueHandle_t probe_q = nullptr;
-    bool device_gone = false;
+    volatile bool device_gone = false;
     TaskHandle_t host_task = nullptr;
     TaskHandle_t client_task = nullptr;
     TaskHandle_t delivery_task = nullptr;
@@ -1359,8 +1359,11 @@ static void bulk_cb(usb_transfer_t *xfer)
         ESP_LOGW(TAG, "bulk status=%d bytes=%d", xfer->status, xfer->actual_num_bytes);
     }
 
-    /* Resubmit only while streaming and not draining for stop/retune. */
-    if (h->streaming && !h->pause_resubmit) {
+    /* Resubmit only while streaming and not draining for stop/retune. A transfer that ended
+     * because the device was unplugged is retired: resubmitting it (or scheduling EP recovery)
+     * races the client task closing the device. */
+    if (h->streaming && !h->pause_resubmit && xfer->status != USB_TRANSFER_STATUS_NO_DEVICE &&
+        !h->device_gone) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "bulk resubmit failed: %s", esp_err_to_name(ret));
@@ -1434,7 +1437,7 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
         return;
     }
     h->pause_resubmit = false;
-    if (!h->streaming || h->bulk == nullptr) {
+    if (!h->streaming || h->bulk == nullptr || h->dev == nullptr || h->device_gone) {
         return;
     }
     h->live_urbs = 0;
@@ -1476,6 +1479,16 @@ public:
     Ep0WindowClaim(const Ep0WindowClaim &) = delete;
     Ep0WindowClaim &operator=(const Ep0WindowClaim &) = delete;
     bool owned() const { return owned_; }
+    /** Try again to take a claim this object does not hold yet. */
+    bool retry()
+    {
+        if (!owned_) {
+            uint32_t expected = 0;
+            owned_ = __atomic_compare_exchange_n(&h_->ep0_window, &expected, 1u, false,
+                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        }
+        return owned_;
+    }
 
 private:
     esp_rtl_sdr_handle *h_;
@@ -2349,16 +2362,82 @@ static void host_lib_task_fn(void *arg)
     worker_task_exit(h);
 }
 
+/**
+ * A dongle whose enumeration fails (seen at power-on: "ENUM: CHECK_SHORT_DEV_DESC FAILED") is
+ * never reported to clients, so nothing retries until it is replugged. When this driver owns the
+ * host library and no device has been enumerated for a while, power-cycle the root port to make
+ * the hub state machine enumerate again. Backs off so an empty port is only blipped once a minute.
+ */
+static constexpr uint32_t kEnumRetryFirstMs = 10000;
+static constexpr uint32_t kEnumRetryMaxMs = 60000;
+
+static void maybe_retry_enumeration(esp_rtl_sdr_handle *h, TickType_t *no_dev_since,
+                                    uint32_t *wait_ms)
+{
+    if (!h->owns_host || !h->host_installed) {
+        return;
+    }
+    /* Count only fully enumerated devices: a device whose enumeration failed stays in the host
+     * library's device list (and in usb_host_lib_info().num_devices) at address 0 until it is
+     * unplugged, which is exactly the case this retry exists for. */
+    uint8_t addrs[4];
+    int num_addressed = 0;
+    const esp_err_t fill = (h->dev != nullptr)
+                               ? ESP_OK
+                               : usb_host_device_addr_list_fill(sizeof(addrs), addrs, &num_addressed);
+    if (h->dev != nullptr || fill != ESP_OK || num_addressed > 0) {
+        *no_dev_since = 0;
+        *wait_ms = kEnumRetryFirstMs;
+        return;
+    }
+    const TickType_t now = xTaskGetTickCount();
+    if (*no_dev_since == 0) {
+        *no_dev_since = now;
+        return;
+    }
+    if ((now - *no_dev_since) < pdMS_TO_TICKS(*wait_ms)) {
+        return;
+    }
+    ESP_LOGW(TAG, "usb no enumerated device for %u ms: power-cycling the root port",
+             static_cast<unsigned>(*wait_ms));
+    if (usb_host_lib_set_root_port_power(false) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        (void)usb_host_lib_set_root_port_power(true);
+    }
+    *no_dev_since = xTaskGetTickCount();
+    *wait_ms = (*wait_ms * 2 > kEnumRetryMaxMs) ? kEnumRetryMaxMs : *wait_ms * 2;
+}
+
 static void client_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
+    TickType_t no_dev_since = 0;
+    uint32_t enum_retry_ms = kEnumRetryFirstMs;
     while (h->tasks_run) {
         usb_host_client_handle_events(h->client, pdMS_TO_TICKS(20));
+        maybe_retry_enumeration(h, &no_dev_since, &enum_retry_ms);
         if (h->device_gone) {
-            h->device_gone = false;
             ESP_LOGW(TAG, "usb disconnected profile=%s addr=%u",
                      rtl_profile_name(h->profile), static_cast<unsigned>(h->open_addr));
             h->streaming = false;
+            /* A retune, rate change, sideband EP0 or EP recovery running on another task uses
+             * h->dev between its own checks; let it finish before the handle goes away. Its
+             * transfers complete through this task, so keep pumping client events meanwhile. */
+            Ep0WindowClaim window(h);
+            /* Also wait for the bulk URBs to retire (they complete NO_DEVICE and are not
+             * resubmitted): interface release and device close refuse pending transfers. */
+            for (uint32_t waited = 0; (!window.retry() || h->live_urbs > 0) && waited < 2000;
+                 waited += 5) {
+                usb_host_client_handle_events(h->client, 0);
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+            if (!window.owned()) {
+                ESP_LOGW(TAG, "usb disconnected while an EP0 window stayed open");
+            }
+            if (h->live_urbs > 0) {
+                ESP_LOGW(TAG, "usb disconnected with %u bulk URBs still pending",
+                         static_cast<unsigned>(h->live_urbs));
+            }
             if (h->iface_claimed && h->dev != nullptr) {
                 usb_host_interface_release(h->client, h->dev, 0);
                 h->iface_claimed = false;
@@ -2368,6 +2447,7 @@ static void client_task_fn(void *arg)
                 h->dev = nullptr;
                 h->open_addr = 0;
             }
+            h->device_gone = false; /* only now: other tasks check it until the handle is closed */
             clear_profile_runtime_state(h);
             h->info = {};
             h->info.present = false;
