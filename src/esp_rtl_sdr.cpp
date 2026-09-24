@@ -30,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
+#include "usb/usb_helpers.h"
 
 #include "rtl_profile.hpp"
 #include "transfers_blog_v3.hpp"
@@ -39,6 +40,13 @@
 #include "reentrancy.hpp"
 
 static const char *TAG = "esp_rtl_sdr";
+
+/* Upstream's per-handle log macros (they prefix a multi-device log id this base doesn't have).
+ * Aliased so upstream fixes can be cherry-picked without rewriting their log lines. */
+#define RTL_LOGD(h, fmt, ...) ESP_LOGD(TAG, fmt, ##__VA_ARGS__)
+#define RTL_LOGI(h, fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#define RTL_LOGW(h, fmt, ...) ESP_LOGW(TAG, fmt, ##__VA_ARGS__)
+#define RTL_LOGE(h, fmt, ...) ESP_LOGE(TAG, fmt, ##__VA_ARGS__)
 
 static constexpr uint32_t kHandleMagic = 0x52345634u;
 static constexpr TickType_t kQueryLockTicks = pdMS_TO_TICKS(50);
@@ -333,6 +341,14 @@ struct esp_rtl_sdr_handle {
 
     /** Sync-read pull ring (CU8 bytes). Filled by delivery task. */
     uint8_t *pull_buf = nullptr;
+    /* Last value written to each tuner register and whether it is known. A hot retune replays the
+     * whole tune template, and every tuner write costs several ms of EP0 + I2C repeater time while
+     * the stream is paused; most of those writes repeat the value already in the register. Only
+     * exact repeats are skipped (a 0x2a, 0x22, 0x2a sequence still writes all three). Dropped at
+     * init, on profile reset and after any failed record. Same idea as upstream 698091a. */
+    uint8_t tuner_reg_val[32] = {0};
+    uint32_t tuner_reg_known = 0;
+    uint32_t tuner_writes_skipped = 0;
     size_t pull_cap = 0;
     size_t pull_r = 0;
     size_t pull_w = 0;
@@ -604,6 +620,7 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     }
     h->profile = RtlProfileId::Unknown;
     h->device_caps = 0;
+    h->tuner_reg_known = 0;
     h->frontend_applied_valid = false;
     h->frontend_applied = MeasuredV4FrontendPlan{};
     h->tuner_reg05_low_bits = 0x03;
@@ -773,8 +790,31 @@ static esp_err_t run_record(esp_rtl_sdr_handle *h, const RtlControlRecord &rec,
                             bool expect_stall)
 {
     const RtlControlRecord mapped = map_tuner_record_for_profile(h, rec);
-    return ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index, mapped.data,
-                       mapped.length, expect_stall);
+    /* A plain register write to the tuner: {reg, value} to the tuner's I2C address. Probe writes
+     * that are expected to STALL (tuner auto-detect) are never cached. */
+    const bool tuner_write = h != nullptr && !expect_stall && mapped.request_type == 0x40 &&
+                             mapped.index == 0x0610 &&
+                             (mapped.value & 0x00ffu) == tuner_i2c_value_for_handle(h);
+    if (tuner_write && mapped.length == 2 && mapped.data[0] < 32) {
+        const uint8_t reg = mapped.data[0];
+        if ((h->tuner_reg_known & (1u << reg)) != 0 && h->tuner_reg_val[reg] == mapped.data[1]) {
+            h->tuner_writes_skipped++;
+            return ESP_OK;
+        }
+    }
+    const esp_err_t err = ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index,
+                                      mapped.data, mapped.length, expect_stall);
+    if (h != nullptr) {
+        if (err != ESP_OK) {
+            h->tuner_reg_known = 0;
+        } else if (tuner_write && mapped.length == 2 && mapped.data[0] < 32) {
+            h->tuner_reg_val[mapped.data[0]] = mapped.data[1];
+            h->tuner_reg_known |= 1u << mapped.data[0];
+        } else if (tuner_write && mapped.length > 2) {
+            h->tuner_reg_known = 0; /* multi-register write: not tracked */
+        }
+    }
+    return err;
 }
 
 /*
@@ -833,6 +873,7 @@ static bool probe_blog_v3_tuner(esp_rtl_sdr_handle *h, usb_device_handle_t dev,
 
 static esp_err_t run_init_table(esp_rtl_sdr_handle *h)
 {
+    h->tuner_reg_known = 0; /* the tuner is being re-initialised from scratch */
     ESP_LOGI(TAG, "init begin profile=%s records=%u", rtl_profile_name(h->profile),
              static_cast<unsigned>(std::size(kRtlInitTransfers)));
     size_t skipped = 0;
@@ -984,33 +1025,13 @@ static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
  * freq_ranges[] (tuner_r82xx.c). Base bytes for the masked regs are the capture's final
  * values, since the R820T2 cannot read back regs >= 0x10 (16-byte I2C read limit).
  */
-struct R820T2BandRow {
-    uint16_t mhz;
-    uint8_t open_d;      /* r17 mask 0x08 */
-    uint8_t rf_mux_ploy; /* r1a mask 0xc3 */
-    uint8_t tf_c;        /* r1b */
-};
-static constexpr R820T2BandRow kR820T2Bands[] = {
-    {0, 0x08, 0x02, 0xdf},   {50, 0x08, 0x02, 0xbe},  {55, 0x08, 0x02, 0x8b},
-    {60, 0x08, 0x02, 0x7b},  {65, 0x08, 0x02, 0x69},  {70, 0x08, 0x02, 0x58},
-    {75, 0x00, 0x02, 0x44},  {80, 0x00, 0x02, 0x44},  {90, 0x00, 0x02, 0x34},
-    {100, 0x00, 0x02, 0x34}, {110, 0x00, 0x02, 0x24}, {120, 0x00, 0x02, 0x24},
-    {140, 0x00, 0x02, 0x14}, {180, 0x00, 0x02, 0x13}, {220, 0x00, 0x02, 0x13},
-    {250, 0x00, 0x02, 0x11}, {280, 0x00, 0x02, 0x00}, {310, 0x00, 0x41, 0x00},
-    {450, 0x00, 0x41, 0x00}, {588, 0x00, 0x40, 0x00}, {650, 0x00, 0x40, 0x00},
-};
 static constexpr uint8_t kR820T2CaptureReg17 = 0x20;
 static constexpr uint8_t kR820T2CaptureReg1a = 0x2a;
 
 static esp_err_t run_r820t2_band_frontend(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
 {
     const uint32_t mhz = frequency_hz / 1000000u;
-    const R820T2BandRow *row = &kR820T2Bands[0];
-    for (const R820T2BandRow &r : kR820T2Bands) {
-        if (mhz >= r.mhz) {
-            row = &r;
-        }
-    }
+    const R820T2BandRow *row = rtl_r820t2_band_for_hz(frequency_hz);
     const uint8_t r17 = static_cast<uint8_t>((kR820T2CaptureReg17 & ~0x08) | row->open_d);
     const uint8_t r1a = static_cast<uint8_t>((kR820T2CaptureReg1a & ~0xc3) | row->rf_mux_ploy);
     const RtlControlRecord recs[] = {
@@ -2103,6 +2124,36 @@ static RtlProfileId identify_profile(esp_rtl_sdr_handle *h, usb_device_handle_t 
 }
 
 /** Probe address; if accepted profile, fill candidate and close unless keep_open. */
+/**
+ * Refuse a device whose descriptors don't have the shape this driver drives: interface 0 with a
+ * bulk IN endpoint 0x81 and a sane max packet size. VID/PID and strings alone are spoofable, and
+ * everything after the claim assumes this layout.
+ */
+static bool rtl_device_layout_ok(usb_device_handle_t dev, const usb_device_desc_t *dd)
+{
+    if (dd == nullptr || dd->bNumConfigurations == 0 || dd->bMaxPacketSize0 < 8) {
+        return false;
+    }
+    const usb_config_desc_t *cfg = nullptr;
+    if (usb_host_get_active_config_descriptor(dev, &cfg) != ESP_OK || cfg == nullptr) {
+        return false;
+    }
+    int offset = 0;
+    const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, 0, 0, &offset);
+    if (intf == nullptr || intf->bNumEndpoints == 0) {
+        return false;
+    }
+    offset = 0;
+    const usb_ep_desc_t *ep =
+        usb_parse_endpoint_descriptor_by_address(cfg, 0, 0, ESP_RTL_SDR_BULK_EP_IN, &offset);
+    if (ep == nullptr ||
+        (ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) != USB_BM_ATTRIBUTES_XFER_BULK) {
+        return false;
+    }
+    const uint16_t mps = USB_EP_DESC_GET_MPS(ep);
+    return mps >= 8 && mps <= 512;
+}
+
 static bool probe_candidate(esp_rtl_sdr_handle *h, uint8_t addr, DeviceCandidate *out,
                             bool keep_open)
 {
@@ -2131,6 +2182,12 @@ static bool probe_candidate(esp_rtl_sdr_handle *h, uint8_t addr, DeviceCandidate
     esp_rtl_sdr_device_info_t di{};
     const RtlProfileId profile = identify_profile(h, dev, dd, &info, &di);
     if (profile == RtlProfileId::Unknown) {
+        usb_host_device_close(h->client, dev);
+        return false;
+    }
+    if (!rtl_device_layout_ok(dev, dd)) {
+        ESP_LOGW(TAG, "addr %u matches %s but has no bulk IN 0x81 on interface 0; ignoring",
+                 static_cast<unsigned>(addr), rtl_profile_name(profile));
         usb_host_device_close(h->client, dev);
         return false;
     }
@@ -3327,10 +3384,24 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             }
             continue;
         }
+        /* At most two memcpys (up to the end of the ring, then from its start). The previous
+         * byte-at-a-time loop did a modulo per byte and cost ~43% of a core at 2 MS/s. */
         while (copied < max_bytes && handle->pull_count > 0) {
-            out_buf[copied++] = handle->pull_buf[handle->pull_r];
-            handle->pull_r = (handle->pull_r + 1) % handle->pull_cap;
-            handle->pull_count--;
+            size_t n = max_bytes - copied;
+            if (n > handle->pull_count) {
+                n = handle->pull_count;
+            }
+            const size_t to_end = handle->pull_cap - handle->pull_r;
+            if (n > to_end) {
+                n = to_end;
+            }
+            std::memcpy(out_buf + copied, handle->pull_buf + handle->pull_r, n);
+            copied += n;
+            handle->pull_r += n;
+            if (handle->pull_r == handle->pull_cap) {
+                handle->pull_r = 0;
+            }
+            handle->pull_count -= n;
         }
         xSemaphoreGive(handle->pull_mux);
 
@@ -4090,8 +4161,68 @@ static esp_err_t apply_gain_records(esp_rtl_sdr_handle *h, int tenth_db, int *ap
 }
 
 /** Apply tuner AUTO and the current route together (caller owns bulk pause). */
+/** Read the R82xx's first n registers (n <= 16: the RTL2832U I2C bridge STALLs longer reads).
+ * The tuner always reads from register 0 and returns each byte bit-reversed. */
+static esp_err_t r820t2_read_regs(esp_rtl_sdr_handle *h, uint8_t *out, uint16_t n)
+{
+    const RtlControlRecord ptr = {kBlogV4TunerI2cValue, 0x0610, 0x40, 1, {0, 0, 0, 0, 0, 0, 0, 0}};
+    esp_err_t err = run_record(h, ptr, false);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t raw[16] = {0};
+    err = ctrl_submit_device(h, h->dev, 0xc0, 0, tuner_i2c_value_for_handle(h), 0x0600, nullptr, n,
+                             false, raw, n);
+    for (uint16_t i = 0; i < n; ++i) {
+        out[i] = r82xx_bitrev(raw[i]);
+    }
+    return err;
+}
+
+/**
+ * R820T2 automatic gain, librtlsdr's r82xx_set_gain(auto): LNA gain auto (r05 bit 4 clear), mixer
+ * gain auto (r07 bit 4 set), VGA fixed at 26.5 dB (r0c low bits 0x0b, mask 0x9f). Read-modify-write
+ * so the other bits in those registers keep what init and tune put there.
+ */
+static esp_err_t apply_r820t2_agc_auto_records(esp_rtl_sdr_handle *h)
+{
+    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn, std::size(kBlogV3TunerRepeaterOn));
+    uint8_t r[16] = {0};
+    if (err == ESP_OK) {
+        err = r820t2_read_regs(h, r, sizeof(r));
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    const uint8_t r05 = static_cast<uint8_t>(r[0x05] & ~0x10u);
+    const uint8_t r07 = static_cast<uint8_t>(r[0x07] | 0x10u);
+    const uint8_t r0c = static_cast<uint8_t>((r[0x0c] & ~0x9fu) | 0x0bu);
+    h->tuner_reg_known = 0; /* the cache may disagree with what was just read back */
+    err = run_record(h, measured_v4_ir_reg_write(0x05, r05), false);
+    if (err == ESP_OK) {
+        err = run_record(h, measured_v4_ir_reg_write(0x07, r07), false);
+    }
+    if (err == ESP_OK) {
+        err = run_record(h, measured_v4_ir_reg_write(0x0c, r0c), false);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "R820T2 gain AUTO: r05=%02x r07=%02x r0c=%02x", r05, r07, r0c);
+    }
+    return err;
+}
+
 static esp_err_t apply_tuner_agc_auto_records(esp_rtl_sdr_handle *h)
 {
+    if (rtl_profile_uses_r820t2_i2c_remap(h->profile)) {
+        esp_err_t err = ESP_FAIL;
+        for (int pass = 0; pass < 3 && err != ESP_OK; ++pass) {
+            err = apply_r820t2_agc_auto_records(h);
+            if (err != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(30 + pass * 20));
+            }
+        }
+        return err;
+    }
     esp_err_t err = ESP_FAIL;
     const uint32_t rf_hz = frontend_rf_hz(h);
     for (int pass = 0; pass < 3; ++pass) {
