@@ -4117,8 +4117,16 @@ static esp_err_t apply_r820t2_agc_auto_records(esp_rtl_sdr_handle *h)
     if (err != ESP_OK) {
         return err;
     }
-    const uint8_t r05 = static_cast<uint8_t>(r[0x05] & ~0x10u);
+    /* reg 0x05: [7] loop-through off, [6] LNA1 power detector, [5] LNA power detector (0 = on),
+     * [4] LNA gain mode (0 = auto), [3:0] manual LNA gain. The replayed init leaves 0xe3: mode
+     * already "auto" but both detectors OFF, so the AGC has nothing to measure and parks the LNA
+     * at minimum gain (verified deaf on hardware). librtlsdr's init is 0x83; the manual-gain
+     * ladder here writes 0x9x, i.e. detectors on, which is why fixed gain worked. Keep bit 7 and
+     * the gain bits, clear 6:4. */
+    const uint8_t r05 = static_cast<uint8_t>(r[0x05] & 0x8fu);
+    /* reg 0x07: [4] mixer gain mode (1 = auto); librtlsdr's init/auto value is 0x75. */
     const uint8_t r07 = static_cast<uint8_t>(r[0x07] | 0x10u);
+    /* reg 0x0c: VGA fixed at 26.5 dB (0x0b) like librtlsdr's auto path. */
     const uint8_t r0c = static_cast<uint8_t>((r[0x0c] & ~0x9fu) | 0x0bu);
     h->tuner_reg_known = 0; /* the cache may disagree with what was just read back */
     err = run_record(h, measured_v4_ir_reg_write(0x05, r05), false);
@@ -4129,7 +4137,8 @@ static esp_err_t apply_r820t2_agc_auto_records(esp_rtl_sdr_handle *h)
         err = run_record(h, measured_v4_ir_reg_write(0x0c, r0c), false);
     }
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "R820T2 gain AUTO: r05=%02x r07=%02x r0c=%02x", r05, r07, r0c);
+        ESP_LOGI(TAG, "R820T2 gain AUTO: r05=%02x r07=%02x r0c=%02x (was %02x/%02x/%02x; vth r0d=%02x r0e=%02x)",
+                 r05, r07, r0c, r[0x05], r[0x07], r[0x0c], r[0x0d], r[0x0e]);
     }
     return err;
 }
