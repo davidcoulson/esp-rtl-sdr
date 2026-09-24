@@ -157,11 +157,13 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
          * from private/gain_r820t2.hpp. Its discrete stage sequence remains
          * a hardware candidate, not a calibrated table (see that header and
          * docs/captures/NOTES.md).
-         * Still no AUTO/RTL_AGC/BIAS_TEE/HF_UPCONVERTER -- unimplemented
+         * Tuner AUTO gain uses librtlsdr's R82xx recipe (LNA + mixer auto, VGA 26.5 dB). Still no
+         * RTL_AGC/BIAS_TEE/HF_UPCONVERTER -- unimplemented
          * for this tuner family, not just unverified. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
-               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
+               ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
     case RtlProfileId::NooelecSmartV5:
         /* Nooelec SMArt v5 uses the same R820T2 tuner and I2C remap path as BlogV3
          * (rtl_profile_uses_r820t2_i2c_remap() is true for both), and
@@ -169,11 +171,11 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
          * apply_r820t2_gain_records() -- there is no Nooelec-specific gain code path,
          * it is the identical BlogV3 manual gain-table write. Enabling CAP_GAIN here
          * to soak-test on real Nooelec SMArt v5 hardware per the maintainer's request
-         * in the capability comment above. Still no AUTO/RTL_AGC/BIAS_TEE/HF_UPCONVERTER
+         * in the capability comment above. AUTO gain as for BlogV3; still no RTL_AGC/BIAS_TEE/HF_UPCONVERTER
          * -- unimplemented for this tuner family, not just unverified. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
-               ESP_RTL_SDR_CAP_GAIN;
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO;
     default:
         return 0;
     }
@@ -222,6 +224,48 @@ inline uint32_t rtl_profile_v3_direct_nco_word(uint32_t frequency_hz, int32_t pp
     const uint32_t scaled = static_cast<uint32_t>(
         (static_cast<uint64_t>(corrected_hz) << 22) / ESP_RTL_SDR_XTAL_HZ);
     return (0x400000u - scaled) & 0x3fffffu;
+}
+
+/**
+ * R820T2 RF front-end band select: librtlsdr's R820T freq_ranges[] (tuner_r82xx.c). The Blog V4
+ * capture the R820T2 path replays only retunes the PLL, so without this the RF mux and tracking
+ * filter stay on the 90-110 MHz FM band the capture was taken in (hardcoreerik/esp-rtl-sdr#25).
+ * open_d is r17 bit 3, rf_mux_ploy is r1a mask 0xc3, tf_c is r1b.
+ */
+struct R820T2BandRow {
+    uint16_t mhz;        /* row applies from this frequency up to the next row */
+    uint8_t open_d;
+    uint8_t rf_mux_ploy;
+    uint8_t tf_c;
+};
+constexpr R820T2BandRow kR820T2Bands[] = {
+    {0, 0x08, 0x02, 0xdf},   {50, 0x08, 0x02, 0xbe},  {55, 0x08, 0x02, 0x8b},
+    {60, 0x08, 0x02, 0x7b},  {65, 0x08, 0x02, 0x69},  {70, 0x08, 0x02, 0x58},
+    {75, 0x00, 0x02, 0x44},  {80, 0x00, 0x02, 0x44},  {90, 0x00, 0x02, 0x34},
+    {100, 0x00, 0x02, 0x34}, {110, 0x00, 0x02, 0x24}, {120, 0x00, 0x02, 0x24},
+    {140, 0x00, 0x02, 0x14}, {180, 0x00, 0x02, 0x13}, {220, 0x00, 0x02, 0x13},
+    {250, 0x00, 0x02, 0x11}, {280, 0x00, 0x02, 0x00}, {310, 0x00, 0x41, 0x00},
+    {450, 0x00, 0x41, 0x00}, {588, 0x00, 0x40, 0x00}, {650, 0x00, 0x40, 0x00},
+};
+
+inline const R820T2BandRow *rtl_r820t2_band_for_hz(uint32_t rf_hz)
+{
+    const uint32_t mhz = rf_hz / 1000000u;
+    const R820T2BandRow *row = &kR820T2Bands[0];
+    for (const R820T2BandRow &r : kR820T2Bands) {
+        if (mhz >= r.mhz) {
+            row = &r;
+        }
+    }
+    return row;
+}
+
+/** R82xx tuners return every register byte bit-reversed over I2C. */
+inline uint8_t r82xx_bitrev(uint8_t b)
+{
+    constexpr uint8_t lut[16] = {0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe,
+                                 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf};
+    return static_cast<uint8_t>((lut[b & 0xf] << 4) | lut[b >> 4]);
 }
 
 /** Blog V4 vendor board controls must never run on plain R820T2/R860 sticks. */
