@@ -424,6 +424,23 @@ static void test_r820t2_band_select(void)
     }
 }
 
+static void test_r820t2_if_for_rate(void)
+{
+    /* librtlsdr r82xx_set_bandwidth() with bandwidth = sample rate */
+    R820T2IfSetting s = rtl_r820t2_if_for_rate(250000u);
+    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0xe8u); EXPECT_EQ_U(s.if_hz, 1700000u);
+    s = rtl_r820t2_if_for_rate(1024000u);
+    EXPECT_EQ_U(s.reg0b, 0xecu); EXPECT_EQ_U(s.if_hz, 1400000u);
+    s = rtl_r820t2_if_for_rate(2048000u);
+    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0x8fu); EXPECT_EQ_U(s.if_hz, 1750000u);
+    s = rtl_r820t2_if_for_rate(2560000u);
+    EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 2000000u);
+    s = rtl_r820t2_if_for_rate(3200000u);
+    EXPECT_EQ_U(s.reg0a, 0x00u); EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 3570000u);
+    /* demod IF word: the init table's 3.57 MHz bytes are 38 11 12 */
+    EXPECT_EQ_U(rtl_demod_if_word(3570000u, 28800000u), 0x381112u);
+}
+
 static void test_r82xx_bitrev(void)
 {
     EXPECT_EQ_U(r82xx_bitrev(0x69), 0x96u); /* R820T2 chip id as it arrives over I2C */
@@ -438,6 +455,7 @@ static void test_r82xx_bitrev(void)
 int main(void)
 {
     test_r820t2_band_select();
+    test_r820t2_if_for_rate();
     test_r82xx_bitrev();
     test_detection_matrix();
     test_unknown_reject_and_v3_probe();
