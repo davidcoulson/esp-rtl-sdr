@@ -359,6 +359,49 @@ inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
     return kMeasuredV4IfOffsetHz;
 }
 
+/**
+ * R820T2 IF filter and IF frequency for a sample rate, as librtlsdr's r82xx_set_bandwidth() picks
+ * them when the tuner bandwidth is left automatic (bandwidth = sample rate). reg 0x0a is written
+ * with mask 0x10, reg 0x0b with mask 0xef, and the RTL2832 demod IF plus the tuner LO follow if_hz.
+ * The replayed capture leaves the 2.2 MHz filter (0x8f) but a 3.57 MHz IF: the signal then sits at
+ * the edge of the filter and the image (7.14 MHz off) is barely rejected, which on a busy band
+ * (915 MHz ISM) buries the wanted signals under the AGC-amplified neighbours.
+ */
+struct R820T2IfSetting {
+    uint8_t reg0a;
+    uint8_t reg0b;
+    uint32_t if_hz;
+};
+
+inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps)
+{
+    constexpr uint32_t kBwKhz[] = {300, 450, 600, 900, 1100, 1200, 1300, 1500, 1800, 2200, 3000, 5000};
+    constexpr uint8_t kReg0b[] = {0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xaf, 0x8f, 0x6f, 0x6f};
+    constexpr uint32_t kIfKhz[] = {1700, 1650, 1600, 1500, 1400, 1350, 1320, 1270, 1600, 1750, 2000, 3570};
+    const uint32_t bw_khz = sample_rate_sps / 1000u;
+    if (bw_khz > 7000u) {
+        return {0x10, 0x0b, 4570000u};
+    }
+    if (bw_khz > 6000u) {
+        return {0x10, 0x2a, 4570000u};
+    }
+    if (bw_khz > 5000u) {
+        return {0x10, 0x6b, 3570000u};
+    }
+    size_t i = 0;
+    while (i + 1 < sizeof(kBwKhz) / sizeof(kBwKhz[0]) && bw_khz > kBwKhz[i]) {
+        ++i;
+    }
+    return {static_cast<uint8_t>(i == 11 ? 0x00 : 0x0f), kReg0b[i], kIfKhz[i] * 1000u};
+}
+
+/** RTL2832 demod IF word (page 1 regs 0x19..0x1b), librtlsdr's rtlsdr_set_if_freq() arithmetic. */
+inline uint32_t rtl_demod_if_word(uint32_t if_hz, uint32_t xtal_hz)
+{
+    const int64_t v = (static_cast<int64_t>(if_hz) << 22) / static_cast<int64_t>(xtal_hz);
+    return static_cast<uint32_t>(-v) & 0x3fffffu;
+}
+
 /** Non-zero only when initialization must restore a profile-specific demod IF. */
 inline uint32_t rtl_profile_demod_if_restore_hz(RtlProfileId profile)
 {

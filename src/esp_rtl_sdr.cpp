@@ -281,6 +281,8 @@ struct esp_rtl_sdr_handle {
 
     /** LO request; applied after bulk drain (never EP0 mid-bulk). 0 = none. */
     volatile uint32_t pending_retune_hz = 0;
+    /** IF the R820T2 path currently runs at (0 = the profile default). Set per sample rate. */
+    uint32_t r820t2_if_hz = 0;
     /** Sample rate queued while streaming; applied in an EP0 window like a retune. */
     volatile uint32_t pending_rate_sps = 0;
     /** Set by bulk_cb when a resubmit fails, meaning the bulk IN endpoint has been halted by a
@@ -635,6 +637,7 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     h->gain_tenth_db = 0;
     h->pending_retune_hz = 0;
     h->pending_rate_sps = 0;
+    h->r820t2_if_hz = 0;
     h->ep_stall_recover = false;
     h->pending_gain = false;
     h->pending_gain_mode = false;
@@ -950,6 +953,60 @@ static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
     return ESP_OK;
 }
 
+static esp_err_t r820t2_read_regs(esp_rtl_sdr_handle *h, uint8_t *out, uint16_t n);
+
+/**
+ * R820T2 profiles: set the tuner IF filter and the demod IF for a sample rate the way librtlsdr
+ * does (see rtl_r820t2_if_for_rate). The caller retunes afterwards: the LO = RF + IF moves.
+ */
+static esp_err_t run_r820t2_if_for_rate(esp_rtl_sdr_handle *h, uint32_t sample_rate_sps)
+{
+    if (h == nullptr || !rtl_profile_uses_r820t2_i2c_remap(h->profile)) {
+        return ESP_OK;
+    }
+    const R820T2IfSetting st = rtl_r820t2_if_for_rate(sample_rate_sps);
+    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn, std::size(kBlogV3TunerRepeaterOn));
+    uint8_t r[16] = {0};
+    if (err == ESP_OK) {
+        err = r820t2_read_regs(h, r, sizeof(r));
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    const uint8_t r0a = static_cast<uint8_t>((r[0x0a] & ~0x10u) | (st.reg0a & 0x10u));
+    const uint8_t r0b = static_cast<uint8_t>((r[0x0b] & ~0xefu) | (st.reg0b & 0xefu));
+    h->tuner_reg_known = 0;
+    err = run_record(h, measured_v4_ir_reg_write(0x0a, r0a), false);
+    if (err == ESP_OK) {
+        err = run_record(h, measured_v4_ir_reg_write(0x0b, r0b), false);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    /* demod IF: page 1 regs 0x19 (bits 21:16), 0x1a, 0x1b; same record shape as the init table */
+    const uint32_t word = rtl_demod_if_word(st.if_hz, ESP_RTL_SDR_XTAL_HZ);
+    const uint8_t bytes[3] = {static_cast<uint8_t>((word >> 16) & 0x3f),
+                              static_cast<uint8_t>(word >> 8), static_cast<uint8_t>(word)};
+    const uint8_t regs[3] = {0x19, 0x1a, 0x1b};
+    for (int i = 0; i < 3; ++i) {
+        const RtlControlRecord w = {static_cast<uint16_t>((regs[i] << 8) | 0x20), 0x0011, 0x40, 1,
+                                    {bytes[i], 0, 0, 0, 0, 0, 0, 0}};
+        const RtlControlRecord rd = {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}};
+        err = run_record(h, w, false);
+        if (err == ESP_OK) {
+            err = run_record(h, rd, false);
+        }
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    h->r820t2_if_hz = st.if_hz;
+    ESP_LOGI(TAG, "r820t2 IF for %u S/s: filter r0a=%02x r0b=%02x (was %02x/%02x) if=%u Hz demod=%06x",
+             static_cast<unsigned>(sample_rate_sps), r0a, r0b, r[0x0a], r[0x0b],
+             static_cast<unsigned>(st.if_hz), static_cast<unsigned>(word));
+    return ESP_OK;
+}
+
 static esp_err_t run_v3_direct_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
 {
     const uint32_t nco =
@@ -1074,7 +1131,9 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
         apply_freq_correction_hz(tuner_base, h != nullptr ? h->freq_correction_ppm : 0);
     uint8_t r16_setup = 0, r16_active = 0, r20 = 0, r21 = 0, r22 = 0;
     const double xtal_hz = rtl_profile_pll_xtal_hz(profile);
-    const double if_offset_hz = rtl_profile_pll_if_offset_hz(profile);
+    const double if_offset_hz = (h != nullptr && h->r820t2_if_hz != 0)
+                                    ? static_cast<double>(h->r820t2_if_hz)
+                                    : rtl_profile_pll_if_offset_hz(profile);
     if (!encode_r820_pll(tune_hz, xtal_hz, if_offset_hz, &r16_setup, &r16_active, &r20, &r21,
                          &r22)) {
         return ESP_RTL_SDR_ERR_BAD_FREQ;
@@ -1557,6 +1616,17 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
     }
     const uint32_t apply = (h->pending_rate_sps != 0) ? h->pending_rate_sps : rate;
     esp_err_t err = run_sample_rate(h, apply);
+    if (err == ESP_OK && rtl_profile_uses_r820t2_i2c_remap(h->profile) &&
+        !rtl_profile_uses_v3_direct_sampling(h->profile, h->frequency_hz)) {
+        /* the IF filter and IF follow the rate; the LO = RF + IF, so retune */
+        err = run_r820t2_if_for_rate(h, apply);
+        if (err == ESP_OK) {
+            err = run_profile_tune(h, h->frequency_hz, h->frequency_hz);
+        }
+        if (err == ESP_OK) {
+            err = run_band_frontend(h, h->frequency_hz);
+        }
+    }
     if (err == ESP_OK) {
         h->sample_rate_sps = apply;
         h->preferred_sample_rate_sps = apply;
@@ -2900,6 +2970,7 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->frontend_applied_valid = false;
     h->pending_retune_hz = 0;
     h->pending_rate_sps = 0;
+    h->r820t2_if_hz = 0;
     h->ep_stall_recover = false;
     h->pending_gain = false;
     h->pending_gain_mode = false;
@@ -3098,6 +3169,12 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (cold_tuner_reinit) {
             ret = run_records(handle, kBlogV3TunerRepeaterOn,
                               std::size(kBlogV3TunerRepeaterOn));
+            if (ret != ESP_OK) {
+                break;
+            }
+        }
+        if (!rtl_profile_uses_v3_direct_sampling(handle->profile, freq)) {
+            ret = run_r820t2_if_for_rate(handle, local.sample_rate_sps);
             if (ret != ESP_OK) {
                 break;
             }
