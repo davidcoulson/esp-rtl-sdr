@@ -289,6 +289,9 @@ struct esp_rtl_sdr_handle {
     volatile bool pending_rtl_agc = false;
     volatile bool pending_rtl_agc_enable = false;
     volatile bool ep0_sideband_busy = false;
+    /** 1 while a retune, rate change or sideband EP0 window owns bulk pause/resume + EP0.
+     * Claimed atomically (Ep0WindowClaim): these run on the app task or the delivery task. */
+    uint32_t ep0_window = 0;
 
     /** Preferred LO/rate for desktop-shaped set_* APIs and start_hz(). */
     uint32_t preferred_frequency_hz = ESP_RTL_SDR_PRESET_KZEL_HZ;
@@ -973,6 +976,7 @@ static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_h
 
 static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 {
+    h->tuner_reg_known = 0; /* a forced reinit must reach the tuner even for cached values */
     for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
         esp_err_t err = run_record(h, kRtlInitTransfers[i], false);
         if (err != ESP_OK) {
@@ -1011,10 +1015,10 @@ static esp_err_t run_v3_leave_direct(esp_rtl_sdr_handle *h)
 static constexpr uint8_t kR820T2CaptureReg17 = 0x20;
 static constexpr uint8_t kR820T2CaptureReg1a = 0x2a;
 
-static esp_err_t run_r820t2_band_frontend(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
+static esp_err_t run_r820t2_band_frontend(esp_rtl_sdr_handle *h, uint32_t lo_hz)
 {
-    const uint32_t mhz = frequency_hz / 1000000u;
-    const R820T2BandRow *row = rtl_r820t2_band_for_hz(frequency_hz);
+    const uint32_t mhz = lo_hz / 1000000u;
+    const R820T2BandRow *row = rtl_r820t2_band_for_hz(lo_hz);
     const uint8_t r17 = static_cast<uint8_t>((kR820T2CaptureReg17 & ~0x08) | row->open_d);
     const uint8_t r1a = static_cast<uint8_t>((kR820T2CaptureReg1a & ~0xc3) | row->rf_mux_ploy);
     const RtlControlRecord recs[] = {
@@ -1030,7 +1034,7 @@ static esp_err_t run_r820t2_band_frontend(esp_rtl_sdr_handle *h, uint32_t freque
             return e;
         }
     }
-    ESP_LOGI(TAG, "r820t2 band frontend rf=%u MHz row=%u r17=%02x r1a=%02x r1b=%02x",
+    ESP_LOGI(TAG, "r820t2 band frontend lo=%u MHz row=%u r17=%02x r1a=%02x r1b=%02x",
              static_cast<unsigned>(mhz), static_cast<unsigned>(row->mhz), r17, r1a, row->tf_c);
     return ESP_OK;
 }
@@ -1088,7 +1092,7 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
         }
     }
     if (h != nullptr && rtl_profile_uses_r820t2_i2c_remap(profile)) {
-        esp_err_t e = run_r820t2_band_frontend(h, frequency_hz);
+        esp_err_t e = run_r820t2_band_frontend(h, rtl_r820t2_lo_hz(tune_hz, if_offset_hz));
         if (e != ESP_OK) {
             return e;
         }
@@ -1391,6 +1395,35 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
 }
 
 /**
+ * Retune, sample-rate change and sideband EP0 (gain/bias) each pause bulk, talk EP0 and resume
+ * bulk, and can be started from the app task or the delivery task. Only one may do so at a time:
+ * two overlapping windows resubmit URBs twice (corrupting live_urbs) or send EP0 mid-bulk.
+ * The claim is released when the object goes out of scope.
+ */
+class Ep0WindowClaim {
+public:
+    explicit Ep0WindowClaim(esp_rtl_sdr_handle *h) : h_(h)
+    {
+        uint32_t expected = 0;
+        owned_ = __atomic_compare_exchange_n(&h_->ep0_window, &expected, 1u, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    ~Ep0WindowClaim()
+    {
+        if (owned_) {
+            __atomic_store_n(&h_->ep0_window, 0u, __ATOMIC_RELEASE);
+        }
+    }
+    Ep0WindowClaim(const Ep0WindowClaim &) = delete;
+    Ep0WindowClaim &operator=(const Ep0WindowClaim &) = delete;
+    bool owned() const { return owned_; }
+
+private:
+    esp_rtl_sdr_handle *h_;
+    bool owned_;
+};
+
+/**
  * Apply a queued sample rate while streaming: drain bulks, rewrite the resampler (the same
  * register sequence start() uses, ending in a demod soft reset), resubmit. Replaces a full
  * stop/start of the stream, which costs about a second of samples on every hop between
@@ -1405,8 +1438,9 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
     if (rate == 0) {
         return ESP_OK;
     }
-    if (h->retune_busy) {
-        return ESP_OK; /* a retune/rate apply is in flight; pending remains */
+    Ep0WindowClaim window(h);
+    if (!window.owned()) {
+        return ESP_OK; /* another EP0 window is open; the delivery task applies it later */
     }
     h->retune_busy = true;
     if (!bulk_pause_and_drain(h)) {
@@ -1457,8 +1491,9 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     if (freq == 0) {
         return ESP_OK;
     }
-    if (h->retune_busy) {
-        return ESP_OK; /* another apply in flight; pending remains */
+    Ep0WindowClaim window(h);
+    if (!window.owned()) {
+        return ESP_OK; /* another EP0 window is open; the delivery task applies it later */
     }
     h->retune_busy = true;
 
@@ -4181,6 +4216,10 @@ static esp_err_t apply_pending_sideband_ep0(esp_rtl_sdr_handle *h)
     if (!h->pending_gain && !h->pending_bias && !h->pending_gain_mode &&
         !h->pending_rtl_agc) {
         return ESP_OK;
+    }
+    Ep0WindowClaim window(h);
+    if (!window.owned()) {
+        return ESP_OK; /* retune or rate change in flight; next delivery pass */
     }
     h->ep0_sideband_busy = true;
 
