@@ -55,6 +55,7 @@ static constexpr UBaseType_t kClientPrio = 19;
 /* Delivery only posts IQ; app audio task should be >= this and graphics much lower. */
 static constexpr UBaseType_t kDeliveryPrio = 18;
 static constexpr size_t kProbeQueueDepth = 8;
+static constexpr uint8_t kPendingRateMaxFailures = 3; /* hot rate change attempts before giving up */
 
 static constexpr uint16_t kVid = ESP_RTL_SDR_USB_VID;
 static constexpr uint16_t kPid = ESP_RTL_SDR_USB_PID;
@@ -276,6 +277,8 @@ struct esp_rtl_sdr_handle {
     uint32_t r820t2_if_hz = 0;
     /** Sample rate queued while streaming; applied in an EP0 window like a retune. */
     volatile uint32_t pending_rate_sps = 0;
+    /** Consecutive failed attempts to apply pending_rate_sps; the request is dropped after a few. */
+    uint8_t pending_rate_failures = 0;
     /** True while apply_pending_retune() runs (delivery or app task). */
     volatile bool retune_busy = false;
     /**
@@ -1180,6 +1183,14 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
         if (err != ESP_OK) {
             return err;
         }
+        /* leave_direct replayed the init IF filter and the fixed 3.57 MHz demod IF, while
+         * run_tune() puts the LO at RF + the rate-based IF: re-match filter and IF to the rate */
+        if (h->sample_rate_sps != 0) {
+            err = run_r820t2_if_for_rate(h, h->sample_rate_sps);
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
         err = run_tune(h, frequency_hz);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "V3 RF mode DIRECT_SAMPLING_Q -> NORMAL_TUNER");
@@ -1547,12 +1558,24 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
         /* effective_sps is bytes over stream time: restart the window at the new rate */
         h->metrics.bytes_total = 0;
         h->stream_start_ms = now_ms();
+        h->pending_rate_failures = 0;
+        if (h->pending_rate_sps == apply) {
+            h->pending_rate_sps = 0;
+        }
         ESP_LOGI(TAG, "hot sample rate applied %u S/s", static_cast<unsigned>(apply));
+    } else if (++h->pending_rate_failures < kPendingRateMaxFailures) {
+        /* The hardware may be half way (resampler at the new rate, tuner not): leave the request
+         * pending so the delivery task runs the whole sequence again on its next pass. Bulk is
+         * resumed regardless; a paused stream would never reach that pass. */
+        ESP_LOGW(TAG, "hot sample rate EP0 failed: %s (attempt %u, will retry)",
+                 esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(h->pending_rate_failures));
     } else {
-        ESP_LOGW(TAG, "hot sample rate EP0 failed: %s", esp_rtl_sdr_err_to_name(err));
-    }
-    if (h->pending_rate_sps == apply) {
-        h->pending_rate_sps = 0;
+        ESP_LOGE(TAG, "hot sample rate EP0 failed: %s; giving up on %u S/s",
+                 esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(apply));
+        h->pending_rate_failures = 0;
+        if (h->pending_rate_sps == apply) {
+            h->pending_rate_sps = 0;
+        }
     }
     bulk_resume(h);
     h->retune_busy = false;
@@ -1983,6 +2006,12 @@ static void free_bulk_pool(esp_rtl_sdr_handle *h)
 static esp_err_t alloc_bulk_pool(esp_rtl_sdr_handle *h, uint32_t num, uint32_t len)
 {
     free_bulk_pool(h);
+    if (h->bulk != nullptr) {
+        /* free_bulk_pool refused (live URBs): never overwrite a pool the host stack still owns */
+        ESP_LOGE(TAG, "alloc_bulk_pool: old pool still live (live_urbs=%u)",
+                 static_cast<unsigned>(h->live_urbs));
+        return ESP_ERR_INVALID_STATE;
+    }
     h->bulk = static_cast<usb_transfer_t **>(calloc(num, sizeof(usb_transfer_t *)));
     if (h->bulk == nullptr) {
         return ESP_ERR_NO_MEM;
@@ -2434,9 +2463,24 @@ static void client_task_fn(void *arg)
             if (!window.owned()) {
                 ESP_LOGW(TAG, "usb disconnected while an EP0 window stayed open");
             }
-            if (h->live_urbs > 0) {
-                ESP_LOGW(TAG, "usb disconnected with %u bulk URBs still pending",
+            if (h->live_urbs > 0 && h->dev != nullptr) {
+                /* Still owned by the host stack: force them back (halt/flush/clear), then keep
+                 * pumping completions for as long as it takes. Releasing the interface under a
+                 * live transfer, or letting the next stream start overwrite the pool, corrupts
+                 * the HCD's state; a stalled client task is the lesser evil, and it says so. */
+                ESP_LOGW(TAG, "usb disconnected with %u bulk URBs still pending; flushing",
                          static_cast<unsigned>(h->live_urbs));
+                usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+                usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+                usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+                for (uint32_t waited = 0; h->live_urbs > 0 && h->tasks_run; waited += 5) {
+                    usb_host_client_handle_events(h->client, 0);
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    if (waited != 0 && waited % 2000 == 0) {
+                        ESP_LOGW(TAG, "still waiting for %u bulk URBs to retire",
+                                 static_cast<unsigned>(h->live_urbs));
+                    }
+                }
             }
             if (h->iface_claimed && h->dev != nullptr) {
                 usb_host_interface_release(h->client, h->dev, 0);
