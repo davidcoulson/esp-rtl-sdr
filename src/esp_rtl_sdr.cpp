@@ -2070,7 +2070,9 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     const uint32_t requested_width = h->bandwidth_requested_hz;
     uint32_t applied_width = requested_width;
     const bool measured_bw = h->sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
-        measured_tuner_bandwidth_count(h->profile, tune_hz, hf_direct_route(h, tune_hz)) != 0;
+        measured_tuner_bandwidth_count(h->profile, tune_hz, hf_direct_route(h, tune_hz)) != 0 &&
+        (h->profile != RtlProfileId::BlogV3 || h->bandwidth_applied_valid ||
+         h->pending_bandwidth);
     if (measured_bw) {
         MeasuredTunerBandwidthPlan requested{};
         if (!measured_tuner_bandwidth_plan(h->profile, tune_hz, applied_width, &requested,
@@ -3913,7 +3915,10 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
                 break;
             }
         }
-        if (local.sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
+        /* V3c boots on its proven 3.57 MHz IF; a bandwidth request explicitly
+         * switches both PLL and demod IF to the captured PC bandwidth plan. */
+        if (handle->profile != RtlProfileId::BlogV3 &&
+            local.sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
             measured_tuner_bandwidth_count(handle->profile, freq, hf_direct_route(handle, freq)) != 0) {
             ret = apply_bandwidth_transaction(handle, freq, 0);
         } else {
