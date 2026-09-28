@@ -328,15 +328,14 @@ inline double rtl_profile_pll_xtal_hz(RtlProfileId profile)
  * 3,570,000 Hz -- the well-known standard RTL2832U/R820T default IF,
  * confirmed independently at three widely-spaced frequencies (88.1, 96.1,
  * 106.1 MHz) to within a few Hz. See docs/captures/NOTES.md for the full
- * sweep data and regression. Scoped to BlogV3 only: NooelecSmartV5 shares
- * BlogV3's I2C remap for tuner addressing but has never been hardware
- * tested for PLL math, so it keeps the V4-derived default rather than
- * inheriting an unverified guess.
+ * sweep data and regression. NooelecSmartV5 has not been hardware tested,
+ * but its replayed init table programs the same 3.57 MHz demodulator IF;
+ * its tuner PLL must use that IF rather than the V4 board-specific offset.
  */
 inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 {
     constexpr double kMeasuredV4IfOffsetHz = 1814972.0;
-    if (profile == RtlProfileId::BlogV3) {
+    if (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5) {
         return static_cast<double>(kBlogV3DemodIfHz);
     }
     return kMeasuredV4IfOffsetHz;
