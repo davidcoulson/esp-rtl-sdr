@@ -28,6 +28,13 @@ constexpr uint16_t kBlogV4TunerI2cValue = 0x0074;     /* R828D */
 constexpr uint16_t kR820T2TunerI2cValue = 0x0034;     /* R820T2 / R860 */
 constexpr uint32_t kR820T2NativeMinHz = 24000000u;    /* V3 direct-Q / Nooelec floor */
 constexpr uint32_t kBlogV3DemodIfHz = 3570000u;       /* measured V3c matched IF */
+/* V3c boot tuner filter registers 0x0a/0x0b. Boot runs the captured R820-family
+ * reinit slice (kRtlTunerReinitFirst..Last), whose last writes of these
+ * registers are d5/6b; read back from the chip after a cold boot on hardware
+ * (2026-09-28). They belong with kBlogV3DemodIfHz. The PC's c5/8f is its
+ * pairing with a 1.815 MHz IF and is not the state V3c boots in. */
+constexpr uint8_t kBlogV3BootReg0a = 0xd5;
+constexpr uint8_t kBlogV3BootReg0b = 0x6b;
 
 inline bool rtl_profile_text_is(const char *actual, const char *expected)
 {

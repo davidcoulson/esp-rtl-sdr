@@ -330,6 +330,50 @@ static void test_bandwidth_demod_if_records_read_after_write(void)
     }
 }
 
+/* V3c AUTO must restore the state V3c boots in, taken from the init data, not
+ * from a PC pairing: hardware readback after cold boot showed 0x0a/0x0b = d5/6b
+ * (the reinit slice) and demod IF 38 11 12, while c5/8f belongs with 1.815 MHz. */
+static void test_v3c_auto_is_boot_state(void)
+{
+    uint8_t last0a = 0, last0b = 0;
+    for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
+        const RtlControlRecord &r = kRtlInitTransfers[i];
+        if (r.request_type == 0x40 && r.value == 0x0074 && r.index == 0x0610 &&
+            r.length == 2) {
+            if (r.data[0] == 0x0a) last0a = r.data[1];
+            if (r.data[0] == 0x0b) last0b = r.data[1];
+        }
+    }
+    EXPECT_EQ_U(last0a, kBlogV3BootReg0a);
+    EXPECT_EQ_U(last0b, kBlogV3BootReg0b);
+
+    MeasuredTunerBandwidthPlan v3{};
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, 96100000u, 0u, &v3));
+    EXPECT_EQ_U(v3.reg0a, last0a);
+    EXPECT_EQ_U(v3.reg0b, last0b);
+    EXPECT_EQ_U(v3.if_hz, kBlogV3DemodIfHz);
+    for (size_t i = 0; i < 3; ++i) {  /* write records of the standard IF slice */
+        const RtlControlRecord &r = kRtlInitTransfers[kRtlStandardIfFirst + i * 2];
+        EXPECT_EQ_U(r.data[0], i == 0 ? v3.if19 : i == 1 ? v3.if1a : v3.if1b);
+    }
+
+    /* The explicit 2.4 MHz plan keeps the PC pairing with its own 1.815 MHz IF. */
+    MeasuredTunerBandwidthPlan wide{};
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, 96100000u, 2400000u, &wide));
+    EXPECT_EQ_U(wide.reg0a, 0xc5u);
+    EXPECT_EQ_U(wide.reg0b, 0x8fu);
+    EXPECT_EQ_U(wide.if_hz, 1814972u);
+
+    /* No leak into the other profiles' AUTO. */
+    MeasuredTunerBandwidthPlan v4{}, v4l{};
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4, 96100000u, 0u, &v4));
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4L, 96100000u, 0u, &v4l));
+    EXPECT_EQ_U(v4.reg0a, 0xc5u);
+    EXPECT_EQ_U(v4.reg0b, 0x8fu);
+    EXPECT_EQ_U(v4l.reg0a, 0xc4u);
+    EXPECT_EQ_U(v4l.reg0b, 0x8fu);
+}
+
 static void test_bandwidth_plan_and_rollback(void)
 {
     struct Case { uint32_t hz; uint8_t reg0b, if19, if1a, if1b; uint32_t if_hz; };
@@ -357,10 +401,11 @@ static void test_bandwidth_plan_and_rollback(void)
         EXPECT_EQ_U(p.reg0a, 0xc5);
         EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, 96100000u,
                                                     point.hz, &p));
-        EXPECT_EQ_U(p.reg0a, 0xc5);
+        EXPECT_EQ_U(p.reg0a, point.hz == 0 ? 0xd5u : 0xc5u);
         EXPECT_EQ_U(p.if_hz, point.hz == 0 ? 3570000u : point.if_hz);
         if (point.hz == 0) {
-            EXPECT_EQ_U(p.reg0b, 0x8fu);
+            /* AUTO is the boot state: boot filter regs with the boot IF. */
+            EXPECT_EQ_U(p.reg0b, 0x6bu);
             EXPECT_EQ_U(p.if19, 0x38u);
             EXPECT_EQ_U(p.if1a, 0x11u);
             EXPECT_EQ_U(p.if1b, 0x12u);
@@ -679,6 +724,7 @@ int main(void)
     test_v4l_direct_route();
     test_bandwidth_plan_and_rollback();
     test_bandwidth_demod_if_records_read_after_write();
+    test_v3c_auto_is_boot_state();
     test_matched_if_policy();
     test_v3_direct_transition_records();
     test_capability_matrix();

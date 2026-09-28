@@ -74,8 +74,10 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
     default: break;
     }
     if (profile == RtlProfileId::BlogV3 && width_hz == 0) {
-        /* AUTO restores the same matched IF as the V3c startup records. */
+        /* AUTO restores the whole V3c boot tuning state: the matched IF and the
+         * tuner filter registers that boot leaves with it. */
         out->if_hz = kBlogV3DemodIfHz;
+        out->reg0a = kBlogV3BootReg0a; out->reg0b = kBlogV3BootReg0b;
         out->if19 = 0x38; out->if1a = 0x11; out->if1b = 0x12;
     }
     return true;
