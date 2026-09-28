@@ -73,6 +73,11 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
         break;
     default: break;
     }
+    if (profile == RtlProfileId::BlogV3 && width_hz == 0) {
+        /* AUTO restores the same matched IF as the V3c startup records. */
+        out->if_hz = kBlogV3DemodIfHz;
+        out->if19 = 0x38; out->if1a = 0x11; out->if1b = 0x12;
+    }
     return true;
 }
 

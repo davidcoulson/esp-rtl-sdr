@@ -311,9 +311,15 @@ static void test_bandwidth_plan_and_rollback(void)
                                                    point.hz, &p));
         EXPECT_EQ_U(p.reg0a, 0xc5);
         EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, 96100000u,
-                                                   point.hz, &p));
+                                                    point.hz, &p));
         EXPECT_EQ_U(p.reg0a, 0xc5);
-        EXPECT_EQ_U(p.if_hz, point.if_hz);
+        EXPECT_EQ_U(p.if_hz, point.hz == 0 ? 3570000u : point.if_hz);
+        if (point.hz == 0) {
+            EXPECT_EQ_U(p.reg0b, 0x8fu);
+            EXPECT_EQ_U(p.if19, 0x38u);
+            EXPECT_EQ_U(p.if1a, 0x11u);
+            EXPECT_EQ_U(p.if1b, 0x12u);
+        }
     }
     MeasuredTunerBandwidthPlan p{};
     EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4L, 1280000u,
