@@ -26,8 +26,15 @@ constexpr uint16_t kRtlSharedPid = 0x2838;
 
 constexpr uint16_t kBlogV4TunerI2cValue = 0x0074;     /* R828D */
 constexpr uint16_t kR820T2TunerI2cValue = 0x0034;     /* R820T2 / R860 */
-constexpr uint32_t kR820T2NativeMinHz = 24000000u;    /* no HF claim for R820T2 path */
+constexpr uint32_t kR820T2NativeMinHz = 24000000u;    /* V3 direct-Q / Nooelec floor */
 constexpr uint32_t kBlogV3DemodIfHz = 3570000u;       /* measured V3c matched IF */
+/* V3c boot tuner filter registers 0x0a/0x0b. Boot runs the captured R820-family
+ * reinit slice (kRtlTunerReinitFirst..Last), whose last writes of these
+ * registers are d5/6b; read back from the chip after a cold boot on hardware
+ * (2026-09-28). They belong with kBlogV3DemodIfHz. The PC's c5/8f is its
+ * pairing with a 1.815 MHz IF and is not the state V3c boots in. */
+constexpr uint8_t kBlogV3BootReg0a = 0xd5;
+constexpr uint8_t kBlogV3BootReg0b = 0x6b;
 
 inline bool rtl_profile_text_is(const char *actual, const char *expected)
 {
@@ -151,14 +158,13 @@ inline uint32_t rtl_profile_library_capabilities(void)
            ESP_RTL_SDR_CAP_NEED | ESP_RTL_SDR_CAP_HEALTH | ESP_RTL_SDR_CAP_PASSPORT |
            ESP_RTL_SDR_CAP_DELIVERY_MODE | ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_BIAS_TEE |
            ESP_RTL_SDR_CAP_HF_UPCONVERTER | ESP_RTL_SDR_CAP_GAIN_AUTO |
-           ESP_RTL_SDR_CAP_RTL_AGC;
+           ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
 }
 
 /**
  * Active-device capability mask. Identity ≠ tuner family ≠ board front-end.
  * Unknown / detached → 0.
- * BlogV3 and Nooelec share provisional VHF/UHF stream (R820T2 I2C remap) without
- * V4 HF / measured gain/bias. Maintainer-unverified; community soak requested.
+ * BlogV3 and Nooelec share R820T2 I2C remapping; board features remain distinct.
  */
 inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
 {
@@ -172,33 +178,22 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
     case RtlProfileId::BlogV4:
         return rtl_profile_library_capabilities() & ~ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
     case RtlProfileId::BlogV3:
-        /* Manual gain: apply_r820t2_gain_records() writes reg05/07 directly
-         * from private/gain_r820t2.hpp. Its discrete stage sequence remains
-         * a hardware candidate, not a calibrated table (see that header and
-         * docs/captures/NOTES.md).
-         * Still no AUTO/RTL_AGC/BIAS_TEE/HF_UPCONVERTER -- unimplemented
-         * for this tuner family, not just unverified. */
+        /* Generic R820T2 identity includes the user-tested V3c, but does not
+         * prove a bias circuit on every stick. Enable only by explicit API. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
-               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_DIRECT_SAMPLING;
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
+               ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_BIAS_TEE |
+               ESP_RTL_SDR_CAP_DIRECT_SAMPLING | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
     case RtlProfileId::BlogV4L:
-        /* R828S. Shares the R820T2 remapped addressing, so the VHF/UHF
-         * stream path is the same as BlogV3's.
-         *
-         * Deliberately NOT DIRECT_SAMPLING: the V4L reaches HF through a
-         * built-in upconverter, so tuning low must not fold through the
-         * V3 Q-branch path. Deliberately NOT HF_UPCONVERTER either - the
-         * board has one, but its control has not been captured or verified
-         * here, and claiming a capability we cannot exercise is worse than
-         * declining it. Until it is, rtl_profile_supports_rf_hz() fails
-         * closed below the tuner's native floor.
-         *
-         * GAIN is claimed on the same footing as BlogV3 (reg05/07 writes
-         * via the R820T2 records). R828S is a different die, so treat the
-         * resulting dB as uncalibrated until measured. */
+        /* R828S at 0x34 with its own measured upconverter route. Never use
+         * BlogV3 direct-Q or BlogV4 triplexer handling on this board. Gain
+         * values are nominal PC requests, not calibrated analog dB. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
-               ESP_RTL_SDR_CAP_GAIN;
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
+               ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_BIAS_TEE |
+               ESP_RTL_SDR_CAP_HF_UPCONVERTER | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
     case RtlProfileId::NooelecSmartV5:
         /* Provisional: stream/retune/sync-read/passport; no V4 HF or measured gain/bias. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
@@ -219,6 +214,11 @@ inline esp_rtl_sdr_gain_mode_t rtl_profile_default_gain_mode(RtlProfileId profil
     return (caps & ESP_RTL_SDR_CAP_GAIN) != 0 && (caps & ESP_RTL_SDR_CAP_GAIN_AUTO) == 0
                ? ESP_RTL_SDR_GAIN_MODE_MANUAL
                : ESP_RTL_SDR_GAIN_MODE_AUTO;
+}
+
+inline void rtl_profile_clear_bias_request(bool &want)
+{
+    want = false;
 }
 
 inline bool rtl_profile_uses_v4_hf_routing(RtlProfileId profile)
@@ -283,26 +283,23 @@ inline bool rtl_profile_supports_rf_hz(RtlProfileId profile, uint32_t frequency_
     if (profile == RtlProfileId::NooelecSmartV5 && frequency_hz < kR820T2NativeMinHz) {
         return false;
     }
-    /* The V4L has an HF upconverter, but its control path is not captured
-     * here. Direct sampling would be actively wrong on this board, so fail
-     * closed below the native tuner floor rather than folding through a
-     * circuit the V4L does not have. */
-    if (profile == RtlProfileId::BlogV4L && frequency_hz < kR820T2NativeMinHz) {
-        return false;
-    }
     if (profile == RtlProfileId::Unknown) {
         return false;
     }
     return true;
 }
 
-inline uint32_t rtl_profile_tuner_frequency_hz(RtlProfileId profile, uint32_t rf_hz)
+inline uint32_t rtl_profile_tuner_frequency_hz(RtlProfileId profile, uint32_t rf_hz,
+                                               bool hf_direct = false)
 {
     if (rtl_profile_uses_v3_direct_sampling(profile, rf_hz)) {
         return 0; /* tuner bypassed */
     }
     if (rtl_profile_uses_v4_hf_routing(profile)) {
-        return esp_rtl_sdr_tuner_frequency_hz(rf_hz);
+        return hf_direct ? rf_hz : esp_rtl_sdr_tuner_frequency_hz(rf_hz);
+    }
+    if (profile == RtlProfileId::BlogV4L && rf_hz < ESP_RTL_SDR_XTAL_HZ && !hf_direct) {
+        return rf_hz + ESP_RTL_SDR_XTAL_HZ;
     }
     return rf_hz;
 }
@@ -338,15 +335,14 @@ inline double rtl_profile_pll_xtal_hz(RtlProfileId profile)
  * 3,570,000 Hz -- the well-known standard RTL2832U/R820T default IF,
  * confirmed independently at three widely-spaced frequencies (88.1, 96.1,
  * 106.1 MHz) to within a few Hz. See docs/captures/NOTES.md for the full
- * sweep data and regression. Scoped to BlogV3 only: NooelecSmartV5 shares
- * BlogV3's I2C remap for tuner addressing but has never been hardware
- * tested for PLL math, so it keeps the V4-derived default rather than
- * inheriting an unverified guess.
+ * sweep data and regression. NooelecSmartV5 has not been hardware tested,
+ * but its replayed init table programs the same 3.57 MHz demodulator IF;
+ * its tuner PLL must use that IF rather than the V4 board-specific offset.
  */
 inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 {
     constexpr double kMeasuredV4IfOffsetHz = 1814972.0;
-    if (profile == RtlProfileId::BlogV3) {
+    if (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5) {
         return static_cast<double>(kBlogV3DemodIfHz);
     }
     return kMeasuredV4IfOffsetHz;
