@@ -374,6 +374,44 @@ static void test_v3c_auto_is_boot_state(void)
     EXPECT_EQ_U(v4l.reg0b, 0x8fu);
 }
 
+/* The public width list, the count and the plan lookup must follow one route rule. The list
+ * function used to have its own copy that ignored the direct HF route: on a V4/V4L at 27.205 MHz
+ * with the direct route it reported 7 widths but read them from the 4-entry HF array (CodeRabbit
+ * finding on PR #29). */
+static void test_bandwidth_list_matches_count_and_plan(void)
+{
+    const RtlProfileId profiles[] = {RtlProfileId::BlogV3, RtlProfileId::BlogV4,
+                                     RtlProfileId::BlogV4L};
+    const uint32_t rfs[] = {1280000u, 24000000u, 27205000u, 28800000u, 28800001u, 96100000u};
+    for (const RtlProfileId profile : profiles) {
+        for (const uint32_t rf : rfs) {
+            for (const bool direct : {false, true}) {
+                const MeasuredBandwidthList list = measured_tuner_bandwidth_list(profile, rf, direct);
+                EXPECT_EQ_U(list.count, measured_tuner_bandwidth_count(profile, rf, direct));
+                if (list.count == 0) {
+                    EXPECT_TRUE(list.values == nullptr);
+                    continue;
+                }
+                EXPECT_TRUE(list.values != nullptr);
+                for (size_t i = 0; i < list.count; ++i) {
+                    MeasuredTunerBandwidthPlan p{};
+                    EXPECT_TRUE(measured_tuner_bandwidth_plan(profile, rf, list.values[i], &p,
+                                                              direct));
+                }
+            }
+        }
+    }
+    /* The reported case: V4/V4L on the direct route below 28.8 MHz use the 7-entry native list. */
+    for (const RtlProfileId profile : {RtlProfileId::BlogV4, RtlProfileId::BlogV4L}) {
+        const MeasuredBandwidthList direct = measured_tuner_bandwidth_list(profile, 27205000u, true);
+        EXPECT_EQ_U(direct.count, 7u);
+        EXPECT_TRUE(direct.values == kMeasuredNativeBandwidths);
+        const MeasuredBandwidthList upconv = measured_tuner_bandwidth_list(profile, 27205000u, false);
+        EXPECT_EQ_U(upconv.count, 4u);
+        EXPECT_TRUE(upconv.values == kMeasuredHfBandwidths);
+    }
+}
+
 static void test_bandwidth_plan_and_rollback(void)
 {
     struct Case { uint32_t hz; uint8_t reg0b, if19, if1a, if1b; uint32_t if_hz; };
@@ -723,6 +761,7 @@ int main(void)
     test_v4l_tune_records();
     test_v4l_direct_route();
     test_bandwidth_plan_and_rollback();
+    test_bandwidth_list_matches_count_and_plan();
     test_bandwidth_demod_if_records_read_after_write();
     test_v3c_auto_is_boot_state();
     test_matched_if_policy();

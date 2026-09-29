@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.9.1 (2026-09-28) — live tuner-bandwidth fixes; first published 0.9 release
+
+`0.9.0` (below) was never tagged or published; `0.9.1` is the first published
+0.9 release and contains everything listed under `0.9.0` plus the fixes here.
+Hardware evidence for these fixes is on the M5 Tab5 with a V3c, V4L and V4
+(`docs/captures/v3c_live_bandwidth_2026-09-28.md`).
+
 ### Fixed
 
 - **Live tuner bandwidth no longer shifts the received frequency (V3c, V4, V4L).** The bandwidth
@@ -21,11 +28,46 @@
   word 38 11 12. The explicit 2.4 MHz plan and the V4/V4L plans are unchanged. Evidence:
   `docs/captures/v3c_live_bandwidth_2026-09-28.md`. Tuner-bandwidth plan values are
   vendor-driver control choices derived from captures, not measured analog passbands.
+- **`esp_rtl_sdr_get_tuner_bandwidths()` no longer reads past the end of a table on the direct HF
+  route.** On a V4 or V4L with the direct HF route enabled (for example CB at 27.205 MHz), the
+  count said 7 widths but the values were read from the 4-entry HF list, so the last three were
+  whatever sat next to it in memory. The count, the list and the plan lookup now come from one
+  function (`measured_tuner_bandwidth_list()`), and a host test checks that every width offered is
+  accepted by the plan lookup on every profile, RF and route. Found by CodeRabbit's review of #29.
+
+### Documentation
+
+- Capability matrix: documented the optional V4/V4L direct HF route and its two API calls, and
+  updated the tuner-bandwidth row (found by CodeRabbit).
+- The 0.9.0 summary no longer implies more V3c verification than was done.
+- New `docs/VERSIONING.md` (how numbers are chosen, how releases are cut, how consumers pin the
+  driver) and `docs/releases/v0.9.1.md` (plain-language release notes).
+
+### Known issues (not fixed in 0.9.1)
+
+Each needs a hardware retest before the fix can ship, so they are tracked rather than rushed:
+
+- [#32](https://github.com/hardcoreerik/esp-rtl-sdr/issues/32) `hf_direct_min_hz` can be changed
+  while streaming without retuning the tuner.
+- [#33](https://github.com/hardcoreerik/esp-rtl-sdr/issues/33) A V4L bias-T change can overwrite
+  the active route's GPIO bits.
+- [#34](https://github.com/hardcoreerik/esp-rtl-sdr/issues/34) The width list and the upconverter
+  rule disagree at exactly 28.8 MHz.
+- [#35](https://github.com/hardcoreerik/esp-rtl-sdr/issues/35) A fifth simultaneously stuck device
+  close is dropped.
+- [#36](https://github.com/hardcoreerik/esp-rtl-sdr/issues/36) Nooelec SMArt v5: the PLL uses the
+  3.57 MHz IF but the demodulator IF is not restored after init. The profile is provisional and
+  has never been tested on Nooelec hardware here.
+- [#24](https://github.com/hardcoreerik/esp-rtl-sdr/issues/24) and
+  [#25](https://github.com/hardcoreerik/esp-rtl-sdr/issues/25) (David Coulson) remain open, with
+  the fixes proposed in [#26](https://github.com/hardcoreerik/esp-rtl-sdr/pull/26).
 
 ## 0.9.0 (2026-09-26) — V4L, V3c and V4 hardware-verified; pre-1.0
 
-The Blog V3/V3c and V4L profiles are no longer provisional; Blog V4, V4L and
-V3c are hardware-verified on the M5 Tab5 (see PROJECT_TRUTH.md). The Nooelec
+The Blog V3/V3c and V4L profiles are no longer provisional for what has been
+exercised on the M5 Tab5: streaming, hotplug and swaps, the measured tuner/gain controls, and
+the V3c matched-IF FM tuning (see PROJECT_TRUTH.md for the exact scope). V3c absolute gain
+accuracy, sensitivity and analog filter passbands are not established. The Nooelec
 SMArt v5 profile stays provisional: no hardware has been tested. This release
 also carries the concurrent multi-receiver foundation below.
 

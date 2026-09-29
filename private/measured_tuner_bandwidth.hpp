@@ -21,15 +21,32 @@ constexpr uint32_t kMeasuredNativeBandwidths[] = {
 };
 constexpr uint32_t kMeasuredHfBandwidths[] = {0u, 200000u, 500000u, 2400000u};
 
+/* The widths a profile offers at this RF, and how many there are. The count and the array are
+ * chosen by ONE rule so they cannot disagree: on the HF upconverter route (V4/V4L at or below
+ * 28.8 MHz and not on the direct route) the short HF list applies, otherwise the native list. */
+struct MeasuredBandwidthList {
+    const uint32_t *values;
+    size_t count;
+};
+
+constexpr MeasuredBandwidthList measured_tuner_bandwidth_list(RtlProfileId profile,
+                                                              uint32_t rf_hz,
+                                                              bool hf_direct = false)
+{
+    if (profile != RtlProfileId::BlogV4 && profile != RtlProfileId::BlogV4L &&
+        profile != RtlProfileId::BlogV3) return {nullptr, 0};
+    if (profile == RtlProfileId::BlogV3 && rf_hz < kR820T2NativeMinHz) return {nullptr, 0};
+    return profile != RtlProfileId::BlogV3 && rf_hz <= ESP_RTL_SDR_XTAL_HZ && !hf_direct
+        ? MeasuredBandwidthList{kMeasuredHfBandwidths,
+                                sizeof(kMeasuredHfBandwidths) / sizeof(uint32_t)}
+        : MeasuredBandwidthList{kMeasuredNativeBandwidths,
+                                sizeof(kMeasuredNativeBandwidths) / sizeof(uint32_t)};
+}
+
 constexpr size_t measured_tuner_bandwidth_count(RtlProfileId profile, uint32_t rf_hz,
                                                 bool hf_direct = false)
 {
-    if (profile != RtlProfileId::BlogV4 && profile != RtlProfileId::BlogV4L &&
-        profile != RtlProfileId::BlogV3) return 0;
-    if (profile == RtlProfileId::BlogV3 && rf_hz < kR820T2NativeMinHz) return 0;
-    return profile != RtlProfileId::BlogV3 && rf_hz <= ESP_RTL_SDR_XTAL_HZ && !hf_direct
-        ? sizeof(kMeasuredHfBandwidths) / sizeof(uint32_t)
-        : sizeof(kMeasuredNativeBandwidths) / sizeof(uint32_t);
+    return measured_tuner_bandwidth_list(profile, rf_hz, hf_direct).count;
 }
 
 inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
@@ -37,12 +54,10 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
                                            MeasuredTunerBandwidthPlan *out,
                                            bool hf_direct = false)
 {
-    if (out == nullptr || measured_tuner_bandwidth_count(profile, rf_hz, hf_direct) == 0)
-        return false;
-    const bool hf = profile != RtlProfileId::BlogV3 && rf_hz <= ESP_RTL_SDR_XTAL_HZ &&
-                    !hf_direct;
-    const uint32_t *widths = hf ? kMeasuredHfBandwidths : kMeasuredNativeBandwidths;
-    const size_t count = measured_tuner_bandwidth_count(profile, rf_hz, hf_direct);
+    const MeasuredBandwidthList list = measured_tuner_bandwidth_list(profile, rf_hz, hf_direct);
+    if (out == nullptr || list.count == 0) return false;
+    const uint32_t *widths = list.values;
+    const size_t count = list.count;
     bool found = false;
     for (size_t i = 0; i < count; ++i) found |= widths[i] == width_hz;
     if (!found) return false;
