@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Live tuner bandwidth no longer shifts the received frequency (V3c, V4, V4L).** The bandwidth
+  transaction wrote the RTL2832 IF bytes 0x19/0x1a/0x1b back to back, while the captured init
+  IF sequence and a PC live-bandwidth capture of the same V3c read page 0x0a reg 0x01 after
+  every demod write. On the M5 Tab5 the V3c landed about +95 kHz off at 200 kHz and about
+  -95 kHz off back at AUTO, and the V4L -312, -5, +98, -124, -50 and +386 kHz through 200k,
+  300k, 500k, 1.0M, 1.8M and 2.4M, while the UI still reported 96.1 MHz. The sequence is now one
+  helper, used by every profile, that reads after each IF byte; with it every stage of AUTO,
+  200k, 300k, 500k, 1.0M, 1.8M, 2.4M, AUTO stays within +/-2.5 kHz of the request on the V3c,
+  V4L and V4 (cold boot and unplug/replug; the largest is -2.5 kHz, V4L after replug). The V4 was not measured before the fix. The RTL2832
+  mechanism behind the read is not established.
+- **V3c AUTO tuner bandwidth restores the boot filter state.** AUTO paired the PC-capture
+  filter registers 0x0a/0x0b = c5/8f (the PC's state with a 1.815 MHz IF) with the 3.570 MHz
+  boot IF, leaving the left side of the passband about 13 dB down. The V3c boots with
+  0x0a/0x0b = d5/6b (read back from the chip); AUTO now restores d5/6b with 3.570 MHz and IF
+  word 38 11 12. The explicit 2.4 MHz plan and the V4/V4L plans are unchanged. Evidence:
+  `docs/captures/v3c_live_bandwidth_2026-09-28.md`. Tuner-bandwidth plan values are
+  vendor-driver control choices derived from captures, not measured analog passbands.
+
 ## 0.9.0 (2026-09-26) — V4L, V3c and V4 hardware-verified; pre-1.0
 
 The Blog V3/V3c and V4L profiles are no longer provisional; Blog V4, V4L and
