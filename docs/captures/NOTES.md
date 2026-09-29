@@ -1,5 +1,9 @@
 # Capture evidence — 2026-09-11 official-driver AGC loop discovery
 
+## V3c live tuner bandwidth — 2026-09-28
+
+A first-party PC capture of the same V3c through one continuous open session (AUTO, 200 kHz, AUTO, retunes) and the Tab5 acceptance cycle that followed are written up in [`v3c_live_bandwidth_2026-09-28.md`](v3c_live_bandwidth_2026-09-28.md), with the decoded control transfers in [`v3c_live_bandwidth_pc_control_transfers_2026-09-28.txt`](v3c_live_bandwidth_pc_control_transfers_2026-09-28.txt). Raw pcapng (sha256 `E4531CDD583E0561BF4B977EDDD6F00451EE21DB9CFC96AB9CE5E6C94736BDB1`) is held locally, not committed.
+
 ## LF/HF follow-up — 2026-09-14
 
 A new labeled first-party V3c campaign captured Q-branch cold tunes at eight
