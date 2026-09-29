@@ -7,7 +7,7 @@ Same discipline as [TheOrc PROJECT_TRUTH](https://github.com/hardcoreerik/TheOrc
 claims need evidence labels; oversell is a bug; retract rather than spin.
 
 Snapshot date: **2026-09-26**
-Version: **0.9.0** (pre-1.0. **Hardware-verified** on the M5 Tab5 through OrcSDR: Blog V4, V4L and V3c streaming, hotplug and swaps, PC-measured gain/tuner AGC/RTL AGC/bias controls, V4 and V4L HF upconverter routes, V3c direct-Q HF, and the V4L/V4 direct HF route on CB. Concurrent multi-handle USB session **Implemented** / host-test verified, not Hardware-verified. Absolute gain calibration, analog filter passbands, loaded bias-tee current and true LF reception are unmeasured. Nooelec SMArt v5 remains **provisional**: no hardware tested.)
+Version: **0.9.1** (pre-1.0. **Hardware-verified** on the M5 Tab5 through OrcSDR: Blog V4, V4L and V3c streaming, hotplug and swaps, PC-measured gain/tuner AGC/RTL AGC/bias controls, V4 and V4L HF upconverter routes, V3c direct-Q HF, and the V4L/V4 direct HF route on CB. Concurrent multi-handle USB session **Implemented** / host-test verified, not Hardware-verified. Absolute gain calibration, analog filter passbands, loaded bias-tee current and true LF reception are unmeasured. Nooelec SMArt v5 remains **provisional**: no hardware tested.)
 Local repo: `F:\Ai\ESP_RTL_SDR\`  
 Remote: **https://github.com/hardcoreerik/esp-rtl-sdr**  
 Open-source honesty: [docs/AI_DEVELOPMENT_DISCLOSURE.md](docs/AI_DEVELOPMENT_DISCLOSURE.md) ·
@@ -138,7 +138,7 @@ Product vision: **`docs/VISION.md`**. Silicon / DS map: **`docs/SILICON.md`**.
 | **0.8.0-rc1** | Unified multi-dongle profiles (V4 + provisional Nooelec + provisional V3 stream); EXPERIMENTAL prerelease |
 | **0.8.0-rc2** | Hotplug/lifecycle hardening and removal of V4-only board controls from provisional R820T2/R860 initialization; hardware acceptance pending |
 | **0.8.0-rc3** | V3c cold-start and LF/HF acceptance |
-| **0.9.0** | PC-measured V4/V4L/V3c controls, V4L HF route, V4L/V4 direct HF route, deferred device-close retry; V3c and V4L no longer provisional |
+| **0.9.0** | PC-measured V4/V4L/V3c controls, V4L HF route, V4L/V4 direct HF route, deferred device-close retry; V3c and V4L no longer provisional. Never tagged or published; first published as 0.9.1 |
 
 ---
 
