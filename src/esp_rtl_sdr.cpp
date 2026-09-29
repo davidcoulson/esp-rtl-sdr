@@ -5688,9 +5688,11 @@ esp_err_t esp_rtl_sdr_get_tuner_bandwidths(esp_rtl_sdr_handle_t handle,
     }
     *out_count = count;
     if (out_hz == nullptr || max_count == 0) return ESP_OK;
-    const bool hf = handle->profile != RtlProfileId::BlogV3 &&
-                    rf_hz <= ESP_RTL_SDR_XTAL_HZ;
-    const uint32_t *values = hf ? kMeasuredHfBandwidths : kMeasuredNativeBandwidths;
+    /* Same route-class rule as the count above and the plan lookup. This used to be a separate
+     * copy that ignored the direct route and read past the 4-entry HF list. */
+    const MeasuredBandwidthList list = measured_tuner_bandwidth_list(
+        handle->profile, rf_hz, hf_direct_route(handle, rf_hz));
+    const uint32_t *values = list.values;
     const size_t n = max_count < count ? max_count : count;
     for (size_t i = 0; i < n; ++i) out_hz[i] = values[i];
     *out_count = n;
