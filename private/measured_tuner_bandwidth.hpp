@@ -81,6 +81,28 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
     return true;
 }
 
+/* Demod IF records of a bandwidth transaction: each IF byte write (0x19, 0x1a,
+ * 0x1b) is followed by the page-0x0a reg-0x01 read that the captured init IF
+ * sequence and PC live-bandwidth captures place after every demod write.
+ * Without the reads, a live transition on the M5 Tab5 left the RTL2832 using
+ * the new 0x19 byte with the previous transaction's 0x1a/0x1b (V3c: about
+ * +/-95 kHz, V4L: -312 to +386 kHz) while the driver reported the requested RF.
+ * The RTL2832 mechanism behind the read is not established. */
+constexpr size_t kMeasuredBandwidthDemodIfRecordCount = 6;
+
+inline void measured_bandwidth_demod_if_records(
+    const MeasuredTunerBandwidthPlan &plan,
+    RtlControlRecord (&out)[kMeasuredBandwidthDemodIfRecordCount])
+{
+    const RtlControlRecord settle_read = {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}};
+    out[0] = {0x1920, 0x0011, 0x40, 1, {plan.if19, 0, 0, 0, 0, 0, 0, 0}};
+    out[1] = settle_read;
+    out[2] = {0x1a20, 0x0011, 0x40, 1, {plan.if1a, 0, 0, 0, 0, 0, 0, 0}};
+    out[3] = settle_read;
+    out[4] = {0x1b20, 0x0011, 0x40, 1, {plan.if1b, 0, 0, 0, 0, 0, 0, 0}};
+    out[5] = settle_read;
+}
+
 enum class RtlBandwidthCommitResult : uint8_t { Applied, RolledBack, Fault };
 
 template <typename Writer>

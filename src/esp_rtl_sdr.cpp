@@ -1588,11 +1588,8 @@ static esp_err_t run_bandwidth_program(esp_rtl_sdr_handle *h, uint32_t rf_hz,
     if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0b, plan.reg0b), false);
     if (err == ESP_OK) err = run_profile_tune(h, rf_hz, previous_rf_hz, plan.if_hz);
     if (err != ESP_OK) return err;
-    const RtlControlRecord demod_if[] = {
-        {0x1920, 0x0011, 0x40, 1, {plan.if19}},
-        {0x1a20, 0x0011, 0x40, 1, {plan.if1a}},
-        {0x1b20, 0x0011, 0x40, 1, {plan.if1b}},
-    };
+    RtlControlRecord demod_if[kMeasuredBandwidthDemodIfRecordCount];
+    measured_bandwidth_demod_if_records(plan, demod_if);
     err = run_records(h, demod_if, std::size(demod_if));
     return err == ESP_OK ? run_band_frontend(h, rf_hz) : err;
 }

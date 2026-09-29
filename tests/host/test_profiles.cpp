@@ -285,6 +285,51 @@ static void test_v4l_direct_route(void)
     EXPECT_EQ_U(measured_tuner_bandwidth_count(RtlProfileId::BlogV4, cb20, true), 7u);
 }
 
+/* Every profile's bandwidth transaction must follow each demod IF byte write with
+ * the settle read, exactly as the captured init IF sequence does. Without the
+ * reads the RTL2832 kept the previous transaction's 0x1a/0x1b (V3c about
+ * +/-95 kHz, V4L -312..+386 kHz on the Tab5). */
+static void test_bandwidth_demod_if_records_read_after_write(void)
+{
+    const RtlProfileId profiles[] = {RtlProfileId::BlogV3, RtlProfileId::BlogV4,
+                                     RtlProfileId::BlogV4L};
+    const uint32_t widths[] = {0u, 200000u, 300000u, 500000u, 1000000u, 1800000u, 2400000u};
+    for (const RtlProfileId profile : profiles) {
+        for (const uint32_t width : widths) {
+            MeasuredTunerBandwidthPlan p{};
+            EXPECT_TRUE(measured_tuner_bandwidth_plan(profile, 96100000u, width, &p));
+            RtlControlRecord r[kMeasuredBandwidthDemodIfRecordCount];
+            measured_bandwidth_demod_if_records(p, r);
+            const uint8_t bytes[3] = {p.if19, p.if1a, p.if1b};
+            for (size_t i = 0; i < 3; ++i) {
+                const RtlControlRecord &write = r[i * 2];
+                const RtlControlRecord &read = r[i * 2 + 1];
+                EXPECT_EQ_U(write.value, static_cast<uint32_t>(0x1920u + i * 0x100u));
+                EXPECT_EQ_U(write.index, 0x0011u);
+                EXPECT_EQ_U(write.request_type, 0x40u);
+                EXPECT_EQ_U(write.length, 1u);
+                EXPECT_EQ_U(write.data[0], bytes[i]);
+                EXPECT_EQ_U(read.value, 0x0120u);
+                EXPECT_EQ_U(read.index, 0x000au);
+                EXPECT_EQ_U(read.request_type, 0xc0u);
+                EXPECT_EQ_U(read.length, 1u);
+            }
+        }
+    }
+    /* Same write/settle-read structure as the captured init IF slice. */
+    MeasuredTunerBandwidthPlan p{};
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, 96100000u, 0u, &p));
+    RtlControlRecord r[kMeasuredBandwidthDemodIfRecordCount];
+    measured_bandwidth_demod_if_records(p, r);
+    for (size_t i = 0; i < kMeasuredBandwidthDemodIfRecordCount; ++i) {
+        const RtlControlRecord &init = kRtlInitTransfers[kRtlStandardIfFirst + i];
+        EXPECT_EQ_U(r[i].value, init.value);
+        EXPECT_EQ_U(r[i].index, init.index);
+        EXPECT_EQ_U(r[i].request_type, init.request_type);
+        EXPECT_EQ_U(r[i].length, init.length);
+    }
+}
+
 static void test_bandwidth_plan_and_rollback(void)
 {
     struct Case { uint32_t hz; uint8_t reg0b, if19, if1a, if1b; uint32_t if_hz; };
@@ -633,6 +678,7 @@ int main(void)
     test_v4l_tune_records();
     test_v4l_direct_route();
     test_bandwidth_plan_and_rollback();
+    test_bandwidth_demod_if_records_read_after_write();
     test_matched_if_policy();
     test_v3_direct_transition_records();
     test_capability_matrix();
