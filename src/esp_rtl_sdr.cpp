@@ -3184,6 +3184,10 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         if (ret != ESP_OK) {
             break;
         }
+        /* The init table resets the tuner (R820T2: reg 0x05 = 0xe3, gain detectors off), so any
+         * AUTO gain applied before a stop is gone. Forget it, so the caller's next
+         * set_tuner_gain_mode(AUTO) writes it again instead of returning "already applied". */
+        handle->tuner_auto_applied = false;
         ret = run_sample_rate(handle, local.sample_rate_sps);
         if (ret != ESP_OK) {
             break;
