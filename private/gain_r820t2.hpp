@@ -4,7 +4,7 @@
  * R820T2/R860 manual gain stage sequence. The advertised gain values are
  * nominal; register 05 selects the LNA stage and register 07 the mixer stage.
  *
- * Anchors (real, hardware-confirmed, 2026-09-11):
+ * Older V3c anchors (real, hardware-confirmed, 2026-09-11):
  *   0.0 dB  -> reg05=0x90 reg07=0x60 (observed default/idle state on every
  *              real V3c and Blog V4 session immediately after tuner init,
  *              before any gain change is requested)
@@ -19,6 +19,9 @@
  * gain increased. These pairs follow the R820T2's non-linear alternating
  * LNA/mixer stage sequence. Absolute gain remains nominal until calibrated
  * against a controlled RF source.
+ * Nooelec SMArt v5 first-party PC captures (2026-09-30) independently match
+ * all 29 native/FM pairs below and reg0c=68. They do not prove HF gain:
+ * Q-branch direct sampling bypasses the tuner. See the Nooelec capture note.
  */
 
 #include <cstddef>
@@ -64,6 +67,13 @@ constexpr R820T2GainStep kR820T2GainSteps[] = {
 
 constexpr size_t kR820T2GainStepCount =
     sizeof(kR820T2GainSteps) / sizeof(kR820T2GainSteps[0]);
+
+/** Nooelec 2026-09-30 AUTO preserves gain nibbles while switching mode bits. */
+inline void r820t2_auto_gain_regs(uint8_t &reg05, uint8_t &reg07)
+{
+    reg05 &= static_cast<uint8_t>(~0x10u);
+    reg07 |= 0x10u;
+}
 
 inline size_t r820t2_nearest_gain_index(int tenth_db)
 {

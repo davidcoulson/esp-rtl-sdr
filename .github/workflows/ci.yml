@@ -40,6 +40,7 @@ jobs:
           cmake --build build
           ctest --test-dir build --output-on-failure
           ./build/esp_rtl_sdr_host_tests
+          python3 ../scripts/test_nooelec_runtime_trace.py
 
       - name: Configure & build (Windows)
         if: runner.os == 'Windows'

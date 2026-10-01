@@ -26,9 +26,10 @@ constexpr uint16_t kRtlSharedPid = 0x2838;
 
 constexpr uint16_t kBlogV4TunerI2cValue = 0x0074;     /* R828D */
 constexpr uint16_t kR820T2TunerI2cValue = 0x0034;     /* R820T2 / R860 */
-constexpr uint32_t kR820T2NativeMinHz = 24000000u;    /* V3 direct-Q / Nooelec floor */
+constexpr uint32_t kR820T2NativeMinHz = 24000000u;    /* captured V3/Nooelec Q-route cutoff */
 constexpr uint32_t kBlogV3DemodIfHz = 3570000u;       /* measured V3c matched IF */
-/* V3c boot tuner filter registers 0x0a/0x0b. Boot runs the captured R820-family
+/* Older V3c-specific evidence (2026-09-28), retained for V3c only, not Nooelec.
+ * V3c boot tuner filter registers 0x0a/0x0b. Boot runs the captured R820-family
  * reinit slice (kRtlTunerReinitFirst..Last), whose last writes of these
  * registers are d5/6b; read back from the chip after a cold boot on hardware
  * (2026-09-28). They belong with kBlogV3DemodIfHz. The PC's c5/8f is its
@@ -195,9 +196,13 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
                ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_BIAS_TEE |
                ESP_RTL_SDR_CAP_HF_UPCONVERTER | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
     case RtlProfileId::NooelecSmartV5:
-        /* Provisional: stream/retune/sync-read/passport; no V4 HF or measured gain/bias. */
+        /* First-party PC captures, 2026-09-30. Q bypasses tuner controls;
+         * this board has no bias tee or V4 HF upconverter. P4 acceptance open. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
-               ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT;
+               ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
+               ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
+               ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_DIRECT_SAMPLING |
+               ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
     default:
         return 0;
     }
@@ -233,9 +238,13 @@ inline bool rtl_profile_uses_r820t2_i2c_remap(RtlProfileId profile)
            profile == RtlProfileId::BlogV4L;
 }
 
-inline bool rtl_profile_uses_v3_direct_sampling(RtlProfileId profile, uint32_t frequency_hz)
+inline constexpr bool rtl_profile_uses_v3_direct_sampling(RtlProfileId profile,
+                                                         uint32_t frequency_hz)
 {
-    return profile == RtlProfileId::BlogV3 && frequency_hz < kR820T2NativeMinHz;
+    /* Nooelec 2026-09-30 captures independently match the older V3 Q sequence.
+     * This is the captured PC route cutoff, not a claim of PLL lock at 24 MHz. */
+    return (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5) &&
+           frequency_hz < kR820T2NativeMinHz;
 }
 
 inline bool rtl_profile_needs_cold_tuner_reinit(RtlProfileId profile,
@@ -249,8 +258,30 @@ inline bool rtl_profile_needs_cold_tuner_reinit(RtlProfileId profile,
      * stream that demonstrably works, and nothing about R828S says the
      * sequence is unnecessary. Revisit if a first-party V4L capture shows
      * otherwise. */
-    return (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::BlogV4L) &&
+    return rtl_profile_uses_r820t2_i2c_remap(profile) &&
            !rtl_profile_uses_v3_direct_sampling(profile, frequency_hz);
+}
+
+/** Map the existing wire records using independently measured board differences. */
+inline RtlControlRecord rtl_profile_map_tuner_record(RtlProfileId profile,
+                                                     const RtlControlRecord &record)
+{
+    RtlControlRecord mapped = record;
+    const uint16_t tuner_addr = rtl_profile_tuner_i2c_value(profile);
+    if (tuner_addr != 0 &&
+        (mapped.index == 0x0610 || mapped.index == 0x0600) &&
+        (mapped.value & 0x00ffu) == kBlogV4TunerI2cValue) {
+        mapped.value = static_cast<uint16_t>((mapped.value & 0xff00u) | tuner_addr);
+    }
+    /* Older V4/V3 tables use c5/d5. Nooelec's 2026-09-30 captures use c3/d3;
+     * preserve the other bits, especially the direct-mode standby value 36. */
+    if (profile == RtlProfileId::NooelecSmartV5 && mapped.request_type == 0x40 &&
+        mapped.index == 0x0610 && mapped.value == kR820T2TunerI2cValue &&
+        mapped.length == 2 && mapped.data[0] == 0x0a &&
+        (mapped.data[1] == 0xc5 || mapped.data[1] == 0xd5)) {
+        mapped.data[1] = static_cast<uint8_t>(mapped.data[1] - 2);
+    }
+    return mapped;
 }
 
 /** Captured RTL2832U Q-branch NCO: 22-bit negative corrected RF/28.8 MHz, truncated. */
@@ -278,10 +309,9 @@ inline bool rtl_profile_supports_rf_hz(RtlProfileId profile, uint32_t frequency_
     if (frequency_hz < ESP_RTL_SDR_FREQ_MIN_HZ || frequency_hz > ESP_RTL_SDR_FREQ_MAX_HZ) {
         return false;
     }
-    /* Nooelec has no measured direct-sampling path. Blog V3 uses its separately
-     * captured Q-branch path below this native tuner floor. */
-    if (profile == RtlProfileId::NooelecSmartV5 && frequency_hz < kR820T2NativeMinHz) {
-        return false;
+    if (profile == RtlProfileId::NooelecSmartV5) {
+        /* Manufacturer's model limits; the 60 kHz capture was exploratory. */
+        return frequency_hz >= 100000u && frequency_hz <= 1750000000u;
     }
     if (profile == RtlProfileId::Unknown) {
         return false;
@@ -335,9 +365,10 @@ inline double rtl_profile_pll_xtal_hz(RtlProfileId profile)
  * 3,570,000 Hz -- the well-known standard RTL2832U/R820T default IF,
  * confirmed independently at three widely-spaced frequencies (88.1, 96.1,
  * 106.1 MHz) to within a few Hz. See docs/captures/NOTES.md for the full
- * sweep data and regression. NooelecSmartV5 has not been hardware tested,
- * but its replayed init table programs the same 3.57 MHz demodulator IF;
- * its tuner PLL must use that IF rather than the V4 board-specific offset.
+ * sweep data and regression. The Nooelec 2026-09-30 cold FM captures now
+ * independently confirm 3.57 MHz. Explicit Nooelec bandwidth AUTO uses a
+ * different captured IF, 1.815 MHz; it must not inherit the older V3 AUTO
+ * boot-state policy. See docs/captures/nooelec_v5_2026-09-30.md.
  */
 inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 {
@@ -351,5 +382,6 @@ inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 /** Non-zero only when initialization must restore a profile-specific demod IF. */
 inline uint32_t rtl_profile_demod_if_restore_hz(RtlProfileId profile)
 {
-    return profile == RtlProfileId::BlogV3 ? kBlogV3DemodIfHz : 0u;
+    return profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5
+        ? kBlogV3DemodIfHz : 0u;
 }

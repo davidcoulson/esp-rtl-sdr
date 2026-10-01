@@ -1017,14 +1017,8 @@ static uint16_t tuner_i2c_value_for_handle(const esp_rtl_sdr_handle *h)
 static RtlControlRecord map_tuner_record_for_profile(esp_rtl_sdr_handle *h,
                                                      const RtlControlRecord &rec)
 {
-    RtlControlRecord mapped = rec;
-    const uint16_t tuner_addr = tuner_i2c_value_for_handle(h);
-    if (tuner_addr != kBlogV4TunerI2cValue &&
-        (mapped.index == 0x0610 || mapped.index == 0x0600) &&
-        (mapped.value & 0x00ffu) == kBlogV4TunerI2cValue) {
-        mapped.value = static_cast<uint16_t>((mapped.value & 0xff00u) | tuner_addr);
-    }
-    return mapped;
+    return rtl_profile_map_tuner_record(h != nullptr ? h->profile : RtlProfileId::BlogV4,
+                                         rec);
 }
 
 static esp_err_t run_record(esp_rtl_sdr_handle *h, const RtlControlRecord &rec,
@@ -1037,6 +1031,15 @@ static esp_err_t run_record(esp_rtl_sdr_handle *h, const RtlControlRecord &rec,
         h->tuner_reg_known = 0;
     } else if (mapped.request_type == 0x40 && mapped.index == 0x0610 &&
                mapped.value == tuner_i2c_value_for_handle(h)) {
+        if (h->profile == RtlProfileId::NooelecSmartV5 && mapped.length >= 2) {
+            /* AUTO preserves current gain nibbles. Reinit writes 05/07 in a
+             * burst, so include bursts when returning from Q to the tuner. */
+            for (unsigned i = 1; i < mapped.length; ++i) {
+                const unsigned reg = mapped.data[0] + i - 1;
+                if (reg == 0x05) h->tuner_reg05_low_bits = mapped.data[i] & 0x1f;
+                if (reg == 0x07) h->tuner_reg07 = mapped.data[i];
+            }
+        }
         if (mapped.length == 2 && mapped.data[0] < 32) {
             const uint8_t reg = mapped.data[0];
             h->tuner_reg_val[reg] = mapped.data[1];
@@ -1248,7 +1251,8 @@ static esp_err_t run_v3_direct_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz
          {static_cast<uint8_t>(nco), 0, 0, 0, 0, 0, 0, 0}},
         {0x0120, 0x000a, 0xc0, 1, {0, 0, 0, 0, 0, 0, 0, 0}},
     };
-    ESP_LOGI(TAG, "V3 direct tune rf=%u Hz ppm=%d nco=%06x input=Q",
+    ESP_LOGI(TAG, "%s direct tune rf=%u Hz ppm=%d nco=%06x input=Q",
+             rtl_profile_name(h->profile),
              static_cast<unsigned>(frequency_hz), static_cast<int>(h->freq_correction_ppm),
              static_cast<unsigned>(nco));
     return run_records(h, records, std::size(records));
@@ -1267,10 +1271,15 @@ static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_h
         err = run_v3_direct_tune(h, frequency_hz);
     }
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "V3 RF mode NORMAL_TUNER -> DIRECT_SAMPLING_Q");
+        ESP_LOGI(TAG, "%s RF mode NORMAL_TUNER -> DIRECT_SAMPLING_Q",
+                 rtl_profile_name(h->profile));
     }
     return err;
 }
+
+static esp_err_t apply_r820t2_gain_records(esp_rtl_sdr_handle *h, int tenth_db,
+                                           int *applied_tenth);
+static esp_err_t apply_tuner_agc_auto_records(esp_rtl_sdr_handle *h);
 
 static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 {
@@ -1279,6 +1288,14 @@ static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
         if (err != ESP_OK) {
             return err;
         }
+    }
+    if (h->profile == RtlProfileId::NooelecSmartV5) {
+        /* Reinit resets 05/07 to 83/75. Restore an explicitly applied gain
+         * mode before native IQ resumes, rather than reporting a stale gain. */
+        if (h->gain_mode == ESP_RTL_SDR_GAIN_MODE_MANUAL) {
+            return apply_r820t2_gain_records(h, h->gain_tenth_db, &h->gain_tenth_db);
+        }
+        if (h->tuner_auto_applied) return apply_tuner_agc_auto_records(h);
     }
     return ESP_OK;
 }
@@ -1360,6 +1377,12 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
             skipped++;
             continue;
         }
+        if (profile == RtlProfileId::NooelecSmartV5 && i == 6) {
+            /* Older V4 template writes manual 0c=68 on every tune. Preserve
+             * Nooelec's captured cold f0 or explicitly applied AUTO 6b. */
+            rec.data[1] = h->tuner_auto_applied ? 0x6b :
+                h->gain_mode == ESP_RTL_SDR_GAIN_MODE_MANUAL ? 0x68 : 0xf0;
+        }
         if (i == 3 || i == 7) {
             rec.data[1] = r16_setup;
         }
@@ -1440,7 +1463,8 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
         }
         err = run_tune(h, frequency_hz, tuner_if_hz);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "V3 RF mode DIRECT_SAMPLING_Q -> NORMAL_TUNER");
+            ESP_LOGI(TAG, "%s RF mode DIRECT_SAMPLING_Q -> NORMAL_TUNER",
+                     rtl_profile_name(h->profile));
         }
         return err;
     }
@@ -2068,7 +2092,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     uint32_t applied_width = requested_width;
     const bool measured_bw = h->sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
         measured_tuner_bandwidth_count(h->profile, tune_hz, hf_direct_route(h, tune_hz)) != 0 &&
-        (h->profile != RtlProfileId::BlogV3 || h->bandwidth_applied_valid ||
+        (rtl_profile_demod_if_restore_hz(h->profile) == 0 || h->bandwidth_applied_valid ||
          h->pending_bandwidth);
     if (measured_bw) {
         MeasuredTunerBandwidthPlan requested{};
@@ -2098,7 +2122,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             h->pending_bandwidth = false;
         }
         if (rtl_profile_uses_v3_direct_sampling(h->profile, tune_hz)) {
-            /* The tuner is bypassed in V3 Q-branch mode. */
+            /* The tuner is bypassed in V3/Nooelec Q-branch mode. */
             h->pending_gain = false;
             h->pending_gain_mode = false;
         }
@@ -3844,10 +3868,9 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->iface_claimed = true;
 
         if (rtl_profile_uses_r820t2_i2c_remap(handle->profile)) {
-            /* Shared R820T2 path (Blog V3 + Nooelec): same USB IR template
-             * remapping 0x74->0x34. Blog V3 can switch to its separately
-             * captured direct-sampling path; Nooelec remains fail-closed
-             * below 24 MHz.
+            /* Shared R820-family addressing, independently captured board
+             * differences. Nooelec's 2026-09-30 PC captures cover Q mode,
+             * gain and bandwidth; ESP32-P4 acceptance remains open.
              *
              * Blog V3 is soak-verified as of 2026-09-21: 1.62 GB at
              * 1.024 MS/s over 787 s, concurrently with a Blog V4 at
@@ -3855,7 +3878,7 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
              * = 0 and IQ age never above 5 ms. Measured rate 2.06 MB/s
              * against 2.048 nominal. Zero init records were rejected.
              *
-             * Nooelec has no such soak and keeps the warning. */
+             * This older V3 soak is not Nooelec ESP32-P4 validation. */
             if (handle->profile == RtlProfileId::BlogV3) {
                 ESP_LOGI(TAG,
                          "%s: R820T2 stream (I2C 0x34 remap); soak-verified "
@@ -3869,8 +3892,8 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
                          rtl_profile_name(handle->profile));
             } else {
                 ESP_LOGW(TAG,
-                         "%s: provisional R820T2 stream (I2C 0x34 remap); "
-                         "maintainer-unverified - please report soak results",
+                         "%s: PC-captured 2026-09-30 (I2C 0x34, direct Q); "
+                         "ESP32-P4 acceptance pending",
                          rtl_profile_name(handle->profile));
             }
         }
@@ -3912,9 +3935,10 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
                 break;
             }
         }
-        /* V3c boots on its proven 3.57 MHz IF; a bandwidth request explicitly
-         * switches both PLL and demod IF to the captured PC bandwidth plan. */
-        if (handle->profile != RtlProfileId::BlogV3 &&
+        /* V3c and Nooelec cold captures use 3.57 MHz. Only an explicit
+         * bandwidth request switches Nooelec to its captured variable IF;
+         * AUTO is 1.815 MHz there, unlike the older V3c AUTO policy. */
+        if (rtl_profile_demod_if_restore_hz(handle->profile) == 0 &&
             local.sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
             measured_tuner_bandwidth_count(handle->profile, freq, hf_direct_route(handle, freq)) != 0) {
             ret = apply_bandwidth_transaction(handle, freq, 0);
@@ -5255,11 +5279,16 @@ static esp_err_t apply_tuner_agc_auto_records(esp_rtl_sdr_handle *h)
             err = run_band_frontend(h, rf_hz, kMeasuredV4TunerAgcReg05,
                                     kMeasuredV4TunerAgcReg07, kMeasuredV4TunerAgcReg0c);
         } else {
-            const uint8_t reg05 = h->profile == RtlProfileId::BlogV4L
+            uint8_t reg05 = h->profile == RtlProfileId::BlogV4L
                 ? measured_v4l_frontend_plan(rf_hz, h->bias_tee_want, 0x03,
                                              hf_direct_route(h, rf_hz)).reg05
                 : 0x88;
-            const uint8_t reg07 = h->profile == RtlProfileId::BlogV4L ? 0x75 : 0x78;
+            uint8_t reg07 = h->profile == RtlProfileId::BlogV4L ? 0x75 : 0x78;
+            if (h->profile == RtlProfileId::NooelecSmartV5) {
+                reg05 = static_cast<uint8_t>(0x80 | h->tuner_reg05_low_bits);
+                reg07 = h->tuner_reg07;
+                r820t2_auto_gain_regs(reg05, reg07);
+            }
             err = run_record(h, measured_v4_ir_reg_write(0x05, reg05), false);
             if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x07, reg07), false);
             if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0c, 0x6b), false);
@@ -5286,6 +5315,10 @@ static esp_err_t apply_rtl_agc_records(esp_rtl_sdr_handle *h, bool enable)
     esp_err_t err = ESP_FAIL;
     for (int pass = 0; pass < 3; ++pass) {
         err = run_record(h, rec, false);
+        if (err == ESP_OK && h->profile == RtlProfileId::NooelecSmartV5) {
+            /* Nooelec 2026-09-30 RTL AGC captures settle each demod write. */
+            err = run_record(h, kBlogV3TunerRepeaterOn[1], false);
+        }
         if (err == ESP_OK) {
             return ESP_OK;
         }
@@ -5653,8 +5686,7 @@ esp_err_t esp_rtl_sdr_get_tuner_gains(esp_rtl_sdr_handle_t handle, int *out_gain
         *out_count = 0;
         return ESP_RTL_SDR_ERR_UNSUPPORTED;
     }
-    const bool r820 = handle->profile == RtlProfileId::BlogV3 ||
-                      handle->profile == RtlProfileId::BlogV4L;
+    const bool r820 = rtl_profile_uses_r820t2_i2c_remap(handle->profile);
     const size_t count = r820 ? kR820T2GainStepCount : kMeasuredV4GainStepCount;
     *out_count = count;
     if (out_gains_tenth_db == nullptr || max_count == 0) {

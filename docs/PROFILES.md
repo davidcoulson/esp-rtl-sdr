@@ -32,17 +32,19 @@ Default until identified (and after detach): **`Unknown`** — never Blog V4.
 | Hardware | Maintainer can soak Blog V4; GPIO/RF acceptance still open |
 | Tuner bandwidth | Live bandwidth AUTO, 200k, 300k, 500k, 1.0M, 1.8M, 2.4M, AUTO **hardware-tested** on the M5 Tab5 at 96.1 MHz (2026-09-28, with the read-after-write fix: one cold boot and one unplug/replug): the carrier stays within +/-1.4 kHz of the request at every stage and final AUTO matches the cold-boot passband within 0.4 dB. **Not measured before the fix**; the V4L, which shares these plan words, shifted -312..+386 kHz without it. Plan values are vendor-driver control choices derived from captures, not measured analog passbands. See `docs/captures/v3c_live_bandwidth_2026-09-28.md`. |
 
-### `nooelec_smart_v5` (NESDR SMArt v5 / R820T2-R860) — PROVISIONAL
+### `nooelec_smart_v5` (NESDR SMArt v5 / R820-family) — PC-CAPTURED; P4 ACCEPTANCE PENDING
 
 | Field | Value |
 |---|---|
-| Status | **Provisional** — contributor-tested; maintainer soak pending |
+| Status | **Implemented from first-party PC captures (2026-09-30)**; host profile checks and ESP32-P4 source compilation are separate from pending P4 reception/soak acceptance |
 | USB | Shared `0bda:2838` + exact `Nooelec` + product contains `NESDR SMArt v5` |
-| Tuner | R820T2/R860 @ I2C `0x34` (mapped from Blog V4 IR records) |
-| HF | **Rejected** below 24 MHz; no V4 HF routing |
-| Caps | STREAM/RETUNE/etc. without HF_UPCONVERTER / GAIN / BIAS_TEE |
-| IF evidence | The existing init table programs a 3.57 MHz demodulator IF; the Nooelec tuner PLL now uses the same offset. This pairing is host-tested, not yet Nooelec hardware-verified. |
-| Evidence | David Coulson's independent Nooelec testing flagged the IF mismatch ([PR #26](https://github.com/hardcoreerik/esp-rtl-sdr/pull/26)); this correction was implemented independently from the driver's existing init records. Community soak welcome. |
+| Tuner | R820-family @ I2C `0x34`; the PC oracle reports tuner type 5 / R820T, which does not establish exact silicon. Nooelec's public datasheet names R860. |
+| RF / HF | Model bounds **100 kHz–1750 MHz**. Automatic Q-branch direct sampling below **24 MHz**, native tuner above; no V4 upconverter, triplexer, or board GPIO. The 24 MHz route cutoff matches the PC capture, whose boundary tune warned that the PLL was not locked; the manufacturer rates native operation from 25 MHz. No RF acceptance claim at 24 MHz. |
+| Caps | STREAM/RETUNE/etc. plus DIRECT_SAMPLING, GAIN, GAIN_AUTO, RTL_AGC, TUNER_BANDWIDTH. **No BIAS_TEE or HF_UPCONVERTER.** Gain/mode and tuner bandwidth requests are unsupported while Q bypasses the tuner. |
+| Cold IF | Captured tuner filter `0x0a/0x0b = d3/6b`; PLL IF **3.570 MHz**, demod IF bytes **38 11 12**. Reinitialize and restore these after sample-rate setup and when returning from Q to the tuner. |
+| Bandwidth | At **2.4 MS/s**, AUTO, 200k, 300k, 500k, 1.0M, 1.8M and 2.4M are captured native-route control choices. Every plan uses `0x0a=c3` with paired PLL/demod IF and settle reads. Explicit AUTO uses **c3/8f and 1.815 MHz**; it does not inherit the older V3c AUTO boot-state policy. Ordinary startup/retune stays at cold 3.570 MHz until a bandwidth request is applied. Analog passbands are unmeasured. |
+| Gain / AGC | All **29 nominal 0.0–49.6 dB** manual register pairs match the existing R820-family ladder. Nooelec tuner AUTO preserves the current gain nibbles and changes mode bits, including after reinit. RTL AGC writes page-0 register 19 (`05` off / `25` on) and performs the captured settle read. |
+| Evidence | [Nooelec capture record](captures/nooelec_v5_2026-09-30.md) contains identity, hashes, procedures and frame anchors; [merge and acceptance notes](nooelec_v5_merge_notes.md) separate source, build and hardware gates. David Coulson's earlier independent testing flagged an IF mismatch ([PR #26](https://github.com/hardcoreerik/esp-rtl-sdr/pull/26)); that historical report is retained as attribution, while this implementation uses the new first-party captures. |
 
 ### `blog_v3` (RTL-SDR Blog V3 / V3c / R820T2 / R860) — IDENTIFICATION, STREAMING, AND MATCHED-IF TUNING VERIFIED
 
@@ -50,7 +52,7 @@ Default until identified (and after detach): **`Unknown`** — never Blog V4.
 |---|---|
 | Status | Identification, streaming, and 3.570 MHz matched-IF tuning **hardware-verified** (2026-09-11/12, real V3c unit, R860 tuner per packaging). Physical checks covered 96.1 MHz, 99.1 MHz with matching RDS, cold start, hot retune, V3c/V4 hotplug in both directions, USB-powered boot, battery-powered boot, and the Blog V4 regression. Gain accuracy remains provisional. |
 | USB | Exact V3 descriptors, or completed R820T2 chip-id `0x96`/`0x69` on ambiguous `0bda:2838` (the tested V3c unit reports the bare factory `RTL2838UHIDIR` descriptor, not `RTLSDRBlog`/`Blog V3` — identified via the ambiguous-descriptor chip-id probe, not string match) |
-| Tuner | R820T2/R860 @ I2C `0x34` (same USB IR template remap as Nooelec provisional; R860 is pin/register-compatible with R820T2, same profile covers both — no separate profile needed) |
+| Tuner | R820T2/R860 @ I2C `0x34` (same USB IR template addressing as Nooelec; independently measured board differences remain profile-specific) |
 | HF/LF | Below 24 MHz uses first-party-capture-derived RTL2832 Q-branch direct sampling; **no** V4 HF upconverter / Cable-2 / GPIO5 |
 | Caps | STREAM/RETUNE/etc. plus provisional manual GAIN and DIRECT_SAMPLING; without HF_UPCONVERTER / GAIN_AUTO / RTL_AGC / BIAS_TEE. Tuner gain setters are unsupported while direct sampling bypasses the tuner. |
 | IF evidence | Official-driver capture measured the V3c PLL IF at 3.570 MHz and ended RTL2832 setup with `0x19/0x1A/0x1B = 0x38/0x11/0x12`, including a settle read after each write. The driver restores that sequence after sample-rate setup and before the first tune. When tuner bandwidth returns to AUTO it restores the whole V3c boot tuning state: demod IF `38 11 12`, PLL IF 3.570 MHz and tuner filter registers `0x0a/0x0b = d5/6b` (read back from the chip after a cold boot). The explicit bandwidth plans use their own captured IF (2.125, 2.025, 1.700, 1.750 or 1.815 MHz) and are written from the same plan; the V3c therefore runs a variable IF by design. V4 stays on its existing matched 1.814972 MHz path; Nooelec separately matches its PLL offset to the 3.57 MHz IF in its init table, pending hardware validation. |
