@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.2 (2026-09-30) — capture-derived Nooelec SMArt v5 profile
+
 ### Nooelec NESDR SMArt v5 profile
 
 - **Correct cold FM tuning on the Nooelec.** In v0.9.1, the Nooelec PLL calculation
@@ -26,9 +28,13 @@
 - **Document provenance and acceptance separately.** The detailed
   [capture record](docs/captures/nooelec_v5_2026-09-30.md) records the USBPcap/TShark
   campaign, hashes, antennas, control/frame anchors and remaining capture gaps.
-  [Merge notes](docs/nooelec_v5_merge_notes.md) record validation and the P4/OrcSDR
-  acceptance procedure. This is branch work, not a newly published release;
-  version/tag selection will be discussed with the maintainer before tag creation.
+  [Merge notes](docs/nooelec_v5_merge_notes.md) record validation and the P4
+  standalone driver acceptance procedure. The implementation was reviewed and
+  merged in [PR #39](https://github.com/hardcoreerik/esp-rtl-sdr/pull/39), with
+  Linux/Windows host tests, truth hygiene and a full ESP-IDF 5.5.4 P4 compile
+  passing. Runtime traces passed 7,664 checks; physical Nooelec acceptance remains
+  open. The maintainer explicitly selected version/tag `0.9.2` / `v0.9.2`.
+  [Release notes](docs/releases/v0.9.2.md) explain the fix, evidence and limits.
 
 ## 0.9.1 (2026-09-28) — live tuner-bandwidth fixes; first published 0.9 release
 

@@ -1,12 +1,15 @@
-# Nooelec NESDR SMArt v5 profile: branch and eventual merge notes
+# Nooelec NESDR SMArt v5 profile: branch, merge and release notes
 
-Status: implementation branch `codex/nooelec-v5-profile`, based on master
+Status: implementation branch `codex/nooelec-v5-profile`, originally based on master
 `105caa5`, which is also the verified remote `v0.9.1` release commit
-`105caa56b9b5ce395a7b4910c6f703c14b83b5d9`. This is a premerge review and acceptance record, not a claim that the change
-is merged, released, or physically accepted. The release version/tag is not
-selected. Consult the user before selecting or creating a release tag; merge
-only with explicit approval, then verify the resulting commit on
-`origin/master`.
+`105caa56b9b5ce395a7b4910c6f703c14b83b5d9`. The implementation is now merged in
+[PR #39](https://github.com/hardcoreerik/esp-rtl-sdr/pull/39) at
+`6c0f3c8e32b4761d4238dda025ca3902ed4e878d`, verified on `origin/master`.
+The validation tables below preserve the premerge record, including its then-current
+version `0.9.1`; they are historical results, not the current publication status.
+The maintainer subsequently explicitly selected `0.9.2` and authorized its tag.
+The final closure below records the merge and release boundary. Physical Nooelec
+RF acceptance remains open.
 
 The authorized scope is this driver repository only. No application changes,
 integration work, or device writes were performed or are authorized by branch
@@ -249,15 +252,45 @@ authorization to undertake them while finishing the driver branch.
 
 ## Merge and release closure
 
-The final runtime check, focused local driver review, and post-fix targeted
-source compile have passed; exact results are recorded above. Before requesting
-merge approval, verify the branch still contains only the reviewed changes.
-Keep the targeted object compile distinct from
-a full firmware build and the PC/host results distinct from physical RF.
-The review lane should contain only this driver/profile work and its evidence.
+The maintainer explicitly authorized final review, branch/PR publication and
+merge. Focused local review found the native retune register-0c and post-HF gain
+restoration issues recorded above. A final check found that a queued AUTO-to-MANUAL
+change interrupted by an HF transition could leave `tuner_auto_applied` true.
+Commit `e9be00663aaf689fa40018e590463c0a85bc1ab6` clears that flag after the
+successful Nooelec manual-gain restore; the actual-function runtime test covers
+this interrupted change. No other high-signal local review finding remained.
+No external CodeRabbit/Grok review is claimed for implementation PR #39.
 
-A PR is not landed work. After explicit merge approval and the actual merge,
-refresh origin and verify the merge commit on `origin/master` before calling
-it landed. Update these notes with that commit and any subsequently supplied
-driver evidence. The release version/tag remains unselected; consult the
-user before choosing or creating a tag or taking a publication action.
+[CI run 36823676980](https://github.com/hardcoreerik/esp-rtl-sdr/actions/runs/36823676980)
+completed successfully on exactly that reviewed head. Linux and Windows host
+jobs, truth/version hygiene, the full standalone ESP-IDF 5.5.4 ESP32-P4 compile,
+and the aggregate CI gate all passed. Linux CTest passed all three host tests;
+the policy executable reported 387 passed / 0 failed, and the actual-function
+Nooelec runtime trace reported 7,664 passed / 0 failed. The prior local profile
+test reported 1,987 passed / 0 failed. The full CI compile is additional software
+evidence beyond the earlier local single-object compile; neither is physical RF.
+
+PR #39 was merged with a merge commit on September 30, 2026 Pacific time
+(`2026-10-01T06:20:01Z`). After `git fetch origin master`, the following were
+verified:
+
+```text
+origin/master = 6c0f3c8e32b4761d4238dda025ca3902ed4e878d
+reviewed head = e9be00663aaf689fa40018e590463c0a85bc1ab6
+git merge-base --is-ancestor <reviewed-head> origin/master: exit 0
+```
+
+The original checkout, its untracked build artifacts, the implementation branch,
+and the external capture evidence were preserved. No OrcSDR files or device state
+were changed. Application integration remains the maintainer's separate follow-up.
+
+After this merge, the maintainer requested version `0.9.2`, then its tag.
+The separate release branch aligns the version macros, package manifests,
+example version checks and current documentation, and moves the Nooelec changelog
+entry into 0.9.2. Historical references to the affected `v0.9.1` and the older
+V3/V4/V4L captures retain their original versions and provenance.
+The [0.9.2 release notes](releases/v0.9.2.md) describe the software evidence and
+remaining physical checks. The annotated `v0.9.2` tag must point to the verified
+release merge commit on `master` after required CI passes. The release PR and tag
+provide the final immutable publication identities; this document does not
+attempt to embed its own future commit hash.
