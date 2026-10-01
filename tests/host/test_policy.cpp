@@ -105,7 +105,7 @@ static void test_capabilities(void)
                              ESP_RTL_SDR_CAP_MULTI_DEVICE | ESP_RTL_SDR_CAP_SYNC_READ |
                              ESP_RTL_SDR_CAP_CONTINUOUS_RATE | ESP_RTL_SDR_CAP_NEED |
                              ESP_RTL_SDR_CAP_HEALTH | ESP_RTL_SDR_CAP_PASSPORT |
-                             ESP_RTL_SDR_CAP_DELIVERY_MODE;
+                             ESP_RTL_SDR_CAP_DELIVERY_MODE | ESP_RTL_SDR_CAP_LIVE_RATE;
     EXPECT_EQ_U(c & need_on, need_on);
 
     /* Measured Blog V4 lab 2026-08-12 — CAP_GAIN / CAP_BIAS_TEE on */

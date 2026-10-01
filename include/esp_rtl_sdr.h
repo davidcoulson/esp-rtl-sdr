@@ -339,6 +339,8 @@ typedef enum {
     ESP_RTL_SDR_CAP_RTL_AGC = 1u << 19,
     /** Measured tuner filter/IF control at 2.4 MS/s; direct-Q HF excluded. */
     ESP_RTL_SDR_CAP_TUNER_BANDWIDTH = 1u << 20,
+    /** set_sample_rate while streaming changes the rate in place (no stop/start). */
+    ESP_RTL_SDR_CAP_LIVE_RATE = 1u << 21,
 } esp_rtl_sdr_cap_t;
 
 /**
@@ -976,7 +978,16 @@ esp_err_t esp_rtl_sdr_get_center_freq(esp_rtl_sdr_handle_t handle, uint32_t *out
 /**
  * Set preferred sample rate (Hz). Must be allowlisted (is_rate_supported).
  * - IDLE: stored for next start() if stream.sample_rate_sps is 0.
- * - STREAMING: returns ERR_BUSY (rate change requires stop/start in Phase 1).
+ * - STREAMING (CAP_LIVE_RATE): changes the rate in place. Bulk IQ pauses for
+ *   one EP0 window, like a hot retune: the resampler is rewritten and the
+ *   tuner-bandwidth state is brought to what start() at the new rate would
+ *   set. No samples are delivered during the window. Blocks the caller for
+ *   the window; returns ESP_OK at once if another EP0 window is open, and the
+ *   delivery task applies the request after it. get_sample_rate() reports the
+ *   new rate once applied. A failed attempt is returned and retried by the
+ *   delivery task, up to 3 attempts in all.
+ *   Not callable from the event callback (ERR_REENTRANT).
+ * - STOPPING: returns ERR_BUSY.
  */
 esp_err_t esp_rtl_sdr_set_sample_rate(esp_rtl_sdr_handle_t handle, uint32_t sample_rate_sps);
 

@@ -322,6 +322,7 @@ uint32_t esp_rtl_sdr_get_capabilities(void);
 | `ESP_RTL_SDR_CAP_GAIN_AUTO` | 18 | **On** | Tuner AGC AUTO (measured 05/07/0c) |
 | `ESP_RTL_SDR_CAP_RTL_AGC` | 19 | **On** | RTL2832 digital AGC (demod 0x19) |
 | `ESP_RTL_SDR_CAP_TUNER_BANDWIDTH` | 20 | **Profile-specific** | Measured filter/PLL/demod IF choices at 2.4 MS/s; V3 direct-Q HF unsupported |
+| `ESP_RTL_SDR_CAP_LIVE_RATE` | 21 | **On** | In-stream `set_sample_rate` (no stop/start) |
 
 ```c
 const uint32_t need = ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_SYNC_READ;
@@ -1028,9 +1029,36 @@ esp_err_t esp_rtl_sdr_get_sample_rate(esp_rtl_sdr_handle_t handle, uint32_t *out
 | State | `set` behavior |
 |---|---|
 | `IDLE` | Stores preferred (quantized) for next start if stream rate is 0 |
-| `STREAMING` | **`ERR_BUSY`** — rate change requires stop/start (Phase 1) |
+| `STREAMING` | Changes the rate in place (`CAP_LIVE_RATE`); see below |
+| `STOPPING` | **`ERR_BUSY`** |
 
 Must pass `is_rate_supported`. `get` returns last applied or preferred exact SPS.
+
+**While streaming** the rate changes without a stop/start, in the same paused-bulk
+EP0 window as a hot retune. Retune, gain/bias/bandwidth writes, rate changes and
+`stop` take that window one at a time, so `stop` waits for a rate change in
+progress. Inside the window:
+
+1. Bulk IQ is drained; no samples are delivered until it resumes.
+2. The resampler is rewritten with the records `start` uses.
+3. The tuner-bandwidth state is set to what `start` at the new rate leaves: the
+   measured plan at 2.4 MS/s where `start` or a retune would use one, or the
+   start-time filter and IF when a plan was in effect at the old rate. Leaving
+   2.4 MS/s clears the requested and applied bandwidth, as `stop` does.
+4. Bulk IQ resumes. `metrics.bytes_total`, `bytes_consumed` and uptime restart,
+   so `effective_sps` and health efficiency refer to the new rate.
+
+| Caller | Result |
+|---|---|
+| App task | Applies before returning. `ESP_OK`, or the first attempt's error |
+| App task, another EP0 window open | `ESP_OK` (accepted); the delivery task applies it next |
+| Event callback | **`ERR_REENTRANT`** (unchanged) |
+| Same rate, nothing pending | `ESP_OK`, no USB traffic |
+
+A failed attempt leaves the request pending and the delivery task runs the whole
+sequence again, up to 3 attempts in all; then the request is dropped and
+`get_sample_rate` keeps the last applied rate. A newer request replaces a pending
+one. `apply_need` still returns **`ERR_BUSY`** while streaming.
 
 ### `esp_rtl_sdr_read`
 

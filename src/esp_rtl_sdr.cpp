@@ -377,6 +377,10 @@ struct esp_rtl_sdr_handle {
     volatile uint32_t pending_retune_hz = 0;
     /** True while apply_pending_retune() runs (delivery or app task). */
     volatile bool retune_busy = false;
+    /** Sample rate requested while streaming; applied in the shared EP0 window. 0 = none. */
+    volatile uint32_t pending_rate_sps = 0;
+    /** Consecutive failed attempts to apply pending_rate_sps. */
+    uint8_t pending_rate_failures = 0;
     /**
      * Sideband EP0 (gain/bias) queued for delivery task — keeps app/HTTP
      * responsive. Applied in one bulk-pause window (never concurrent with retune).
@@ -744,6 +748,8 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     h->gain_mode = ESP_RTL_SDR_GAIN_MODE_AUTO;
     h->gain_tenth_db = 0;
     h->pending_retune_hz = 0;
+    h->pending_rate_sps = 0;
+    h->pending_rate_failures = 0;
     h->pending_gain = false;
     h->pending_gain_mode = false;
     h->pending_bias = false;
@@ -2090,10 +2096,9 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     esp_err_t err = ESP_OK;
     const uint32_t requested_width = h->bandwidth_requested_hz;
     uint32_t applied_width = requested_width;
-    const bool measured_bw = h->sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
-        measured_tuner_bandwidth_count(h->profile, tune_hz, hf_direct_route(h, tune_hz)) != 0 &&
-        (rtl_profile_demod_if_restore_hz(h->profile) == 0 || h->bandwidth_applied_valid ||
-         h->pending_bandwidth);
+    const bool measured_bw = rtl_measured_bandwidth_in_use(
+        h->profile, h->sample_rate_sps, tune_hz, hf_direct_route(h, tune_hz),
+        h->bandwidth_applied_valid, h->pending_bandwidth);
     if (measured_bw) {
         MeasuredTunerBandwidthPlan requested{};
         if (!measured_tuner_bandwidth_plan(h->profile, tune_hz, applied_width, &requested,
@@ -2163,6 +2168,132 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             emit_after_unlock(h, ESP_RTL_SDR_EVT_RETUNED, &f, cb, ctx);
         }
     }
+    return err;
+}
+
+/**
+ * Change the sample rate of a running stream in place, instead of a stop/start.
+ *
+ * Owns the shared EP0 window (ep0_sideband_busy) like a hot retune, so it never overlaps a retune,
+ * a sideband write or stop(); stop() waits for it. Inside the window: drain bulk, rewrite the
+ * resampler with the same records start() uses, bring the tuner-bandwidth state to what start()
+ * would leave at the new rate (rtl_rate_change_bandwidth), resubmit bulk.
+ *
+ * A failure keeps the request pending, with bulk resumed, so the delivery task runs the whole
+ * sequence again; it is dropped after kRtlRateChangeMaxAttempts failures in a row. Must NOT run on
+ * the USB client/host lib tasks. Coalesces like apply_pending_retune().
+ */
+static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
+{
+    if (h == nullptr || !h->streaming) {
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    const uint32_t rate = h->pending_rate_sps;
+    if (rate == 0) {
+        return ESP_OK;
+    }
+    if (h->ep0_sideband_busy.exchange(true)) {
+        return ESP_OK; /* another EP0 window is open; the delivery task applies it later */
+    }
+    const int64_t t0 = esp_timer_get_time();
+
+    if (!bulk_pause_and_drain(h)) {
+        h->ep0_sideband_busy = false;
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
+    if (!h->streaming) {
+        h->pause_resubmit = false;
+        if (h->pending_rate_sps == rate) {
+            h->pending_rate_sps = 0;
+        }
+        h->ep0_sideband_busy = false;
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+
+    /* Use the latest request if a newer one arrived while draining. */
+    const uint32_t apply = (h->pending_rate_sps != 0) ? h->pending_rate_sps : rate;
+    const uint32_t rf_hz = h->frequency_hz;
+    const bool hf_direct = hf_direct_route(h, rf_hz);
+    const RtlRateChangeBandwidth bw = rtl_rate_change_bandwidth(
+        h->profile, apply, rf_hz, hf_direct, h->bandwidth_applied_valid, h->pending_bandwidth);
+    const uint32_t requested_width = h->bandwidth_requested_hz;
+    uint32_t applied_width = requested_width;
+
+    esp_err_t err = run_sample_rate(h, apply);
+    if (err == ESP_OK && bw == RtlRateChangeBandwidth::ApplyPlan) {
+        MeasuredTunerBandwidthPlan requested{};
+        if (!measured_tuner_bandwidth_plan(h->profile, rf_hz, applied_width, &requested,
+                                           hf_direct)) {
+            applied_width = 0; /* width from a different route class */
+        }
+        err = apply_bandwidth_transaction(h, rf_hz, applied_width);
+    } else if (err == ESP_OK && bw == RtlRateChangeBandwidth::RestoreBaseline) {
+        MeasuredTunerBandwidthPlan baseline{};
+        if (!measured_tuner_bandwidth_baseline(h->profile, rf_hz, &baseline)) {
+            err = ESP_RTL_SDR_ERR_UNSUPPORTED;
+        } else if (!measured_tuner_bandwidth_same_controls(baseline, h->bandwidth_applied)) {
+            /* e.g. Blog V4 AUTO is already the start-time state; nothing to write then. */
+            err = run_bandwidth_program(h, rf_hz, rf_hz, baseline);
+        }
+    }
+
+    if (h->state == ESP_RTL_SDR_STATE_FAULT) {
+        /* apply_bandwidth_transaction could not restore either plan and stopped the stream. */
+        h->pending_rate_sps = 0;
+        h->pending_rate_failures = 0;
+        h->ep0_sideband_busy = false;
+        RTL_LOGE(h, "live sample rate %u S/s: bandwidth state lost, stream faulted",
+                 static_cast<unsigned>(apply));
+        return err;
+    }
+    if (err == ESP_OK) {
+        if (bw == RtlRateChangeBandwidth::ApplyPlan) {
+            if (h->bandwidth_requested_hz == requested_width) {
+                h->bandwidth_requested_hz = applied_width;
+                h->pending_bandwidth = false;
+            }
+        } else {
+            /* No plan at this rate: same state stop/start would leave. */
+            h->bandwidth_applied_valid = false;
+            h->bandwidth_requested_hz = 0;
+            h->pending_bandwidth = false;
+        }
+        h->sample_rate_sps = apply;
+        h->preferred_sample_rate_sps = apply;
+        h->metrics.sample_rate_sps = apply;
+        /* effective_sps is bytes over stream uptime: restart both at the new rate. */
+        h->metrics.bytes_total = 0;
+        h->metrics.bytes_consumed = 0;
+        h->stream_start_ms = now_ms();
+        h->pending_rate_failures = 0;
+        if (h->pending_rate_sps == apply) {
+            h->pending_rate_sps = 0;
+        }
+        RTL_LOGI(h, "live sample rate applied %u S/s bandwidth=%s in %lld us",
+                 static_cast<unsigned>(apply),
+                 bw == RtlRateChangeBandwidth::ApplyPlan        ? "plan"
+                 : bw == RtlRateChangeBandwidth::RestoreBaseline ? "baseline"
+                                                                 : "unchanged",
+                 static_cast<long long>(esp_timer_get_time() - t0));
+    } else if (rtl_rate_change_retry(++h->pending_rate_failures)) {
+        /* The resampler may already be at the new rate with the rest not: keep the request so
+         * the delivery task runs the whole sequence again. Bulk resumes regardless; a paused
+         * stream would never reach that pass. */
+        RTL_LOGW(h, "live sample rate %u S/s failed: %s (attempt %u, will retry)",
+                 static_cast<unsigned>(apply), esp_rtl_sdr_err_to_name(err),
+                 static_cast<unsigned>(h->pending_rate_failures));
+    } else {
+        RTL_LOGE(h, "live sample rate %u S/s failed: %s; giving up after %u attempts",
+                 static_cast<unsigned>(apply), esp_rtl_sdr_err_to_name(err),
+                 static_cast<unsigned>(h->pending_rate_failures));
+        h->pending_rate_failures = 0;
+        if (h->pending_rate_sps == apply) {
+            h->pending_rate_sps = 0;
+        }
+    }
+
+    bulk_resume(h);
+    h->ep0_sideband_busy = false;
     return err;
 }
 
@@ -2421,7 +2552,11 @@ static void delivery_task_fn(void *arg)
             !h->retune_busy && !h->ep0_sideband_busy) {
             bulk_recover_stall(h);
         }
-        /* Async EP0 off the USB client task (retune first, then gain/bias). */
+        /* Async EP0 off the USB client task (rate, retune, then gain/bias). */
+        if (h->streaming && h->pending_rate_sps != 0 && !h->retune_busy &&
+            !h->ep0_sideband_busy) {
+            (void)apply_pending_rate(h);
+        }
         if (h->streaming && h->pending_retune_hz != 0 && !h->retune_busy &&
             !h->ep0_sideband_busy) {
             (void)apply_pending_retune(h);
@@ -3698,6 +3833,8 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->streaming = false;
     h->frontend_applied_valid = false;
     h->pending_retune_hz = 0;
+    h->pending_rate_sps = 0;
+    h->pending_rate_failures = 0;
     h->pending_gain = false;
     h->pending_gain_mode = false;
     h->pending_bias = false;
@@ -3938,9 +4075,8 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         /* V3c and Nooelec cold captures use 3.57 MHz. Only an explicit
          * bandwidth request switches Nooelec to its captured variable IF;
          * AUTO is 1.815 MHz there, unlike the older V3c AUTO policy. */
-        if (rtl_profile_demod_if_restore_hz(handle->profile) == 0 &&
-            local.sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
-            measured_tuner_bandwidth_count(handle->profile, freq, hf_direct_route(handle, freq)) != 0) {
+        if (rtl_measured_bandwidth_in_use(handle->profile, local.sample_rate_sps, freq,
+                                          hf_direct_route(handle, freq), false, false)) {
             ret = apply_bandwidth_transaction(handle, freq, 0);
         } else {
             ret = run_profile_tune(handle, freq, 0);
@@ -4028,6 +4164,8 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
                  static_cast<unsigned>(handle->cfg.transfer_count),
                  static_cast<unsigned>(handle->cfg.transfer_bytes));
         handle->pending_retune_hz = 0;
+        handle->pending_rate_sps = 0;
+        handle->pending_rate_failures = 0;
         handle->retune_busy = false;
         handle->pause_resubmit = false;
         handle->live_urbs = 0;
@@ -4275,6 +4413,18 @@ esp_err_t esp_rtl_sdr_set_sample_rate(esp_rtl_sdr_handle_t handle, uint32_t samp
     if (re != ESP_OK) {
         set_error_unlocked(handle, re);
         return re;
+    }
+    if (handle->state == ESP_RTL_SDR_STATE_STREAMING && handle->streaming) {
+        if (exact == handle->sample_rate_sps && handle->pending_rate_sps == 0) {
+            set_error_unlocked(handle, ESP_OK);
+            return ESP_OK;
+        }
+        /* Change the rate in place in the shared EP0 window (apply_pending_rate). */
+        handle->pending_rate_sps = exact;
+        handle->pending_rate_failures = 0;
+        set_error_unlocked(handle, ESP_OK);
+        lk.release();
+        return apply_pending_rate(handle);
     }
     if (handle->state == ESP_RTL_SDR_STATE_STREAMING ||
         handle->state == ESP_RTL_SDR_STATE_STOPPING) {

@@ -638,6 +638,11 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_BIAS_TEE) == 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0);
 
+    /* Live sample-rate change goes wherever streaming does. */
+    for (uint32_t caps : {v4, v4l, v3, noe}) {
+        EXPECT_TRUE((caps & ESP_RTL_SDR_CAP_LIVE_RATE) != 0);
+    }
+
     EXPECT_EQ_U(unk, 0);
     EXPECT_EQ_U(esp_rtl_sdr_get_capabilities(), rtl_profile_library_capabilities());
     EXPECT_TRUE(std::strcmp(esp_rtl_sdr_profile_to_name(ESP_RTL_SDR_PROFILE_BLOG_V4),
@@ -846,6 +851,136 @@ static void test_nooelec_captured_programming(void)
     }
 }
 
+/* Live sample-rate change: the bandwidth decision is the one start() and hot retune make, and
+ * leaving a plan restores exactly what start() leaves at a rate without one. */
+static void test_live_rate_bandwidth_policy(void)
+{
+    constexpr uint32_t fm = 96100000u;
+    constexpr uint32_t ism = 433920000u;
+    constexpr uint32_t hf_q = 7000000u; /* V3/Nooelec direct-Q */
+    using RCB = RtlRateChangeBandwidth;
+
+    /* start(): V4/V4L apply the AUTO plan at 2.4 MS/s; V3c/Nooelec only on request. */
+    EXPECT_TRUE(rtl_measured_bandwidth_in_use(RtlProfileId::BlogV4, ESP_RTL_SDR_RATE_2400K, fm,
+                                              false, false, false));
+    EXPECT_TRUE(rtl_measured_bandwidth_in_use(RtlProfileId::BlogV4L, ESP_RTL_SDR_RATE_2400K, fm,
+                                              false, false, false));
+    EXPECT_TRUE(!rtl_measured_bandwidth_in_use(RtlProfileId::BlogV3, ESP_RTL_SDR_RATE_2400K, fm,
+                                               false, false, false));
+    EXPECT_TRUE(!rtl_measured_bandwidth_in_use(RtlProfileId::NooelecSmartV5,
+                                               ESP_RTL_SDR_RATE_2400K, fm, false, false, false));
+    EXPECT_TRUE(rtl_measured_bandwidth_in_use(RtlProfileId::NooelecSmartV5,
+                                              ESP_RTL_SDR_RATE_2400K, fm, false, false, true));
+    EXPECT_TRUE(rtl_measured_bandwidth_in_use(RtlProfileId::BlogV3, ESP_RTL_SDR_RATE_2400K, fm,
+                                              false, true, false));
+    EXPECT_TRUE(!rtl_measured_bandwidth_in_use(RtlProfileId::BlogV4, ESP_RTL_SDR_RATE_2048K, fm,
+                                               false, true, true));
+    EXPECT_TRUE(!rtl_measured_bandwidth_in_use(RtlProfileId::BlogV3, ESP_RTL_SDR_RATE_2400K,
+                                               hf_q, false, true, true));
+
+    /* rtl_433-style hops (250k <-> 2048k) never touch filter or IF. */
+    for (RtlProfileId p : {RtlProfileId::BlogV4, RtlProfileId::BlogV4L, RtlProfileId::BlogV3,
+                           RtlProfileId::NooelecSmartV5}) {
+        EXPECT_TRUE(rtl_rate_change_bandwidth(p, 250000u, ism, false, false, false) == RCB::Keep);
+        EXPECT_TRUE(rtl_rate_change_bandwidth(p, ESP_RTL_SDR_RATE_2048K, 915000000u, false,
+                                              false, false) == RCB::Keep);
+    }
+    /* Entering 2.4 MS/s: same plan decision as start(). */
+    EXPECT_TRUE(rtl_rate_change_bandwidth(RtlProfileId::BlogV4, ESP_RTL_SDR_RATE_2400K, fm,
+                                          false, false, false) == RCB::ApplyPlan);
+    EXPECT_TRUE(rtl_rate_change_bandwidth(RtlProfileId::BlogV3, ESP_RTL_SDR_RATE_2400K, fm,
+                                          false, false, false) == RCB::Keep);
+    /* Leaving 2.4 MS/s with a plan applied puts back the start-time filter and IF. */
+    for (RtlProfileId p : {RtlProfileId::BlogV4, RtlProfileId::BlogV4L, RtlProfileId::BlogV3,
+                           RtlProfileId::NooelecSmartV5}) {
+        EXPECT_TRUE(rtl_rate_change_bandwidth(p, ESP_RTL_SDR_RATE_1024K, fm, false, true, false) ==
+                    RCB::RestoreBaseline);
+    }
+    /* Direct-Q bypasses the tuner: nothing to restore. */
+    EXPECT_TRUE(rtl_rate_change_bandwidth(RtlProfileId::NooelecSmartV5, ESP_RTL_SDR_RATE_1024K,
+                                          hf_q, false, true, false) == RCB::Keep);
+    MeasuredTunerBandwidthPlan none{};
+    EXPECT_TRUE(!measured_tuner_bandwidth_baseline(RtlProfileId::NooelecSmartV5, hf_q, &none));
+    EXPECT_TRUE(!measured_tuner_bandwidth_baseline(RtlProfileId::Unknown, fm, &none));
+
+    /* Retry: three attempts in all. */
+    EXPECT_TRUE(rtl_rate_change_retry(1));
+    EXPECT_TRUE(rtl_rate_change_retry(2));
+    EXPECT_TRUE(!rtl_rate_change_retry(3));
+    EXPECT_EQ_U(kRtlRateChangeMaxAttempts, 3u);
+}
+
+/* Replay the records start() runs before tuning (init table, R820 reinit slice, standard IF) the
+ * way run_record() maps them, and check the baseline plan writes the same last values. */
+static void test_live_rate_baseline_matches_start(void)
+{
+    constexpr uint32_t fm = 96100000u;
+    for (RtlProfileId p : {RtlProfileId::BlogV4, RtlProfileId::BlogV4L, RtlProfileId::BlogV3,
+                           RtlProfileId::NooelecSmartV5}) {
+        const uint16_t tuner = rtl_profile_tuner_i2c_value(p);
+        int reg0a = -1, reg0b = -1, if19 = -1, if1a = -1, if1b = -1;
+        auto replay = [&](size_t first, size_t last) {
+            for (size_t i = first; i <= last; ++i) {
+                if (!rtl_profile_allows_init_record(p, kRtlInitTransfers[i])) continue;
+                const RtlControlRecord r = rtl_profile_map_tuner_record(p, kRtlInitTransfers[i]);
+                if (r.request_type != 0x40) continue;
+                if (r.index == 0x0610 && r.value == tuner && r.length == 2) {
+                    if (r.data[0] == 0x0a) reg0a = r.data[1];
+                    if (r.data[0] == 0x0b) reg0b = r.data[1];
+                }
+                if (r.index == 0x0011 && r.length == 1) {
+                    if (r.value == 0x1920) if19 = r.data[0];
+                    if (r.value == 0x1a20) if1a = r.data[0];
+                    if (r.value == 0x1b20) if1b = r.data[0];
+                }
+            }
+        };
+        replay(0, std::size(kRtlInitTransfers) - 1);
+        if (rtl_profile_needs_cold_tuner_reinit(p, fm)) {
+            replay(kRtlTunerReinitFirst, kRtlTunerReinitLast);
+        }
+        if (rtl_profile_demod_if_restore_hz(p) != 0) {
+            replay(kRtlStandardIfFirst, kRtlStandardIfLast);
+        }
+
+        MeasuredTunerBandwidthPlan base{};
+        EXPECT_TRUE(measured_tuner_bandwidth_baseline(p, fm, &base));
+        EXPECT_EQ_U(rtl_profile_map_tuner_record(p, measured_v4_ir_reg_write(0x0a, base.reg0a))
+                        .data[1],
+                    static_cast<unsigned>(reg0a));
+        EXPECT_EQ_U(rtl_profile_map_tuner_record(p, measured_v4_ir_reg_write(0x0b, base.reg0b))
+                        .data[1],
+                    static_cast<unsigned>(reg0b));
+        EXPECT_EQ_U(base.if19, static_cast<unsigned>(if19));
+        EXPECT_EQ_U(base.if1a, static_cast<unsigned>(if1a));
+        EXPECT_EQ_U(base.if1b, static_cast<unsigned>(if1b));
+        EXPECT_EQ_U(base.if_hz, static_cast<uint32_t>(rtl_profile_pll_if_offset_hz(p)));
+    }
+    /* Spot values: Nooelec is d3 on the wire, V4 matches its own AUTO plan. */
+    MeasuredTunerBandwidthPlan noe{}, v4{}, v4_auto{};
+    EXPECT_TRUE(measured_tuner_bandwidth_baseline(RtlProfileId::NooelecSmartV5, fm, &noe));
+    EXPECT_EQ_U(rtl_profile_map_tuner_record(RtlProfileId::NooelecSmartV5,
+                                             measured_v4_ir_reg_write(0x0a, noe.reg0a)).data[1],
+                0xd3u);
+    EXPECT_EQ_U(noe.if_hz, kBlogV3DemodIfHz);
+    EXPECT_TRUE(measured_tuner_bandwidth_baseline(RtlProfileId::BlogV4, fm, &v4));
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4, fm, 0u, &v4_auto));
+    /* Leaving V4 AUTO at 2.4 MS/s needs no writes; V4L AUTO (c4) and any V3c/Nooelec
+     * plan do. */
+    EXPECT_TRUE(measured_tuner_bandwidth_same_controls(v4, v4_auto));
+    MeasuredTunerBandwidthPlan v4_wide{}, v4l{}, v4l_auto{}, v3{}, v3_auto{}, noe_auto{};
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4, fm, 1000000u, &v4_wide));
+    EXPECT_TRUE(!measured_tuner_bandwidth_same_controls(v4, v4_wide));
+    EXPECT_TRUE(measured_tuner_bandwidth_baseline(RtlProfileId::BlogV4L, fm, &v4l));
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV4L, fm, 0u, &v4l_auto));
+    EXPECT_TRUE(!measured_tuner_bandwidth_same_controls(v4l, v4l_auto));
+    EXPECT_TRUE(measured_tuner_bandwidth_baseline(RtlProfileId::BlogV3, fm, &v3));
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::BlogV3, fm, 0u, &v3_auto));
+    EXPECT_TRUE(measured_tuner_bandwidth_same_controls(v3, v3_auto)); /* V3c AUTO = boot state */
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::NooelecSmartV5, fm, 0u, &noe_auto));
+    EXPECT_TRUE(!measured_tuner_bandwidth_same_controls(noe, noe_auto));
+}
+
 int main(void)
 {
     test_detection_matrix();
@@ -858,6 +993,8 @@ int main(void)
     test_bandwidth_list_matches_count_and_plan();
     test_bandwidth_demod_if_records_read_after_write();
     test_v3c_auto_is_boot_state();
+    test_live_rate_bandwidth_policy();
+    test_live_rate_baseline_matches_start();
     test_matched_if_policy();
     test_v3_direct_transition_records();
     test_capability_matrix();

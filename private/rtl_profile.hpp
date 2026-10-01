@@ -159,7 +159,8 @@ inline uint32_t rtl_profile_library_capabilities(void)
            ESP_RTL_SDR_CAP_NEED | ESP_RTL_SDR_CAP_HEALTH | ESP_RTL_SDR_CAP_PASSPORT |
            ESP_RTL_SDR_CAP_DELIVERY_MODE | ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_BIAS_TEE |
            ESP_RTL_SDR_CAP_HF_UPCONVERTER | ESP_RTL_SDR_CAP_GAIN_AUTO |
-           ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH;
+           ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_TUNER_BANDWIDTH |
+           ESP_RTL_SDR_CAP_LIVE_RATE;
 }
 
 /**
@@ -182,6 +183,7 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
         /* Generic R820T2 identity includes the user-tested V3c, but does not
          * prove a bias circuit on every stick. Enable only by explicit API. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
+               ESP_RTL_SDR_CAP_LIVE_RATE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
                ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
                ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_BIAS_TEE |
@@ -191,6 +193,7 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
          * BlogV3 direct-Q or BlogV4 triplexer handling on this board. Gain
          * values are nominal PC requests, not calibrated analog dB. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
+               ESP_RTL_SDR_CAP_LIVE_RATE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
                ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
                ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_BIAS_TEE |
@@ -199,6 +202,7 @@ inline uint32_t rtl_profile_device_capabilities(RtlProfileId profile)
         /* First-party PC captures, 2026-09-30. Q bypasses tuner controls;
          * this board has no bias tee or V4 HF upconverter. P4 acceptance open. */
         return common | ESP_RTL_SDR_CAP_STREAM | ESP_RTL_SDR_CAP_RETUNE |
+               ESP_RTL_SDR_CAP_LIVE_RATE |
                ESP_RTL_SDR_CAP_SYNC_READ | ESP_RTL_SDR_CAP_PASSPORT |
                ESP_RTL_SDR_CAP_GAIN | ESP_RTL_SDR_CAP_GAIN_AUTO |
                ESP_RTL_SDR_CAP_RTL_AGC | ESP_RTL_SDR_CAP_DIRECT_SAMPLING |

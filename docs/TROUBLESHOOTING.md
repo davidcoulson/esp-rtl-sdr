@@ -50,7 +50,7 @@ Truth of claims: [`../PROJECT_TRUTH.md`](../PROJECT_TRUTH.md).
 | Symptom | Cause | Fix |
 |---|---|---|
 | Retune from IQ callback seems delayed | **Async queue** (0.7.3+) | Wait for `EVT_RETUNED`; OK by design |
-| Rate change while streaming | Phase 1: stop/start required | `ERR_BUSY` on `set_sample_rate` while streaming |
+| `set_sample_rate` from IQ callback returns `ERR_REENTRANT` | Live rate change blocks for an EP0 window | Call it from an app task (`CAP_LIVE_RATE`); no stop/start needed |
 | Crash after uninstall | Stale handle use | Set pointer NULL; expect `STALE_HANDLE` |
 
 ---
