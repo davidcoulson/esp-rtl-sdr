@@ -15,7 +15,8 @@ FUNCTIONS = """apply_freq_correction_hz encode_r820_pll tuner_i2c_value_for_hand
 map_tuner_record_for_profile run_record run_records run_profile_demod_if_restore
 run_v3_direct_tune run_v3_enter_direct run_v3_tuner_reinit run_v3_leave_direct
 run_tune run_profile_tune frontend_rf_hz apply_r820t2_gain_records apply_gain_records
-apply_tuner_agc_auto_records apply_rtl_agc_records run_bandwidth_program""".split()
+apply_tuner_agc_auto_records apply_rtl_agc_records run_bandwidth_program
+run_rate_if_program""".split()
 
 
 def extract(source, name):
@@ -67,6 +68,8 @@ struct esp_rtl_sdr_handle {
     uint8_t tuner_reg_val[32] = {}, tuner_reg05_low_bits = 3, tuner_reg07 = 0x75;
     esp_rtl_sdr_gain_mode_t gain_mode = ESP_RTL_SDR_GAIN_MODE_AUTO;
     int gain_tenth_db = 0;
+    uint32_t sample_rate_sps = ESP_RTL_SDR_RATE_2400K, rate_if_hz = 0;
+    bool bandwidth_applied_valid = false, pending_bandwidth = false;
 };
 static std::vector<RtlControlRecord> wire;
 static esp_err_t ctrl_submit(esp_rtl_sdr_handle *, uint8_t type, uint8_t,
@@ -129,7 +132,51 @@ static void q_route() {
         if (r.index == 0x0610 || r.index == 0x0600) CHECK((r.value & 0xff) == 0x34);
     }
 }
+static void pll_if(uint32_t rf, uint32_t if_hz) {
+    uint8_t s = 0, a = 0, r20 = 0, r21 = 0, r22 = 0;
+    CHECK(encode_r820_pll(rf, 28800000.0, double(if_hz), &s, &a, &r20, &r21, &r22));
+    CHECK(last_tuner(0x14) == r20 && last_tuner(0x15) == r21 && last_tuner(0x16) == r22);
+}
+static void rate_plan_trace() {
+    // Nooelec AUTO at 2048 kS/s: filter, demod IF and PLL IF follow the rate together.
+    esp_rtl_sdr_handle h; h.sample_rate_sps = 2048000;
+    CHECK(run_v3_tuner_reinit(&h) == ESP_OK); CHECK(run_profile_demod_if_restore(&h) == ESP_OK);
+    CHECK(run_rate_if_program(&h, 915000000, h.sample_rate_sps) == ESP_OK);
+    CHECK(h.rate_if_hz == 1750000); CHECK(last_tuner(10) == 0xc3 && last_tuner(11) == 0x8f);
+    if_bytes(0x3c, 0x1c, 0x72);
+    CHECK(run_profile_tune(&h, 915000000, 0) == ESP_OK); pll_if(915000000, 1750000);
+    CHECK(run_profile_tune(&h, 916000000, 915000000) == ESP_OK); pll_if(916000000, 1750000);
+    // Q and back: the reinit/3.57 MHz restore is re-matched to the rate before the PLL tune.
+    wire.clear(); CHECK(run_profile_tune(&h, 1600000, 916000000) == ESP_OK); q_route();
+    CHECK(h.rate_if_hz == 0);
+    wire.clear(); CHECK(run_profile_tune(&h, 915000000, 1600000) == ESP_OK);
+    CHECK(last_tuner(10) == 0xc3 && last_tuner(11) == 0x8f); if_bytes(0x3c, 0x1c, 0x72);
+    pll_if(915000000, 1750000); CHECK(h.rate_if_hz == 1750000);
+    records_seen(kBlogV3DirectDisable, std::size(kBlogV3DirectDisable));
+    // 250 kS/s: the narrowest librtlsdr filter.
+    h = {}; wire.clear(); h.sample_rate_sps = 250000;
+    CHECK(run_rate_if_program(&h, 433920000, h.sample_rate_sps) == ESP_OK);
+    CHECK(last_tuner(10) == 0xc3 && last_tuner(11) == 0xe8); if_bytes(0x3c, 0x38, 0xe4);
+    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_OK); pll_if(433920000, 1700000);
+    // An explicit bandwidth plan owns the IF; the PLL no longer uses the rate IF.
+    MeasuredTunerBandwidthPlan plan{}; CHECK(measured_tuner_bandwidth_plan(h.profile, 433920000, 500000, &plan));
+    CHECK(run_bandwidth_program(&h, 433920000, 433920000, plan) == ESP_OK);
+    CHECK(h.rate_if_hz == 0); pll_if(433920000, plan.if_hz); if_bytes(plan.if19, plan.if1a, plan.if1b);
+    h.pending_bandwidth = true; wire.clear();
+    CHECK(run_rate_if_program(&h, 433920000, h.sample_rate_sps) == ESP_OK); CHECK(wire.empty());
+    // 2.4 MS/s: captured state unchanged (cold d3/6b, 3.57 MHz everywhere).
+    h = {}; wire.clear();
+    CHECK(run_v3_tuner_reinit(&h) == ESP_OK); CHECK(run_profile_demod_if_restore(&h) == ESP_OK);
+    CHECK(run_rate_if_program(&h, 915000000, h.sample_rate_sps) == ESP_OK); CHECK(h.rate_if_hz == 0);
+    CHECK(run_profile_tune(&h, 915000000, 0) == ESP_OK);
+    CHECK(last_tuner(10) == 0xd3 && last_tuner(11) == 0x6b); if_bytes(0x38, 0x11, 0x12);
+    pll_if(915000000, 3570000);
+    // Q route: nothing to program.
+    h = {}; wire.clear(); h.sample_rate_sps = 2048000;
+    CHECK(run_rate_if_program(&h, 1600000, h.sample_rate_sps) == ESP_OK); CHECK(wire.empty());
+}
 int main() {
+    rate_plan_trace();
     esp_rtl_sdr_handle h;
     CHECK(run_v3_tuner_reinit(&h) == ESP_OK);
     gain(0x83, 0x75, 0xf0); CHECK(last_tuner(10) == 0xd3 && last_tuner(11) == 0x6b);

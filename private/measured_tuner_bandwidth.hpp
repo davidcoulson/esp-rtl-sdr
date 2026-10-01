@@ -123,6 +123,66 @@ inline void measured_bandwidth_demod_if_records(
     out[5] = settle_read;
 }
 
+/* R820T2 IF filter and IF for a sample rate, as librtlsdr's r82xx_set_bandwidth() picks them when
+ * the tuner bandwidth is left automatic (bandwidth = sample rate). Not a vendor capture: this is
+ * librtlsdr's table. librtlsdr writes reg 0x0a under mask 0x10 and reg 0x0b under mask 0xef; the
+ * RTL2832 demod IF and the PLL LO (RF + IF) follow if_hz. */
+struct R820T2IfSetting {
+    uint8_t reg0a;
+    uint8_t reg0b;
+    uint32_t if_hz;
+};
+
+inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps)
+{
+    constexpr uint32_t kBwKhz[] = {300, 450, 600, 900, 1100, 1200, 1300, 1500, 1800, 2200, 3000, 5000};
+    constexpr uint8_t kReg0b[] = {0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xaf, 0x8f, 0x6f, 0x6f};
+    constexpr uint32_t kIfKhz[] = {1700, 1650, 1600, 1500, 1400, 1350, 1320, 1270, 1600, 1750, 2000, 3570};
+    constexpr size_t kCount = sizeof(kBwKhz) / sizeof(kBwKhz[0]);
+    const uint32_t bw_khz = sample_rate_sps / 1000u;
+    if (bw_khz > 7000u) return {0x10, 0x0b, 4570000u};
+    if (bw_khz > 6000u) return {0x10, 0x2a, 4570000u};
+    if (bw_khz > 5000u) return {0x10, 0x6b, 3570000u};
+    size_t i = 0;
+    while (i + 1 < kCount && bw_khz > kBwKhz[i]) ++i;
+    return {static_cast<uint8_t>(i + 1 == kCount ? 0x00 : 0x0f), kReg0b[i], kIfKhz[i] * 1000u};
+}
+
+/* RTL2832 demod IF word (page 1 regs 0x19..0x1b), librtlsdr's rtlsdr_set_if_freq() arithmetic.
+ * Reproduces the captured 3.57, 2.125, 2.025, 1.815, 1.75 and 1.7 MHz bytes (host-tested). */
+inline uint32_t rtl_demod_if_word(uint32_t if_hz, uint32_t xtal_hz = ESP_RTL_SDR_XTAL_HZ)
+{
+    const int64_t v = (static_cast<int64_t>(if_hz) << 22) / static_cast<int64_t>(xtal_hz);
+    return static_cast<uint32_t>(-v) & 0x3fffffu;
+}
+
+/* Nooelec cold-reinit filter registers (the mapped reinit slice ends at d3/6b; host-tested). */
+constexpr uint8_t kNooelecColdReg0a = 0xd3;
+constexpr uint8_t kNooelecColdReg0b = 0x6b;
+
+/* Nooelec SMArt v5 only: the filter, PLL IF and demod IF for a sample rate with no captured plan.
+ * The vendor captures cover 2.4 MS/s only, so every other rate otherwise runs the cold 6 MHz-class
+ * filter (d3/6b) with the 3.57 MHz IF. Returns false, leaving the captured behaviour in charge,
+ * when: the profile is not Nooelec, the rate is 2.4 MS/s, the RF is on the Q route (tuner
+ * bypassed), or an explicit tuner bandwidth is applied or pending. requested_hz is 0 (AUTO).
+ * The filter bytes are librtlsdr's masked writes applied to the cold d3/6b. */
+inline bool rtl_rate_if_plan(RtlProfileId profile, uint32_t sample_rate_sps, uint32_t rf_hz,
+                             bool explicit_bandwidth, MeasuredTunerBandwidthPlan *out)
+{
+    if (out == nullptr || profile != RtlProfileId::NooelecSmartV5 || sample_rate_sps == 0 ||
+        sample_rate_sps == ESP_RTL_SDR_RATE_2400K || explicit_bandwidth ||
+        rtl_profile_uses_v3_direct_sampling(profile, rf_hz))
+        return false;
+    const R820T2IfSetting st = rtl_r820t2_if_for_rate(sample_rate_sps);
+    const uint32_t word = rtl_demod_if_word(st.if_hz);
+    *out = {0u, st.if_hz,
+            static_cast<uint8_t>((kNooelecColdReg0a & ~0x10u) | (st.reg0a & 0x10u)),
+            static_cast<uint8_t>((kNooelecColdReg0b & ~0xefu) | (st.reg0b & 0xefu)),
+            static_cast<uint8_t>((word >> 16) & 0x3fu), static_cast<uint8_t>(word >> 8),
+            static_cast<uint8_t>(word)};
+    return true;
+}
+
 enum class RtlBandwidthCommitResult : uint8_t { Applied, RolledBack, Fault };
 
 template <typename Writer>

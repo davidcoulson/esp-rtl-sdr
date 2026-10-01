@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Nooelec SMArt v5: the tuner IF filter and IF follow the sample rate when no captured
+  plan applies.** The vendor captures cover 2.4 MS/s only; at every other rate the
+  Nooelec ran the cold `d3/6b` filter with the 3.57 MHz IF. With tuner bandwidth AUTO,
+  at a rate other than 2.4 MS/s and on the native route, the driver now programs
+  librtlsdr's `r82xx_set_bandwidth()` choice for bandwidth = sample rate (e.g. 250 kS/s:
+  `c3/e8`, 1.70 MHz IF; 2048 kS/s: `c3/8f`, 1.75 MHz IF) and moves the RTL2832 demod IF
+  and the PLL LO with it, so the three never disagree. It is applied at stream start and
+  re-applied after returning from Q sampling (whose reinit restores `d3/6b` / 3.57 MHz).
+  2.4 MS/s, explicit tuner bandwidths, Q mode and the Blog V3/V4/V4L profiles are
+  unchanged. Field evidence is from the reporter's fork on an ESP32-P4 at 915 MHz /
+  2048 kS/s; this port onto 0.9.2 is host-tested only.
+
 ## 0.9.2 (2026-09-30) — capture-derived Nooelec SMArt v5 profile
 
 ### Nooelec NESDR SMArt v5 profile

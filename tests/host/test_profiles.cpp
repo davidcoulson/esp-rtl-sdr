@@ -804,6 +804,8 @@ static void test_nooelec_captured_programming(void)
     EXPECT_EQ_U(filter_patches, 2u);
     EXPECT_EQ_U(cold0a, 0xd3);
     EXPECT_EQ_U(cold0b, 0x6b);
+    EXPECT_EQ_U(cold0a, kNooelecColdReg0a); /* the rate plan's base filter bytes */
+    EXPECT_EQ_U(cold0b, kNooelecColdReg0b);
     for (const auto &old : kRtlCleanupTransfers) {
         const auto n = rtl_profile_map_tuner_record(noo, old);
         EXPECT_TRUE(std::memcmp(n.data, old.data, sizeof(n.data)) == 0);
@@ -846,6 +848,92 @@ static void test_nooelec_captured_programming(void)
     }
 }
 
+static void test_r820t2_if_for_rate(void)
+{
+    /* librtlsdr r82xx_set_bandwidth() with bandwidth = sample rate */
+    R820T2IfSetting s = rtl_r820t2_if_for_rate(250000u);
+    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0xe8u); EXPECT_EQ_U(s.if_hz, 1700000u);
+    s = rtl_r820t2_if_for_rate(1024000u);
+    EXPECT_EQ_U(s.reg0b, 0xecu); EXPECT_EQ_U(s.if_hz, 1400000u);
+    s = rtl_r820t2_if_for_rate(2048000u);
+    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0x8fu); EXPECT_EQ_U(s.if_hz, 1750000u);
+    s = rtl_r820t2_if_for_rate(2560000u);
+    EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 2000000u);
+    s = rtl_r820t2_if_for_rate(3200000u);
+    EXPECT_EQ_U(s.reg0a, 0x00u); EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 3570000u);
+    s = rtl_r820t2_if_for_rate(6000000u);
+    EXPECT_EQ_U(s.reg0a, 0x10u); EXPECT_EQ_U(s.reg0b, 0x6bu); EXPECT_EQ_U(s.if_hz, 3570000u);
+    /* The demod IF arithmetic reproduces every captured IF byte triple: the init
+     * table's 3.57 MHz and X
+    EXPECT_EQ_U(rtl_demod_if_word(3570000u, 28800000u), 0x381112u);
+    EXPECT_EQ_U(rtl_demod_if_word(3570000u), 0x381112u);
+    EXPECT_EQ_U(rtl_demod_if_word(2125000u), 0x3b471du);
+    EXPECT_EQ_U(rtl_demod_if_word(2025000u), 0x3b8000u);
+    EXPECT_EQ_U(rtl_demod_if_word(1815000u), 0x3bf778u); /* demod bytes are 1.815 MHz even */
+    EXPECT_EQ_U(rtl_demod_if_word(1750000u), 0x3c1c72u);
+    EXPECT_EQ_U(rtl_demod_if_word(1700000u), 0x3c38e4u);
+}
+
+/* The rate plan is Nooelec-only, AUTO-only, native-route-only and never at 2.4 MS/s,
+ * where the vendor captures (and upstream's plans) stay in charge. */
+static void test_nooelec_rate_if_plan_scope(void)
+{
+    constexpr auto noo = RtlProfileId::NooelecSmartV5;
+    MeasuredTunerBandwidthPlan p{};
+
+    /* Nooelec + AUTO + a rate without a captured plan: filter, PLL IF and demod IF agree. */
+    struct RateCase { uint32_t sps; uint8_t r0a, r0b; uint32_t if_hz; };
+    constexpr RateCase rates[] = {
+        {250000u, 0xc3, 0xe8, 1700000u},  {960000u, 0xc3, 0xec, 1400000u},
+        {1024000u, 0xc3, 0xec, 1400000u}, {1800000u, 0xc3, 0xaf, 1600000u},
+        {2048000u, 0xc3, 0x8f, 1750000u}, {2560000u, 0xc3, 0x6f, 2000000u},
+        {3200000u, 0xc3, 0x6f, 3570000u},
+    };
+    for (const auto &c : rates) {
+        for (uint32_t rf : {24000000u, 433920000u, 915000000u}) {
+            p = {};
+            EXPECT_TRUE(rtl_rate_if_plan(noo, c.sps, rf, false, &p));
+            EXPECT_EQ_U(p.requested_hz, 0u);
+            EXPECT_EQ_U(p.reg0a, c.r0a);
+            EXPECT_EQ_U(p.reg0b, c.r0b);
+            EXPECT_EQ_U(p.if_hz, c.if_hz);
+            const uint32_t word = rtl_demod_if_word(p.if_hz);
+            EXPECT_EQ_U(p.if19, (word >> 16) & 0x3fu);
+            EXPECT_EQ_U(p.if1a, (word >> 8) & 0xffu);
+            EXPECT_EQ_U(p.if1b, word & 0xffu);
+        }
+    }
+    EXPECT_TRUE(rtl_rate_if_plan(noo, 2048000u, 915000000u, false, &p));
+    EXPECT_EQ_U(p.if19, 0x3cu); EXPECT_EQ_U(p.if1a, 0x1cu); EXPECT_EQ_U(p.if1b, 0x72u);
+
+    /* 2.4 MS/s keeps upstream's captured state: no rate plan, the bandwidth plans apply. */
+    EXPECT_TRUE(!rtl_rate_if_plan(noo, ESP_RTL_SDR_RATE_2400K, 915000000u, false, &p));
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(noo, 915000000u, 0u, &p));
+    EXPECT_EQ_U(p.reg0a, 0xc3u); EXPECT_EQ_U(p.reg0b, 0x8fu); EXPECT_EQ_U(p.if_hz, 1814972u);
+
+    /* An explicit tuner bandwidth (applied or pending) wins at any rate. */
+    for (uint32_t sps : {250000u, 2048000u, 2400000u}) {
+        EXPECT_TRUE(!rtl_rate_if_plan(noo, sps, 915000000u, true, &p));
+    }
+    /* Q route: tuner bypassed, nothing to follow. Rate 0: not known yet. */
+    EXPECT_TRUE(!rtl_rate_if_plan(noo, 2048000u, 23999999u, false, &p));
+    EXPECT_TRUE(!rtl_rate_if_plan(noo, 2048000u, 1600000u, false, &p));
+    EXPECT_TRUE(!rtl_rate_if_plan(noo, 0u, 915000000u, false, &p));
+    EXPECT_TRUE(!rtl_rate_if_plan(noo, 2048000u, 915000000u, false, nullptr));
+
+    /* Other profiles are unchanged at every rate. */
+    for (auto other : {RtlProfileId::BlogV3, RtlProfileId::BlogV4, RtlProfileId::BlogV4L,
+                       RtlProfileId::Unknown}) {
+        for (uint32_t sps : {250000u, 1024000u, 2048000u, 2400000u, 3200000u}) {
+            EXPECT_TRUE(!rtl_rate_if_plan(other, sps, 915000000u, false, &p));
+        }
+    }
+    /* Profile defaults are untouched: 3.57 MHz on V3/Nooelec, 1.815 MHz on V4/V4L. */
+    EXPECT_EQ_U((uint32_t)rtl_profile_pll_if_offset_hz(noo), 3570000u);
+    EXPECT_EQ_U((uint32_t)rtl_profile_pll_if_offset_hz(RtlProfileId::BlogV3), 3570000u);
+    EXPECT_EQ_U((uint32_t)rtl_profile_pll_if_offset_hz(RtlProfileId::BlogV4L), 1814972u);
+}
+
 int main(void)
 {
     test_detection_matrix();
@@ -864,6 +952,8 @@ int main(void)
     test_profile_transition_matrix();
     test_blog_v4l_identity();
     test_nooelec_captured_programming();
+    test_r820t2_if_for_rate();
+    test_nooelec_rate_if_plan_scope();
     std::printf("RESULT profiles passed=%d failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

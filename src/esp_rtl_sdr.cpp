@@ -437,6 +437,10 @@ struct esp_rtl_sdr_handle {
     MeasuredTunerBandwidthPlan bandwidth_applied{};
     uint32_t bandwidth_applied_rf_hz = 0;
     bool bandwidth_applied_valid = false;
+    /** Nooelec: PLL IF of the rate plan (rtl_rate_if_plan) the tuner filter and demod IF are
+     *  currently programmed for; 0 = not programmed, the PLL uses the profile IF. Cleared by
+     *  anything that rewrites the filter or demod IF, so the PLL can never run a stale IF. */
+    uint32_t rate_if_hz = 0;
     uint8_t tuner_reg05_low_bits = 0x03;
     uint8_t tuner_reg07 = 0x75;
     MeasuredV4FrontendPlan frontend_applied{};
@@ -754,6 +758,7 @@ static void clear_profile_runtime_state(esp_rtl_sdr_handle *h)
     h->bandwidth_applied = {};
     h->bandwidth_applied_rf_hz = 0;
     h->bandwidth_applied_valid = false;
+    h->rate_if_hz = 0;
     h->passport = {};
     h->passport_valid = false;
 }
@@ -1214,6 +1219,7 @@ static esp_err_t run_profile_demod_if_restore(esp_rtl_sdr_handle *h)
      * repeater, so if they are fast the repeater is the cost and the fix
      * is fewer tuner writes, not lower latency. */
     const int64_t t_if0 = esp_timer_get_time();
+    h->rate_if_hz = 0; /* demod IF goes back to the profile IF */
     for (size_t i = kRtlStandardIfFirst; i <= kRtlStandardIfLast; ++i) {
         esp_err_t e = run_record(h, kRtlInitTransfers[i], false);
         if (e != ESP_OK) {
@@ -1260,6 +1266,7 @@ static esp_err_t run_v3_direct_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz
 
 static esp_err_t run_v3_enter_direct(esp_rtl_sdr_handle *h, uint32_t frequency_hz)
 {
+    h->rate_if_hz = 0; /* 0x19..0x1b carry the Q NCO from here on */
     for (size_t i = 0; i <= kRtlTunerCleanupLast; ++i) {
         esp_err_t err = run_record(h, kRtlCleanupTransfers[i], false);
         if (err != ESP_OK) {
@@ -1283,6 +1290,7 @@ static esp_err_t apply_tuner_agc_auto_records(esp_rtl_sdr_handle *h);
 
 static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 {
+    h->rate_if_hz = 0; /* the reinit slice rewrites the 0x0a/0x0b filter */
     for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
         esp_err_t err = run_record(h, kRtlInitTransfers[i], false);
         if (err != ESP_OK) {
@@ -1333,6 +1341,36 @@ static bool hf_direct_route(const esp_rtl_sdr_handle *h, uint32_t rf_hz)
 }
 
 /**
+ * Nooelec: program the tuner IF filter and the RTL2832 demod IF for the sample rate when
+ * rtl_rate_if_plan() applies (AUTO bandwidth, a rate without a captured plan, native route), and
+ * record the IF so run_tune() puts the LO at RF + that IF. No-op otherwise. The caller tunes
+ * next; filter, demod IF and PLL IF are then one plan. Runs with IQ paused or not yet started.
+ */
+static esp_err_t run_rate_if_program(esp_rtl_sdr_handle *h, uint32_t rf_hz,
+                                     uint32_t sample_rate_sps)
+{
+    MeasuredTunerBandwidthPlan plan{};
+    if (!rtl_rate_if_plan(h->profile, sample_rate_sps, rf_hz,
+                          h->bandwidth_applied_valid || h->pending_bandwidth, &plan)) {
+        return ESP_OK;
+    }
+    h->rate_if_hz = 0;
+    esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn, std::size(kBlogV3TunerRepeaterOn));
+    if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0a, plan.reg0a), false);
+    if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0b, plan.reg0b), false);
+    if (err != ESP_OK) return err;
+    RtlControlRecord demod_if[kMeasuredBandwidthDemodIfRecordCount];
+    measured_bandwidth_demod_if_records(plan, demod_if);
+    err = run_records(h, demod_if, std::size(demod_if));
+    if (err != ESP_OK) return err;
+    h->rate_if_hz = plan.if_hz;
+    ESP_LOGI(TAG, "%s IF follows rate %u S/s: filter r0a=%02x r0b=%02x if=%u Hz demod=%02x%02x%02x",
+             rtl_profile_name(h->profile), static_cast<unsigned>(sample_rate_sps), plan.reg0a,
+             plan.reg0b, static_cast<unsigned>(plan.if_hz), plan.if19, plan.if1a, plan.if1b);
+    return ESP_OK;
+}
+
+/**
  * Program R828D PLL for *user RF* frequency_hz.
  * Blog V4 HF (public): RF < 28.8 MHz is upconverted by 28.8 MHz before the tuner.
  * User-facing metrics keep RF; only the PLL pack uses tuner_hz.
@@ -1354,7 +1392,9 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
     uint8_t r16_setup = 0, r16_active = 0, r20 = 0, r21 = 0, r22 = 0;
     const double xtal_hz = rtl_profile_pll_xtal_hz(profile);
     const double if_offset_hz = tuner_if_hz != 0 ? static_cast<double>(tuner_if_hz)
-                                                  : rtl_profile_pll_if_offset_hz(profile);
+                              : (h != nullptr && h->rate_if_hz != 0)
+                                  ? static_cast<double>(h->rate_if_hz)
+                                  : rtl_profile_pll_if_offset_hz(profile);
     if (!encode_r820_pll(tune_hz, xtal_hz, if_offset_hz, &r16_setup, &r16_active, &r20, &r21,
                          &r22)) {
         return ESP_RTL_SDR_ERR_BAD_FREQ;
@@ -1460,6 +1500,14 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
                           std::size(kBlogV3TunerRepeaterOn));
         if (err != ESP_OK) {
             return err;
+        }
+        /* leave_direct replayed the cold filter and the 3.57 MHz demod IF. Without an explicit
+         * IF from the caller, re-match filter and demod IF to the rate before the PLL tune. */
+        if (tuner_if_hz == 0) {
+            err = run_rate_if_program(h, frequency_hz, h->sample_rate_sps);
+            if (err != ESP_OK) {
+                return err;
+            }
         }
         err = run_tune(h, frequency_hz, tuner_if_hz);
         if (err == ESP_OK) {
@@ -1600,6 +1648,7 @@ static esp_err_t run_bandwidth_program(esp_rtl_sdr_handle *h, uint32_t rf_hz,
                                        uint32_t previous_rf_hz,
                                        const MeasuredTunerBandwidthPlan &plan)
 {
+    h->rate_if_hz = 0; /* an explicit plan owns filter, PLL IF and demod IF */
     if (previous_rf_hz != 0 &&
         rtl_profile_uses_v3_direct_sampling(h->profile, previous_rf_hz)) {
         const esp_err_t leave = run_v3_leave_direct(h);
@@ -3706,6 +3755,7 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->pending_bandwidth = false;
     h->bandwidth_applied_valid = false;
     h->bandwidth_requested_hz = 0;
+    h->rate_if_hz = 0;
 
     /* Same order as bulk_pause_and_drain (shared drain_live_urbs): poll natural
      * completions first, halt/flush/clear only if still live, poll again.
@@ -3943,7 +3993,9 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
             measured_tuner_bandwidth_count(handle->profile, freq, hf_direct_route(handle, freq)) != 0) {
             ret = apply_bandwidth_transaction(handle, freq, 0);
         } else {
-            ret = run_profile_tune(handle, freq, 0);
+            /* Nooelec at a rate without a captured plan: filter and IF follow the rate. */
+            ret = run_rate_if_program(handle, freq, local.sample_rate_sps);
+            if (ret == ESP_OK) ret = run_profile_tune(handle, freq, 0);
             if (ret == ESP_OK) ret = run_band_frontend(handle, freq);
         }
         if (ret != ESP_OK) {
