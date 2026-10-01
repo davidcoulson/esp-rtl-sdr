@@ -403,6 +403,23 @@ inline uint32_t rtl_demod_if_word(uint32_t if_hz, uint32_t xtal_hz)
 }
 
 /** Non-zero only when initialization must restore a profile-specific demod IF. */
+/**
+ * Register 0x0c (VGA gain) for the shared tune template on an R820T2 profile.
+ * The template (kRtlFinalTuneTemplate, record 6) writes the manual-gain value
+ * 0x68 on every tune; once AUTO gain has been applied that would drop the VGA
+ * from 26.5 dB (0x6b, librtlsdr's fixed AUTO setting) to 16.3 dB after the
+ * first retune. Keep 0x6b while AUTO is in effect, otherwise the template's
+ * value. Other profiles always keep the template's value.
+ */
+constexpr size_t kRtlFinalTuneReg0cIndex = 6;
+
+inline uint8_t rtl_r820t2_tune_reg0c(RtlProfileId profile, bool tuner_auto_applied,
+                                     uint8_t template_value)
+{
+    return (rtl_profile_uses_r820t2_i2c_remap(profile) && tuner_auto_applied) ? 0x6b
+                                                                             : template_value;
+}
+
 inline uint32_t rtl_profile_demod_if_restore_hz(RtlProfileId profile)
 {
     return (profile == RtlProfileId::BlogV3 || profile == RtlProfileId::NooelecSmartV5)

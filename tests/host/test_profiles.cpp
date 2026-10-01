@@ -452,8 +452,24 @@ static void test_r82xx_bitrev(void)
     }
 }
 
+static void test_r820t2_tune_keeps_auto_vga(void)
+{
+    /* Record 6 of the tune template must be the 0x0c write this helper patches */
+    EXPECT_EQ_U(kRtlFinalTuneTemplate[kRtlFinalTuneReg0cIndex].data[0], 0x0cu);
+    const uint8_t tmpl = kRtlFinalTuneTemplate[kRtlFinalTuneReg0cIndex].data[1];
+    EXPECT_EQ_U(tmpl, 0x68u);
+    /* AUTO applied: both R820T2 profiles keep librtlsdr's fixed AUTO VGA */
+    EXPECT_EQ_U(rtl_r820t2_tune_reg0c(RtlProfileId::NooelecSmartV5, true, tmpl), 0x6bu);
+    EXPECT_EQ_U(rtl_r820t2_tune_reg0c(RtlProfileId::BlogV3, true, tmpl), 0x6bu);
+    /* No AUTO (manual or never set): the template's value */
+    EXPECT_EQ_U(rtl_r820t2_tune_reg0c(RtlProfileId::NooelecSmartV5, false, tmpl), 0x68u);
+    /* Not an R820T2 remap profile: untouched even with AUTO */
+    EXPECT_EQ_U(rtl_r820t2_tune_reg0c(RtlProfileId::BlogV4, true, tmpl), 0x68u);
+}
+
 int main(void)
 {
+    test_r820t2_tune_keeps_auto_vga();
     test_r820t2_band_select();
     test_r820t2_if_for_rate();
     test_r82xx_bitrev();
