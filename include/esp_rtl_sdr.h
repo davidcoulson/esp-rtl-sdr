@@ -985,7 +985,8 @@ esp_err_t esp_rtl_sdr_get_center_freq(esp_rtl_sdr_handle_t handle, uint32_t *out
  *   the window; returns ESP_OK at once if another EP0 window is open, and the
  *   delivery task applies the request after it. get_sample_rate() reports the
  *   new rate once applied. A failed attempt is returned and retried by the
- *   delivery task, up to 3 attempts in all.
+ *   delivery task, up to 3 attempts in all; after the third the stream goes
+ *   to FAULT (stop, then start again).
  *   Not callable from the event callback (ERR_REENTRANT).
  * - STOPPING: returns ERR_BUSY.
  */

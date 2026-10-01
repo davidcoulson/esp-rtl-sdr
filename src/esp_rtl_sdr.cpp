@@ -2180,7 +2180,8 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
  * would leave at the new rate (rtl_rate_change_bandwidth), resubmit bulk.
  *
  * A failure keeps the request pending, with bulk resumed, so the delivery task runs the whole
- * sequence again; it is dropped after kRtlRateChangeMaxAttempts failures in a row. Must NOT run on
+ * sequence again. After kRtlRateChangeMaxAttempts failures in a row the stream goes to FAULT
+ * (streaming stops), since the resampler may no longer match sample_rate_sps. Must NOT run on
  * the USB client/host lib tasks. Coalesces like apply_pending_retune().
  */
 static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
@@ -2283,13 +2284,22 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
                  static_cast<unsigned>(apply), esp_rtl_sdr_err_to_name(err),
                  static_cast<unsigned>(h->pending_rate_failures));
     } else {
-        RTL_LOGE(h, "live sample rate %u S/s failed: %s; giving up after %u attempts",
+        /* The resampler may hold the new rate while sample_rate_sps still says the old one.
+         * Rather than stream at a rate the driver cannot vouch for, fault the stream the way a
+         * failed bandwidth transaction does; the app sees FAULT and stops/starts. Bulk stays
+         * paused (already drained). */
+        RTL_LOGE(h, "live sample rate %u S/s failed: %s; giving up after %u attempts, "
+                    "resampler state unknown, stream faulted",
                  static_cast<unsigned>(apply), esp_rtl_sdr_err_to_name(err),
                  static_cast<unsigned>(h->pending_rate_failures));
+        h->pending_rate_sps = 0;
         h->pending_rate_failures = 0;
-        if (h->pending_rate_sps == apply) {
-            h->pending_rate_sps = 0;
-        }
+        h->state = ESP_RTL_SDR_STATE_FAULT;
+        h->streaming = false;
+        h->pause_resubmit = true;
+        set_error_unlocked(h, ESP_RTL_SDR_ERR_FAULT);
+        h->ep0_sideband_busy = false;
+        return ESP_RTL_SDR_ERR_FAULT;
     }
 
     bulk_resume(h);

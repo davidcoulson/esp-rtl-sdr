@@ -201,8 +201,8 @@ inline RtlRateChangeBandwidth rtl_rate_change_bandwidth(RtlProfileId profile,
 }
 
 /* A failed live rate change stays pending and the delivery task runs the whole sequence again.
- * After this many failed attempts in a row the request is dropped; the driver then still reports
- * the last rate it applied, although the resampler may already have been rewritten. */
+ * After this many failed attempts in a row the stream goes to FAULT: the resampler may already
+ * hold the new rate while the driver reports the old one, so streaming on would be unvouched. */
 constexpr uint8_t kRtlRateChangeMaxAttempts = 3;
 
 constexpr bool rtl_rate_change_retry(uint8_t failed_attempts)

@@ -7,7 +7,8 @@
   the same paused-bulk EP0 window (`ep0_sideband_busy`) as hot retune and
   sideband writes, so `stop` waits for it, and it leaves the tuner-bandwidth
   state as `start` at the new rate would. A failed change is retried by the
-  delivery task, up to 3 attempts. New capability bit `ESP_RTL_SDR_CAP_LIVE_RATE`.
+  delivery task, up to 3 attempts; after that the stream goes to `FAULT`.
+  New capability bit `ESP_RTL_SDR_CAP_LIVE_RATE`.
   See the [API reference](docs/API_REFERENCE.md#esp_rtl_sdr_set_sample_rate--get_sample_rate).
 
 ## 0.9.2 (2026-09-30) — capture-derived Nooelec SMArt v5 profile

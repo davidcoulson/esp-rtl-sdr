@@ -1056,9 +1056,10 @@ progress. Inside the window:
 | Same rate, nothing pending | `ESP_OK`, no USB traffic |
 
 A failed attempt leaves the request pending and the delivery task runs the whole
-sequence again, up to 3 attempts in all; then the request is dropped and
-`get_sample_rate` keeps the last applied rate. A newer request replaces a pending
-one. `apply_need` still returns **`ERR_BUSY`** while streaming.
+sequence again, up to 3 attempts in all. If the third attempt fails, the stream
+goes to **`FAULT`** with `ERR_FAULT` (the resampler may already hold the new rate
+while the driver reports the old one); `stop` and `start` again to recover. A
+newer request replaces a pending one. `apply_need` still returns **`ERR_BUSY`** while streaming.
 
 ### `esp_rtl_sdr_read`
 

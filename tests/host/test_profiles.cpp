@@ -904,7 +904,7 @@ static void test_live_rate_bandwidth_policy(void)
     EXPECT_TRUE(!measured_tuner_bandwidth_baseline(RtlProfileId::NooelecSmartV5, hf_q, &none));
     EXPECT_TRUE(!measured_tuner_bandwidth_baseline(RtlProfileId::Unknown, fm, &none));
 
-    /* Retry: three attempts in all. */
+    /* Retry: three attempts in all; the third failure faults the stream. */
     EXPECT_TRUE(rtl_rate_change_retry(1));
     EXPECT_TRUE(rtl_rate_change_retry(2));
     EXPECT_TRUE(!rtl_rate_change_retry(3));
