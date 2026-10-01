@@ -166,9 +166,9 @@ static void test_frequency_policy(void)
     EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::BlogV4, 23999u));
     EXPECT_TRUE(rtl_profile_uses_v4_hf_routing(RtlProfileId::BlogV4));
 
-    /* Nooelec: reject < 24 MHz; no V4 HF LO offset / routing. */
-    EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 10000000u));
-    EXPECT_TRUE(!rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 23999999u));
+    /* Nooelec: independently captured Q route; no V4 HF LO offset / routing. */
+    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 10000000u));
+    EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 23999999u));
     EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 24000000u));
     EXPECT_TRUE(rtl_profile_supports_rf_hz(RtlProfileId::NooelecSmartV5, 100000000u));
     EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(RtlProfileId::NooelecSmartV5, 100000000u),
@@ -460,7 +460,7 @@ static void test_bandwidth_plan_and_rollback(void)
                                                 200000u, &p));
     EXPECT_TRUE(!measured_tuner_bandwidth_plan(RtlProfileId::BlogV4, 96100000u,
                                                 400000u, &p));
-    EXPECT_TRUE(!measured_tuner_bandwidth_plan(RtlProfileId::NooelecSmartV5,
+    EXPECT_TRUE(measured_tuner_bandwidth_plan(RtlProfileId::NooelecSmartV5,
                                                 96100000u, 0u, &p));
     EXPECT_EQ_U(measured_tuner_bandwidth_count(RtlProfileId::BlogV4L, 1280000u), 4u);
     EXPECT_EQ_U(measured_tuner_bandwidth_count(RtlProfileId::BlogV3, 1280000u), 0u);
@@ -496,7 +496,7 @@ static void test_matched_if_policy(void)
     EXPECT_EQ_U(rtl_profile_demod_if_restore_hz(RtlProfileId::BlogV4L), 0u);
     /* Nooelec's init table selects the standard 3.57 MHz demodulator IF. */
     EXPECT_EQ_U((uint32_t)rtl_profile_pll_if_offset_hz(RtlProfileId::NooelecSmartV5), 3570000u);
-    EXPECT_EQ_U(rtl_profile_demod_if_restore_hz(RtlProfileId::NooelecSmartV5), 0u);
+    EXPECT_EQ_U(rtl_profile_demod_if_restore_hz(RtlProfileId::NooelecSmartV5), 3570000u);
 
     const uint16_t values[] = {0x1920, 0x0120, 0x1a20, 0x0120, 0x1b20, 0x0120};
     const uint16_t indices[] = {0x0011, 0x000a, 0x0011, 0x000a, 0x0011, 0x000a};
@@ -538,7 +538,7 @@ static void test_v3_direct_transition_records(void)
     EXPECT_TRUE(rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV3, 99100000u));
     EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV3, 23999999u));
     EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::BlogV4, 99100000u));
-    EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(RtlProfileId::NooelecSmartV5,
+    EXPECT_TRUE(rtl_profile_needs_cold_tuner_reinit(RtlProfileId::NooelecSmartV5,
                                                      99100000u));
 
     uint8_t full_tail_reg05 = 0;
@@ -631,9 +631,12 @@ static void test_capability_matrix(void)
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_STREAM) != 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_RETUNE) != 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_HF_UPCONVERTER) == 0);
-    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_GAIN) == 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_GAIN) != 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_GAIN_AUTO) != 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_RTL_AGC) != 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_TUNER_BANDWIDTH) != 0);
     EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_BIAS_TEE) == 0);
-    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) == 0);
+    EXPECT_TRUE((noe & ESP_RTL_SDR_CAP_DIRECT_SAMPLING) != 0);
 
     EXPECT_EQ_U(unk, 0);
     EXPECT_EQ_U(esp_rtl_sdr_get_capabilities(), rtl_profile_library_capabilities());
@@ -752,6 +755,97 @@ static void test_blog_v4l_identity(void)
     EXPECT_TRUE(!rtl_profile_allows_init_record(RtlProfileId::BlogV4L, vendor));
 }
 
+static void test_nooelec_captured_programming(void)
+{
+    constexpr auto noo = RtlProfileId::NooelecSmartV5;
+    EXPECT_TRUE(!rtl_profile_supports_rf_hz(noo, 60000u)); /* exploratory capture */
+    EXPECT_TRUE(!rtl_profile_supports_rf_hz(noo, 99999u));
+    EXPECT_TRUE(rtl_profile_supports_rf_hz(noo, 100000u));
+    EXPECT_TRUE(rtl_profile_supports_rf_hz(noo, 1750000000u));
+    EXPECT_TRUE(!rtl_profile_supports_rf_hz(noo, 1750000001u));
+    for (uint32_t rf : {1280000u, 1600000u, 10000000u, 23999999u}) {
+        EXPECT_TRUE(rtl_profile_uses_v3_direct_sampling(noo, rf));
+        EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(noo, rf), 0u);
+        EXPECT_TRUE(!rtl_profile_needs_cold_tuner_reinit(noo, rf));
+        EXPECT_EQ_U(measured_tuner_bandwidth_count(noo, rf), 0u);
+    }
+    for (uint32_t rf : {24000000u, 28799999u, 28800000u, 28800001u, 99100000u}) {
+        EXPECT_TRUE(!rtl_profile_uses_v3_direct_sampling(noo, rf));
+        EXPECT_EQ_U(rtl_profile_tuner_frequency_hz(noo, rf), rf);
+        EXPECT_TRUE(rtl_profile_needs_cold_tuner_reinit(noo, rf));
+        EXPECT_EQ_U(measured_tuner_bandwidth_count(noo, rf), 7u);
+    }
+
+    /* controls frames 797..909 / 1765..1877: all 57 reinit records match
+     * the older V3 slice except its two d5 writes, which Nooelec writes d3. */
+    unsigned filter_patches = 0;
+    uint8_t cold0a = 0, cold0b = 0;
+    for (size_t i = kRtlTunerReinitFirst; i <= kRtlTunerReinitLast; ++i) {
+        const auto &old = kRtlInitTransfers[i];
+        const auto v3 = rtl_profile_map_tuner_record(RtlProfileId::BlogV3, old);
+        const auto n = rtl_profile_map_tuner_record(noo, old);
+        EXPECT_EQ_U(n.value, v3.value);
+        EXPECT_EQ_U(n.index, old.index);
+        EXPECT_EQ_U(n.request_type, old.request_type);
+        EXPECT_EQ_U(n.length, old.length);
+        for (unsigned j = 0; j < n.length; ++j) {
+            const bool changed = (i == 392 || i == 409) && j == 1;
+            EXPECT_EQ_U(n.data[j], changed ? 0xd3 : old.data[j]);
+            if (changed) {
+                ++filter_patches;
+                EXPECT_EQ_U(v3.data[j], 0xd5);
+            }
+        }
+        if (n.index == 0x0610 && n.length == 2 && n.data[0] == 0x0a)
+            cold0a = n.data[1];
+        if (n.index == 0x0610 && n.length == 2 && n.data[0] == 0x0b)
+            cold0b = n.data[1];
+    }
+    EXPECT_EQ_U(filter_patches, 2u);
+    EXPECT_EQ_U(cold0a, 0xd3);
+    EXPECT_EQ_U(cold0b, 0x6b);
+    for (const auto &old : kRtlCleanupTransfers) {
+        const auto n = rtl_profile_map_tuner_record(noo, old);
+        EXPECT_TRUE(std::memcmp(n.data, old.data, sizeof(n.data)) == 0);
+    }
+
+    struct BandwidthCase { uint32_t width, if_hz; uint8_t reg0b, hi, mid, lo; };
+    constexpr BandwidthCase captured[] = {
+        {0, 1814972, 0x8f, 0x3b, 0xf7, 0x78},
+        {200000, 2125000, 0xe6, 0x3b, 0x47, 0x1d},
+        {300000, 2125000, 0xe6, 0x3b, 0x47, 0x1d},
+        {500000, 2025000, 0xe8, 0x3b, 0x80, 0x00},
+        {1000000, 1700000, 0xeb, 0x3c, 0x38, 0xe4},
+        {1800000, 1750000, 0xac, 0x3c, 0x1c, 0x72},
+        {2400000, 1814972, 0x8f, 0x3b, 0xf7, 0x78},
+    };
+    for (const auto &c : captured) {
+        MeasuredTunerBandwidthPlan p{};
+        EXPECT_TRUE(measured_tuner_bandwidth_plan(noo, 99100000u, c.width, &p));
+        EXPECT_EQ_U(p.reg0a, 0xc3);
+        EXPECT_EQ_U(p.reg0b, c.reg0b);
+        EXPECT_EQ_U(p.if_hz, c.if_hz);
+        EXPECT_EQ_U(p.if19, c.hi);
+        EXPECT_EQ_U(p.if1a, c.mid);
+        EXPECT_EQ_U(p.if1b, c.lo);
+    }
+    EXPECT_EQ_U(rtl_profile_demod_if_restore_hz(noo), 3570000u);
+    EXPECT_EQ_U(static_cast<uint32_t>(rtl_profile_pll_if_offset_hz(noo)), 3570000u);
+    MeasuredTunerBandwidthPlan p{};
+    EXPECT_TRUE(!measured_tuner_bandwidth_plan(noo, 1600000u, 0, &p));
+    EXPECT_TRUE(!measured_tuner_bandwidth_plan(noo, 99100000u, 400000u, &p));
+
+    /* Native AUTO frames3983..3987 / 4011..4015; cold nibbles are 3/5. */
+    const uint8_t before[][2] = {{0x9f, 0x6e}, {0x90, 0x60}, {0x83, 0x75}};
+    const uint8_t after[][2] = {{0x8f, 0x7e}, {0x80, 0x70}, {0x83, 0x75}};
+    for (size_t i = 0; i < std::size(before); ++i) {
+        uint8_t r05 = before[i][0], r07 = before[i][1];
+        r820t2_auto_gain_regs(r05, r07);
+        EXPECT_EQ_U(r05, after[i][0]);
+        EXPECT_EQ_U(r07, after[i][1]);
+    }
+}
+
 int main(void)
 {
     test_detection_matrix();
@@ -769,6 +863,7 @@ int main(void)
     test_capability_matrix();
     test_profile_transition_matrix();
     test_blog_v4l_identity();
+    test_nooelec_captured_programming();
     std::printf("RESULT profiles passed=%d failed=%d\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

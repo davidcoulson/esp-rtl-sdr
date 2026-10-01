@@ -230,7 +230,7 @@ Any in-window rate is quantized to an exact RTL2832 ratio (`quantize_sample_rate
 | Item | Value |
 |---|---|
 | Arithmetic range | 24 kHz … 1766 MHz (`FREQ_MIN_HZ` … `FREQ_MAX_HZ`) |
-| Device range | Profile-specific; Blog V4 accepts the full arithmetic range, Blog V3/V3c uses Q-branch direct sampling below 24 MHz, and Nooelec rejects below 24 MHz |
+| Device range | Profile-specific; Blog V4 accepts the full arithmetic range, Blog V3/V3c uses Q-branch direct sampling below 24 MHz. Nooelec SMArt v5 accepts 100 kHz–1750 MHz, using Q below the captured 24 MHz route cutoff; its manufacturer rates native operation from 25 MHz and the PC 24 MHz boundary tune warned of no PLL lock. Nooelec tuner gain/mode and bandwidth setters are unsupported while Q bypasses the tuner. |
 | Quantization | Exact Hz (`FREQ_QUANT_HZ` = 1) |
 | PPM | Software LO offset, ±200 |
 

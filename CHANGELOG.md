@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Nooelec NESDR SMArt v5 profile
+
+- **Correct cold FM tuning on the Nooelec.** In v0.9.1, the Nooelec PLL calculation
+  uses a 3.570 MHz IF but the shared initialization ends at a 1.815 MHz demod IF.
+  The resulting +1.755 MHz shift is consistent with the reported 99.1 MHz station
+  received at a 97.3 MHz dial setting. Restore the independently captured Nooelec
+  `d3/6b` tuner filters and `38 11 12` demod IF at cold start and after returning
+  from Q sampling. This source diagnosis and fix still require OrcSDR RF acceptance.
+- **Implement the independently captured Nooelec controls.** Reuse the 29-step
+  nominal native/FM gain ladder; preserve gain nibbles for tuner AUTO; add RTL AGC
+  settle reads and seven native tuner-bandwidth choices at 2.4 MS/s. Explicit
+  bandwidth AUTO follows the new Nooelec `c3/8f`, 1.815 MHz capture, while the older
+  V3c AUTO boot-state policy remains specific to V3c.
+  Retunes and bandwidth changes preserve Nooelec cold/manual/AUTO register-0c
+  state, and returning from HF restores an explicitly applied gain/mode.
+- **Add Q-branch HF tuning for this board.** Accept the manufacturer's model range
+  of 100 kHz–1750 MHz, using the captured PC Q route below 24 MHz and restoring the
+  native tuner above it. The 24 MHz PC tune reported no PLL lock; native RF operation
+  there is unverified and the manufacturer rates native operation from 25 MHz.
+  Tuner gain/mode and tuner bandwidth setters reject Q mode. Bias tee and HF
+  upconverter capabilities remain absent.
+- **Document provenance and acceptance separately.** The detailed
+  [capture record](docs/captures/nooelec_v5_2026-09-30.md) records the USBPcap/TShark
+  campaign, hashes, antennas, control/frame anchors and remaining capture gaps.
+  [Merge notes](docs/nooelec_v5_merge_notes.md) record validation and the P4/OrcSDR
+  acceptance procedure. This is branch work, not a newly published release;
+  version/tag selection will be discussed with the maintainer before tag creation.
+
 ## 0.9.1 (2026-09-28) — live tuner-bandwidth fixes; first published 0.9 release
 
 `0.9.0` (below) was never tagged or published; `0.9.1` is the first published

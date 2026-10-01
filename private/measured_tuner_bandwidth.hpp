@@ -34,9 +34,11 @@ constexpr MeasuredBandwidthList measured_tuner_bandwidth_list(RtlProfileId profi
                                                               bool hf_direct = false)
 {
     if (profile != RtlProfileId::BlogV4 && profile != RtlProfileId::BlogV4L &&
-        profile != RtlProfileId::BlogV3) return {nullptr, 0};
-    if (profile == RtlProfileId::BlogV3 && rf_hz < kR820T2NativeMinHz) return {nullptr, 0};
-    return profile != RtlProfileId::BlogV3 && rf_hz <= ESP_RTL_SDR_XTAL_HZ && !hf_direct
+        profile != RtlProfileId::BlogV3 && profile != RtlProfileId::NooelecSmartV5)
+        return {nullptr, 0};
+    if (rtl_profile_uses_v3_direct_sampling(profile, rf_hz)) return {nullptr, 0};
+    return (profile == RtlProfileId::BlogV4 || profile == RtlProfileId::BlogV4L) &&
+           rf_hz <= ESP_RTL_SDR_XTAL_HZ && !hf_direct
         ? MeasuredBandwidthList{kMeasuredHfBandwidths,
                                 sizeof(kMeasuredHfBandwidths) / sizeof(uint32_t)}
         : MeasuredBandwidthList{kMeasuredNativeBandwidths,
@@ -62,7 +64,8 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
     for (size_t i = 0; i < count; ++i) found |= widths[i] == width_hz;
     if (!found) return false;
     *out = {width_hz, 1814972u,
-            static_cast<uint8_t>(profile == RtlProfileId::BlogV4L ? 0xc4 : 0xc5),
+            static_cast<uint8_t>(profile == RtlProfileId::BlogV4L ? 0xc4 :
+                                profile == RtlProfileId::NooelecSmartV5 ? 0xc3 : 0xc5),
             0x8f, 0x3b, 0xf7, 0x78};
     switch (width_hz) {
     case 200000u:
@@ -89,8 +92,8 @@ inline bool measured_tuner_bandwidth_plan(RtlProfileId profile, uint32_t rf_hz,
     default: break;
     }
     if (profile == RtlProfileId::BlogV3 && width_hz == 0) {
-        /* AUTO restores the whole V3c boot tuning state: the matched IF and the
-         * tuner filter registers that boot leaves with it. */
+        /* Older V3c-specific AUTO policy (2026-09-28): restore the boot IF and
+         * filters. Nooelec's 2026-09-30 AUTO capture instead uses c3/8f, 1.815 MHz. */
         out->if_hz = kBlogV3DemodIfHz;
         out->reg0a = kBlogV3BootReg0a; out->reg0b = kBlogV3BootReg0b;
         out->if19 = 0x38; out->if1a = 0x11; out->if1b = 0x12;
