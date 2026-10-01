@@ -170,6 +170,12 @@ int main() {
         CHECK(wire[0].length == 1 && wire[0].data[0] == (enabled ? 0x25 : 0x05));
         CHECK(wire[1].value == 0x0120 && wire[1].index == 0x000a && wire[1].request_type == 0xc0 && wire[1].length == 1);
     }
+    // A Q retune can cancel queued MANUAL while the old AUTO-applied flag remains.
+    h.gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL; h.gain_tenth_db = 496;
+    h.tuner_auto_applied = true;
+    wire.clear(); CHECK(run_profile_tune(&h, 1600000, 99100000) == ESP_OK); q_route();
+    wire.clear(); CHECK(run_profile_tune(&h, 99100000, 1600000) == ESP_OK);
+    gain(0x9f, 0x6e, 0x68); CHECK(!h.tuner_auto_applied);
     std::printf("RESULT nooelec_runtime_trace passed=%u failed=0\n", checks);
 }
 '''

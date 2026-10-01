@@ -2,7 +2,7 @@
 
 Status: implementation branch `codex/nooelec-v5-profile`, based on master
 `105caa5`, which is also the verified remote `v0.9.1` release commit
-`105caa56b9b5ce395a7b4910c6f703c14b83b5d9`. This is a review and acceptance record, not a claim that the change
+`105caa56b9b5ce395a7b4910c6f703c14b83b5d9`. This is a premerge review and acceptance record, not a claim that the change
 is merged, released, or physically accepted. The release version/tag is not
 selected. Consult the user before selecting or creating a release tag; merge
 only with explicit approval, then verify the resulting commit on
@@ -145,9 +145,9 @@ That check compiled **`src/esp_rtl_sdr.cpp` to one object successfully**, with e
 volatile increment/decrement warnings. It is not a full firmware link/build
 or device result. The repeat against the final mode-restoration changes also
 passed. Its retained log is
-`C:\Tools\esp-rtl-sdr-lab\validation\nooelec-v5-20260930\compile-source-check-final.log`,
+`C:\Tools\esp-rtl-sdr-lab\validation\nooelec-v5-20260930\compile-source-check-premerge.log`,
 and the final object SHA-256 is
-`A5AD429EEA54C613A2649198DAC83919C56A30D5EFDB0D7E7BBC455D81D7325D`.
+`6847E9C8A43DF765CB899808B43D9CCCEEB1F2C6F83952AD7689E22DE9C1098C`.
 No application build or application integration is in scope.
 
 Local review identified two concrete runtime state hazards. A final shared
@@ -157,6 +157,11 @@ already applied gain/mode while getters still reported the cached selection.
 The fixes compose the final register state as **f0 cold /68 manual /6b explicit
 AUTO**, preserve that state through hot retunes and bandwidth changes, and
 restore previously applied manual gain or AUTO after native reinitialization.
+The final review also covered a queued AUTO-to-MANUAL request interrupted by
+an HF retune. After successful manual restoration the driver clears the
+Nooelec AUTO-applied flag, preventing the next tune from changing manual
+`0c=68` back to `6b` while reporting MANUAL. Failed writes retain their error
+return; the flag changes only after the manual writes succeed.
 The added driver-runtime trace check compiles 19 actual driver functions with
 successful mock USB transport. It does not substitute copied versions of the
 tuning functions, and it does not claim to exercise the complete public API,
@@ -173,21 +178,25 @@ The final Windows/WSL invocation was:
 wsl -e bash -lc 'cd /mnt/c/Users/hardc/.codex/worktrees/nooelec-v5-profile/esp_rtl_sdr && python3 tests/scripts/test_nooelec_runtime_trace.py'
 ```
 
-Result: **`RESULT nooelec_runtime_trace passed=7475 failed=0`**. Checks cover
+Result: **`RESULT nooelec_runtime_trace passed=7664 failed=0`**. Checks cover
 cold `83/75/f0` and `d3/6b`, matching settled 3.57 MHz IF, all 29 manual gain
 pairs across native retunes and Q-to-native returns, Q enable/disable and NCO,
 AUTO nibbles and `0c=6b` across retunes and all seven bandwidth choices,
-explicit AUTO restoration after Q, and RTL AGC write/settle pairs. The existing
+explicit AUTO restoration after Q, the interrupted queued MANUAL case, and
+RTL AGC write/settle pairs. The existing
 Linux host-test CI step now runs this check; remote CI has not been run for
 this local branch.
 
+The following status table records the premerge validation state. The PR is
+the durable record for subsequent CI and verified merge closure.
+
 | Driver readiness item | Evidence / command | Result |
 |---|---|---|
-| Narrow diff and final source review | Focused local driver review, final diff and `git diff --check` | Two valid state findings fixed and covered by runtime traces; whitespace check passed |
+| Narrow diff and final source review | Focused local driver review, final diff and `git diff --check` | Gain/mode state findings and the queued-mode edge fixed and covered by runtime traces; whitespace check passed |
 | Selected host profile regression | Commands above, GNU 13.3, `-Wall -Wextra -Werror` | CTest 1/1 passed; 1987 checks passed, 0 failed |
 | Truth hygiene | External normalized script command above | `TRUTH_HYGIENE_OK ver=0.9.1` |
 | Targeted P4 source compile | External `compile-source-check.ps1` above, cached IDF 5.5.4; final log/object hash above | Earlier and post-fix one-object compiles passed |
-| Final runtime control composition | Exact Python/WSL commands above | 7475 checks passed, 0 failed |
+| Final runtime control composition | Exact Python/WSL commands above | 7664 checks passed, 0 failed |
 | Full firmware link/build | Outside this driver's targeted validation | Not performed |
 | Driver hardware / RF acceptance | Optional future separate effort below | Not performed; no on-device repair claim |
 | Application integration / device writes | Outside the authorized driver-only scope | Not performed |

@@ -5232,6 +5232,7 @@ static esp_err_t apply_r820t2_gain_records(esp_rtl_sdr_handle *h, int tenth_db,
     }
     h->tuner_reg05_low_bits = st.reg05 & 0x1f;
     h->tuner_reg07 = st.reg07;
+    if (h->profile == RtlProfileId::NooelecSmartV5) h->tuner_auto_applied = false;
     if (applied_tenth != nullptr) {
         *applied_tenth = st.tenth_db;
     }
