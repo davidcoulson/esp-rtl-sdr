@@ -1543,8 +1543,11 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
                  static_cast<unsigned>(live_urbs_get(h)));
         return;
     }
+    if (!h->streaming) {
+        return; /* stopping: pause_resubmit belongs to stop() now */
+    }
     h->pause_resubmit = false;
-    if (!h->streaming || h->bulk == nullptr || h->dev == nullptr || h->device_gone) {
+    if (h->bulk == nullptr || h->dev == nullptr || h->device_gone) {
         return;
     }
     bool failed = false;
@@ -1701,11 +1704,84 @@ static void bulk_recover_stall(esp_rtl_sdr_handle *h)
              static_cast<unsigned>(h->ep_recoveries), static_cast<unsigned>(live_urbs_get(h)));
 }
 
+/** Record err as last_error from a task that does not hold the API lock. */
+static void set_error_locked(esp_rtl_sdr_handle *h, esp_err_t err)
+{
+    HandleLock lk(h, kQueryLockTicks);
+    if (lk.ok()) {
+        set_error_unlocked(h, err);
+    }
+}
+
 /**
- * Apply a queued sample rate while streaming: drain bulks, rewrite the resampler (the same
- * register sequence start() uses, ending in a demod soft reset), resubmit. Replaces a full
- * stop/start of the stream, which costs about a second of samples on every hop between
- * bands that use different rates. Same threading rules as apply_pending_retune().
+ * A configuration change failed and was rolled back: the stream runs on at the last complete
+ * configuration. Set last_error and send EVT_ERROR, so a caller whose request was deferred (and
+ * so never saw a return code) learns the stream is not at the rate or frequency it asked for.
+ * Call without the EP0 window claim held: the app callback may call retune.
+ */
+static void report_config_error(esp_rtl_sdr_handle *h, esp_err_t code, const char *message)
+{
+    esp_rtl_sdr_event_cb_t cb = nullptr;
+    void *ctx = nullptr;
+    {
+        HandleLock lk(h, kQueryLockTicks);
+        if (lk.ok()) {
+            set_error_unlocked(h, code);
+            cb = h->cfg.event_cb;
+            ctx = h->cfg.event_ctx;
+        }
+    }
+    if (cb != nullptr) {
+        esp_rtl_sdr_error_info_t info{};
+        info.code = code;
+        std::snprintf(info.message, sizeof(info.message), "%s", message);
+        emit_after_unlock(h, ESP_RTL_SDR_EVT_ERROR, &info, cb, ctx);
+    }
+}
+
+/**
+ * The hot sample-rate sequence, inside a paused EP0 window: resampler (the register sequence
+ * start() uses, ending in a demod soft reset), then on R820T2 outside direct sampling the IF
+ * filter and IF for the rate and a retune, since LO = RF + IF moves. Publishes nothing except
+ * r820t2_if_hz, which the LO arithmetic reads. Returns NOT_STREAMING as soon as a stop() has
+ * cleared streaming, so a stop never waits behind (or races) the rest of the sequence.
+ */
+static esp_err_t program_rate(esp_rtl_sdr_handle *h, uint32_t rate)
+{
+    esp_err_t err = run_sample_rate(h, rate);
+    if (err != ESP_OK || !rtl_profile_uses_r820t2_i2c_remap(h->profile) ||
+        rtl_profile_uses_v3_direct_sampling(h->profile, h->frequency_hz)) {
+        return err;
+    }
+    if (!h->streaming) {
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    err = run_r820t2_if_for_rate(h, rate);
+    if (err == ESP_OK && !h->streaming) {
+        err = ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    if (err == ESP_OK) {
+        err = run_profile_tune(h, h->frequency_hz, h->frequency_hz);
+    }
+    if (err == ESP_OK && !h->streaming) {
+        err = ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    if (err == ESP_OK) {
+        err = run_band_frontend(h, h->frequency_hz);
+    }
+    return err;
+}
+
+/**
+ * Apply a queued sample rate while streaming: drain bulks, program the new rate, resubmit.
+ * Replaces a full stop/start of the stream, which costs about a second of samples on every hop
+ * between bands that use different rates. Same threading rules as apply_pending_retune().
+ *
+ * All or nothing: the rate is published (sample_rate_sps, IQ block metadata, metrics) only once
+ * the whole sequence succeeded. A failure leaves the hardware half way (resampler at the new
+ * rate, tuner not), so the previous rate is programmed back before bulk resumes; the request
+ * stays pending for a retry, and after kPendingRateMaxFailures it is dropped with EVT_ERROR. If
+ * even the previous rate cannot be restored the stream goes to FAULT.
  */
 static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
 {
@@ -1726,26 +1802,15 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
         return ESP_RTL_SDR_ERR_TIMEOUT;
     }
     if (!h->streaming) {
-        h->pause_resubmit = false;
-        if (h->pending_rate_sps == rate) {
-            h->pending_rate_sps = 0;
-        }
+        /* stopped (stop() clears the request and owns pause_resubmit) or unplugged */
         h->retune_busy = false;
         return ESP_RTL_SDR_ERR_NOT_STREAMING;
     }
     const uint32_t apply = (h->pending_rate_sps != 0) ? h->pending_rate_sps : rate;
-    esp_err_t err = run_sample_rate(h, apply);
-    if (err == ESP_OK && rtl_profile_uses_r820t2_i2c_remap(h->profile) &&
-        !rtl_profile_uses_v3_direct_sampling(h->profile, h->frequency_hz)) {
-        /* the IF filter and IF follow the rate; the LO = RF + IF, so retune */
-        err = run_r820t2_if_for_rate(h, apply);
-        if (err == ESP_OK) {
-            err = run_profile_tune(h, h->frequency_hz, h->frequency_hz);
-        }
-        if (err == ESP_OK) {
-            err = run_band_frontend(h, h->frequency_hz);
-        }
-    }
+    const uint32_t previous = h->sample_rate_sps;
+    esp_err_t err = program_rate(h, apply);
+    bool gave_up = false;
+    bool restored = true;
     if (err == ESP_OK) {
         h->sample_rate_sps = apply;
         h->preferred_sample_rate_sps = apply;
@@ -1758,22 +1823,59 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
             h->pending_rate_sps = 0;
         }
         ESP_LOGI(TAG, "hot sample rate applied %u S/s", static_cast<unsigned>(apply));
-    } else if (++h->pending_rate_failures < kPendingRateMaxFailures) {
-        /* The hardware may be half way (resampler at the new rate, tuner not): leave the request
-         * pending so the delivery task runs the whole sequence again on its next pass. Bulk is
-         * resumed regardless; a paused stream would never reach that pass. */
-        ESP_LOGW(TAG, "hot sample rate EP0 failed: %s (attempt %u, will retry)",
-                 esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(h->pending_rate_failures));
-    } else {
-        ESP_LOGE(TAG, "hot sample rate EP0 failed: %s; giving up on %u S/s",
-                 esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(apply));
-        h->pending_rate_failures = 0;
-        if (h->pending_rate_sps == apply) {
-            h->pending_rate_sps = 0;
+    } else if (h->streaming) {
+        const esp_err_t rb = program_rate(h, previous);
+        restored = (rb == ESP_OK);
+        if (!restored) {
+            ESP_LOGE(TAG, "hot sample rate %u S/s failed (%s) and restoring %u S/s failed (%s)",
+                     static_cast<unsigned>(apply), esp_rtl_sdr_err_to_name(err),
+                     static_cast<unsigned>(previous), esp_rtl_sdr_err_to_name(rb));
+            h->pending_rate_failures = 0;
+            if (h->pending_rate_sps == apply) {
+                h->pending_rate_sps = 0;
+            }
+        } else if (++h->pending_rate_failures < kPendingRateMaxFailures) {
+            /* Back at the previous rate; the request stays pending and the delivery task runs
+             * the whole sequence again on its next pass. */
+            ESP_LOGW(TAG, "hot sample rate EP0 failed: %s (attempt %u, kept %u S/s, will retry)",
+                     esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(h->pending_rate_failures),
+                     static_cast<unsigned>(previous));
+        } else {
+            ESP_LOGE(TAG, "hot sample rate EP0 failed: %s; giving up on %u S/s, kept %u S/s",
+                     esp_rtl_sdr_err_to_name(err), static_cast<unsigned>(apply),
+                     static_cast<unsigned>(previous));
+            h->pending_rate_failures = 0;
+            if (h->pending_rate_sps == apply) {
+                h->pending_rate_sps = 0;
+            }
+            gave_up = true;
         }
+    }
+    if (!h->streaming) {
+        /* stop() took over mid-sequence: it tears the stream down and start() re-inits */
+        h->retune_busy = false;
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    if (!restored) {
+        h->pause_resubmit = true;
+        h->streaming = false;
+        h->retune_busy = false;
+        window.release();
+        fail_stream(h, err, "sample rate change failed and the previous rate could not be restored");
+        return err;
     }
     bulk_resume(h);
     h->retune_busy = false;
+    window.release();
+    if (err != ESP_OK) {
+        set_error_locked(h, err);
+    }
+    if (gave_up) {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "sample rate change to %u S/s failed; stream kept at %u S/s",
+                      static_cast<unsigned>(apply), static_cast<unsigned>(previous));
+        report_config_error(h, err, msg);
+    }
     return err;
 }
 
@@ -1782,6 +1884,10 @@ static esp_err_t apply_pending_rate(esp_rtl_sdr_handle *h)
  * Must NOT run on the USB client/host lib tasks (blocks; does EP0).
  * Safe from delivery task or app tasks. Coalesces: if pending changes mid-apply,
  * leaves the newer pending_retune_hz set for another pass.
+ *
+ * All or nothing, like apply_pending_rate(): the frequency is published only after the tune and
+ * the front-end route both succeeded. On failure the previous frequency is tuned back before bulk
+ * resumes and the caller gets last_error + EVT_ERROR; if that fails too the stream goes to FAULT.
  */
 static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
 {
@@ -1804,10 +1910,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     }
 
     if (!h->streaming) {
-        h->pause_resubmit = false;
-        if (h->pending_retune_hz == freq) {
-            h->pending_retune_hz = 0;
-        }
+        /* stopped (stop() clears the request and owns pause_resubmit) or unplugged */
         h->retune_busy = false;
         return ESP_RTL_SDR_ERR_NOT_STREAMING;
     }
@@ -1815,12 +1918,17 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     /* Use latest pending if a newer retune arrived while draining. */
     const uint32_t tune_hz =
         (h->pending_retune_hz != 0) ? h->pending_retune_hz : freq;
+    const uint32_t previous = h->frequency_hz;
 
     h->frontend_applied_valid = false;
-    esp_err_t err = run_profile_tune(h, tune_hz, h->frequency_hz);
+    esp_err_t err = run_profile_tune(h, tune_hz, previous);
+    if (err == ESP_OK && !h->streaming) {
+        err = ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
     if (err == ESP_OK) {
         err = run_band_frontend(h, tune_hz);
     }
+    bool restored = true;
     if (err == ESP_OK) {
         h->frequency_hz = tune_hz;
         h->metrics.frequency_hz = tune_hz;
@@ -1837,17 +1945,46 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
                  static_cast<unsigned>(tune_hz),
                  static_cast<unsigned>(rtl_profile_tuner_frequency_hz(h->profile, tune_hz)),
                  rtl_profile_uses_v3_direct_sampling(h->profile, tune_hz) ? 1 : 0);
-    } else {
-        ESP_LOGW(TAG, "hot retune EP0 failed: %s (tune/route may be partially applied)",
-                 esp_rtl_sdr_err_to_name(err));
+    } else if (h->streaming) {
         if (h->pending_retune_hz == tune_hz) {
             h->pending_retune_hz = 0;
         }
+        /* The tune or route may be half applied (for V3, possibly half way into or out of
+         * direct sampling): tune back with the failed target as the "previous" frequency, so
+         * the matching transition sequence runs. */
+        esp_err_t rb = run_profile_tune(h, previous, tune_hz);
+        if (rb == ESP_OK) {
+            rb = run_band_frontend(h, previous);
+        }
+        restored = (rb == ESP_OK);
+        if (restored) {
+            ESP_LOGW(TAG, "hot retune to %u Hz failed: %s; kept %u Hz",
+                     static_cast<unsigned>(tune_hz), esp_rtl_sdr_err_to_name(err),
+                     static_cast<unsigned>(previous));
+        } else {
+            ESP_LOGE(TAG, "hot retune to %u Hz failed (%s) and restoring %u Hz failed (%s)",
+                     static_cast<unsigned>(tune_hz), esp_rtl_sdr_err_to_name(err),
+                     static_cast<unsigned>(previous), esp_rtl_sdr_err_to_name(rb));
+        }
+    }
+    if (!h->streaming) {
+        /* stop() took over mid-sequence: it tears the stream down and start() re-inits */
+        h->retune_busy = false;
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
+    }
+    if (!restored) {
+        h->pause_resubmit = true;
+        h->streaming = false;
+        h->retune_busy = false;
+        window.release();
+        fail_stream(h, err, "retune failed and the previous frequency could not be restored");
+        return err;
     }
 
     bulk_resume(h);
 
     h->retune_busy = false;
+    window.release();
 
     if (err == ESP_OK) {
         esp_rtl_sdr_event_cb_t cb = h->cfg.event_cb;
@@ -1856,6 +1993,11 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             uint32_t f = h->frequency_hz;
             emit_after_unlock(h, ESP_RTL_SDR_EVT_RETUNED, &f, cb, ctx);
         }
+    } else {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "retune to %u Hz failed; stream kept at %u Hz",
+                      static_cast<unsigned>(tune_hz), static_cast<unsigned>(previous));
+        report_config_error(h, err, msg);
     }
     return err;
 }
@@ -3234,6 +3376,24 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     if (timeout_ms > ESP_RTL_SDR_MAX_TIMEOUT_MS) {
         timeout_ms = ESP_RTL_SDR_MAX_TIMEOUT_MS;
     }
+    /* Say "stopping" before waiting for the claim: a retune / rate change / sideband window that
+     * is running checks streaming between its EP0 steps, gives up, and does not resume bulk, so
+     * it hands the claim over quickly. Its pending request is dropped here too, so the delivery
+     * task cannot retry it into the next start(). */
+    const bool was_streaming = h->streaming || h->state == ESP_RTL_SDR_STATE_STREAMING ||
+                               h->state == ESP_RTL_SDR_STATE_STOPPING;
+    h->state = ESP_RTL_SDR_STATE_STOPPING;
+    h->pause_resubmit = true;
+    h->streaming = false;
+    h->pending_retune_hz = 0;
+    h->pending_rate_sps = 0;
+    h->pending_rate_failures = 0;
+    h->ep_stall_recover = false;
+    h->pending_gain = false;
+    h->pending_gain_mode = false;
+    h->pending_bias = false;
+    h->pending_rtl_agc = false;
+
     Ep0WindowClaim window(h);
     if (!have_window) {
         const uint32_t claim_wait = (timeout_ms / 2 < kStopClaimWaitMs) ? timeout_ms / 2
@@ -3247,20 +3407,10 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
         }
     }
 
-    const bool was_streaming = h->streaming || h->state == ESP_RTL_SDR_STATE_STREAMING ||
-                               h->state == ESP_RTL_SDR_STATE_STOPPING;
-    h->state = ESP_RTL_SDR_STATE_STOPPING;
-    h->pause_resubmit = true;
-    h->streaming = false;
+    /* Only now that no window runs: these belong to the window that owned them. */
     h->frontend_applied_valid = false;
-    h->pending_retune_hz = 0;
-    h->pending_rate_sps = 0;
     h->r820t2_if_hz = 0;
-    h->ep_stall_recover = false;
-    h->pending_gain = false;
-    h->pending_gain_mode = false;
-    h->pending_bias = false;
-    h->pending_rtl_agc = false;
+    h->retune_busy = false;
     h->ep0_sideband_busy = false;
 
     /* Same order as bulk_pause_and_drain (shared drain_live_urbs): poll natural
@@ -4942,6 +5092,11 @@ static esp_err_t apply_pending_sideband_ep0(esp_rtl_sdr_handle *h)
 
     bulk_resume(h);
     h->ep0_sideband_busy = false;
+    if (err != ESP_OK) {
+        /* usually deferred to the delivery task: nobody sees the return code */
+        window.release();
+        set_error_locked(h, err);
+    }
 
     /* If newer requests arrived while busy, leave them for next delivery pass. */
     return err;
