@@ -41,6 +41,7 @@ Default until identified (and after detach): **`Unknown`** — never Blog V4.
 | HF | **Rejected** below 24 MHz; no V4 HF routing |
 | Caps | STREAM/RETUNE/etc. without HF_UPCONVERTER / GAIN / BIAS_TEE |
 | Evidence | Contributor/OrcSDR tester reports; clean-room remap only; community soak welcome |
+| IF filter | Follows the sample rate; driver table by default, librtlsdr `r82xx_set_bandwidth()` with Kconfig — see [KCONFIG.md](KCONFIG.md#r820t2-if-mode) |
 
 ### `blog_v3` (RTL-SDR Blog V3 / V3c / R820T2 / R860) — IDENTIFICATION, STREAMING, AND MATCHED-IF TUNING VERIFIED
 
@@ -52,6 +53,7 @@ Default until identified (and after detach): **`Unknown`** — never Blog V4.
 | HF/LF | Below 24 MHz uses first-party-capture-derived RTL2832 Q-branch direct sampling; **no** V4 HF upconverter / Cable-2 / GPIO5 |
 | Caps | STREAM/RETUNE/etc. plus provisional manual GAIN and DIRECT_SAMPLING; without HF_UPCONVERTER / GAIN_AUTO / RTL_AGC / BIAS_TEE. Tuner gain setters are unsupported while direct sampling bypasses the tuner. |
 | IF evidence | Official-driver capture measured the V3c PLL IF at 3.570 MHz and ended RTL2832 setup with `0x19/0x1A/0x1B = 0x38/0x11/0x12`, including a settle read after each write. The driver now restores that exact demodulator sequence after sample-rate setup and before the first tune. V4 stays on its existing matched 1.814972 MHz path; Nooelec is unchanged. |
+| IF filter | As Nooelec: follows the sample rate (overriding the 3.570 MHz restore above once a rate is set); driver table or librtlsdr per [KCONFIG.md](KCONFIG.md#r820t2-if-mode) |
 | Evidence | Probe recovered from `agent/blog-v3-profile` / `d870740`. Identification/streaming verified via repeated cold-boot and hot-swap testing (V4 ↔ V3-family, both directions) with zero crashes. The matched-IF fix passes both host suites, truth hygiene, ESP-IDF 5.5.4 ESP32-P4 compile, and physical V3c/V4 tuning acceptance. Manual-gain calibration remains open. |
 
 ## Fail closed

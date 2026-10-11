@@ -1,5 +1,8 @@
 #pragma once
 
+#if __has_include("sdkconfig.h")
+#include "sdkconfig.h" /* CONFIG_ESP_RTL_SDR_ESP_R820T2_IF_* */
+#endif
 #include "esp_rtl_sdr.h"
 #include "rtl_control.hpp"
 
@@ -360,20 +363,51 @@ inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
 }
 
 /**
- * R820T2 IF filter and IF frequency for a sample rate, as librtlsdr's r82xx_set_bandwidth() picks
- * them when the tuner bandwidth is left automatic (bandwidth = sample rate). reg 0x0a is written
- * with mask 0x10, reg 0x0b with mask 0xef, and the RTL2832 demod IF plus the tuner LO follow if_hz.
- * The replayed capture leaves the 2.2 MHz filter (0x8f) but a 3.57 MHz IF: the signal then sits at
- * the edge of the filter and the image (7.14 MHz off) is barely rejected, which on a busy band
- * (915 MHz ISM) buries the wanted signals under the AGC-amplified neighbours.
+ * R820T2 IF filter (reg 0x0a/0x0b) and IF frequency for a sample rate, with the tuner bandwidth
+ * left automatic (bandwidth = sample rate). The caller writes reg 0x0a with mask 0x10 and reg 0x0b
+ * with mask 0xef (as osmocom librtlsdr does), then points the RTL2832 demod IF
+ * (rtl_demod_if_word) and the PLL LO (RF + if_hz, rtl_r820t2_lo_hz) at if_hz.
+ *
+ * Without this the replayed capture leaves the 2.2 MHz filter (0x8f) with a 3.57 MHz IF: the
+ * signal sits at the filter edge and the image (7.14 MHz off) is barely rejected, which on a busy
+ * band (915 MHz ISM) buries the wanted signals under the AGC-amplified neighbours.
+ *
+ * Two mappings, picked at build time (Kconfig ESP_RTL_SDR_ESP_R820T2_IF_MODE, see
+ * docs/KCONFIG.md); the default keeps the table the driver has shipped since it gained this step.
  */
+enum class R820T2IfMode : uint8_t {
+    Table,     /* rtl_r820t2_if_for_rate_table(): the driver's own table (default) */
+    Librtlsdr, /* rtl_r820t2_if_for_rate_librtlsdr(): r82xx_set_bandwidth() */
+};
+
+#if defined(CONFIG_ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR)
+constexpr R820T2IfMode kR820T2IfModeBuild = R820T2IfMode::Librtlsdr;
+#else
+constexpr R820T2IfMode kR820T2IfModeBuild = R820T2IfMode::Table;
+#endif
+
 struct R820T2IfSetting {
     uint8_t reg0a;
     uint8_t reg0b;
     uint32_t if_hz;
 };
 
-inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps)
+/**
+ * The driver's own table. It is not what any librtlsdr computes: its 300-1500 kHz rows are the
+ * commented-out "settings from Oldenburger" table in the librtlsdr/librtlsdr fork's
+ * tuner_r82xx.c, and of its 1800-5000 kHz rows only 1800 (0xaf) and 2200 (0x8f) keep that table's
+ * reg 0x0b, with every IF but 3000/5000 changed (1800: 1.60 MHz, not 1.40; 2200: 1.75 MHz, not
+ * 1.60) and 3000/5000 at 0x6f instead of 0x8f/0x6b. The row is the first one at or above the rate
+ * (that fork compares against the midpoint of neighbouring rows), and above 5 MS/s it falls
+ * through to the osmocom 6/7/8 MHz settings.
+ *
+ * reg0a holds that fork's low-nibble values, but the fork writes reg 0x0a with mask 0x0f and the
+ * caller uses osmocom's mask 0x10, so only bit 4 reaches the tuner: clear up to 5 MS/s, where
+ * osmocom sets it above 2.43 MS/s. The table found 915 MHz utility meters at 2048k on a
+ * Nooelec SMArt v5 that the replayed filter missed (0 -> 5 decodes in 10 min, Linux rtl_433: 10);
+ * whether the librtlsdr mapping does better is the A/B in docs/KCONFIG.md.
+ */
+inline R820T2IfSetting rtl_r820t2_if_for_rate_table(uint32_t sample_rate_sps)
 {
     constexpr uint32_t kBwKhz[] = {300, 450, 600, 900, 1100, 1200, 1300, 1500, 1800, 2200, 3000, 5000};
     constexpr uint8_t kReg0b[] = {0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xaf, 0x8f, 0x6f, 0x6f};
@@ -393,6 +427,68 @@ inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps)
         ++i;
     }
     return {static_cast<uint8_t>(i == 11 ? 0x00 : 0x0f), kReg0b[i], kIfKhz[i] * 1000u};
+}
+
+/**
+ * osmocom librtlsdr's r82xx_set_bandwidth() (tuner_r82xx.c; rtl-sdr-blog's copy is identical),
+ * with bw = sample rate as rtlsdr_set_sample_rate() passes it. Above 2.43 MHz (the widest
+ * low-pass corner plus both high-pass steps) it uses the fixed 6/7/8 MHz settings with reg 0x0a
+ * bit 4 set. Below, it starts from a 2.3 MHz IF, enables each high-pass step (reg 0x0b bit 5 for
+ * 380 kHz, bit 6 for 350 kHz; a set bit means off) only while the rate exceeds what the low-pass
+ * filter alone can pass, picks the narrowest low-pass corner that still exceeds what is left
+ * (reg 0x0b bits 3:0 = 15 - index), and centres the IF on the resulting passband.
+ */
+inline R820T2IfSetting rtl_r820t2_if_for_rate_librtlsdr(uint32_t sample_rate_sps)
+{
+    constexpr int64_t kLowPassHz[] = {1700000, 1600000, 1550000, 1450000, 1200000,
+                                      900000,  700000,  550000,  450000,  350000};
+    constexpr int64_t kHighPass1Hz = 350000;
+    constexpr int64_t kHighPass2Hz = 380000;
+    constexpr size_t kLowPassCount = sizeof(kLowPassHz) / sizeof(kLowPassHz[0]);
+    int64_t bw = sample_rate_sps;
+    if (bw > 7000000) {
+        return {0x10, 0x0b, 4570000u};
+    }
+    if (bw > 6000000) {
+        return {0x10, 0x2a, 4570000u};
+    }
+    if (bw > kLowPassHz[0] + kHighPass1Hz + kHighPass2Hz) {
+        return {0x10, 0x6b, 3570000u};
+    }
+    uint8_t reg0b = 0x80;
+    int64_t if_hz = 2300000;
+    int64_t real_bw = 0;
+    if (bw > kLowPassHz[0] + kHighPass1Hz) {
+        bw -= kHighPass2Hz;
+        if_hz += kHighPass2Hz;
+        real_bw += kHighPass2Hz;
+    } else {
+        reg0b |= 0x20;
+    }
+    if (bw > kLowPassHz[0]) {
+        bw -= kHighPass1Hz;
+        if_hz += kHighPass1Hz;
+        real_bw += kHighPass1Hz;
+    } else {
+        reg0b |= 0x40;
+    }
+    /* bw <= kLowPassHz[0] here, so the first corner below it is at index >= 1 */
+    size_t i = 1;
+    while (i < kLowPassCount && bw <= kLowPassHz[i]) {
+        ++i;
+    }
+    --i;
+    reg0b = static_cast<uint8_t>(reg0b | (15u - i));
+    real_bw += kLowPassHz[i];
+    if_hz -= real_bw / 2;
+    return {0x00, reg0b, static_cast<uint32_t>(if_hz)};
+}
+
+inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps,
+                                              R820T2IfMode mode = kR820T2IfModeBuild)
+{
+    return mode == R820T2IfMode::Librtlsdr ? rtl_r820t2_if_for_rate_librtlsdr(sample_rate_sps)
+                                           : rtl_r820t2_if_for_rate_table(sample_rate_sps);
 }
 
 /** RTL2832 demod IF word (page 1 regs 0x19..0x1b), librtlsdr's rtlsdr_set_if_freq() arithmetic. */

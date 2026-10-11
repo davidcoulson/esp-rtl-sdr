@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 
@@ -424,20 +425,150 @@ static void test_r820t2_band_select(void)
     }
 }
 
-static void test_r820t2_if_for_rate(void)
+/*
+ * Expected librtlsdr values, produced by compiling rtl-sdr-blog's own r82xx_set_bandwidth()
+ * (src/tuner_r82xx.c @ aed0ea1, byte-identical to osmocom rtl-sdr @ 797f814) with bw = rate and a
+ * stub that records the reg 0x0a/0x0b values, and its rtlsdr_set_if_freq() arithmetic (double
+ * division, 28.8 MHz xtal) for the demod word. Not derived from rtl_profile.hpp.
+ */
+struct R820T2IfGolden {
+    uint32_t rate;
+    uint8_t reg0a;
+    uint8_t reg0b;
+    uint32_t if_hz;
+    uint32_t demod_word;
+};
+
+static const R820T2IfGolden kLibrtlsdrIfGolden[] = {
+    {       0u, 0x00u, 0xe6u, 2125000u, 0x3b471du},
+    {  225001u, 0x00u, 0xe6u, 2125000u, 0x3b471du},
+    {  250000u, 0x00u, 0xe6u, 2125000u, 0x3b471du},
+    {  300000u, 0x00u, 0xe6u, 2125000u, 0x3b471du},
+    {  350000u, 0x00u, 0xe6u, 2125000u, 0x3b471du},
+    {  350001u, 0x00u, 0xe7u, 2075000u, 0x3b638fu},
+    {  900001u, 0x00u, 0xebu, 1700000u, 0x3c38e4u},
+    {  960000u, 0x00u, 0xebu, 1700000u, 0x3c38e4u},
+    { 1024000u, 0x00u, 0xebu, 1700000u, 0x3c38e4u},
+    { 1200001u, 0x00u, 0xecu, 1575000u, 0x3c8000u},
+    { 1400000u, 0x00u, 0xecu, 1575000u, 0x3c8000u},
+    { 1700000u, 0x00u, 0xefu, 1450000u, 0x3cc71du},
+    { 1700001u, 0x00u, 0xacu, 1750000u, 0x3c1c72u},
+    { 1800000u, 0x00u, 0xacu, 1750000u, 0x3c1c72u},
+    { 2048000u, 0x00u, 0xafu, 1625000u, 0x3c638fu},
+    { 2050000u, 0x00u, 0xafu, 1625000u, 0x3c638fu},
+    { 2050001u, 0x00u, 0xcfu, 1640000u, 0x3c5b06u},
+    { 2400000u, 0x00u, 0x8fu, 1815000u, 0x3bf778u},
+    { 2430000u, 0x00u, 0x8fu, 1815000u, 0x3bf778u},
+    { 2430001u, 0x10u, 0x6bu, 3570000u, 0x381112u},
+    { 2560000u, 0x10u, 0x6bu, 3570000u, 0x381112u},
+    { 3200000u, 0x10u, 0x6bu, 3570000u, 0x381112u},
+    { 6000000u, 0x10u, 0x6bu, 3570000u, 0x381112u},
+    { 6000001u, 0x10u, 0x2au, 4570000u, 0x35d82eu},
+    { 7000000u, 0x10u, 0x2au, 4570000u, 0x35d82eu},
+    { 7000001u, 0x10u, 0x0bu, 4570000u, 0x35d82eu},
+    { 8000000u, 0x10u, 0x0bu, 4570000u, 0x35d82eu},
+};
+
+static void test_r820t2_if_librtlsdr(void)
 {
-    /* librtlsdr r82xx_set_bandwidth() with bandwidth = sample rate */
-    R820T2IfSetting s = rtl_r820t2_if_for_rate(250000u);
-    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0xe8u); EXPECT_EQ_U(s.if_hz, 1700000u);
+    for (const R820T2IfGolden &g : kLibrtlsdrIfGolden) {
+        const int failed_before = g_failed;
+        const R820T2IfSetting s = rtl_r820t2_if_for_rate(g.rate, R820T2IfMode::Librtlsdr);
+        EXPECT_EQ_U(s.reg0a, g.reg0a);
+        EXPECT_EQ_U(s.reg0b, g.reg0b);
+        EXPECT_EQ_U(s.if_hz, g.if_hz);
+        EXPECT_EQ_U(rtl_demod_if_word(s.if_hz, 28800000u), g.demod_word);
+        /* the caller's masks: 0x0b bit 4 is never asked for, 0x0a only ever bit 4 */
+        EXPECT_EQ_U(s.reg0b & 0x10u, 0u);
+        EXPECT_EQ_U(s.reg0a & ~0x10u, 0u);
+        if (g_failed != failed_before) {
+            std::printf("  ^ librtlsdr IF mapping at %u S/s\n", static_cast<unsigned>(g.rate));
+        }
+    }
+    /* PLL: LO = RF + IF (r82xx_set_freq), and the band row follows the LO */
+    EXPECT_EQ_U(rtl_r820t2_lo_hz(433920000u, 2125000.0), 436045000u);
+    EXPECT_EQ_U(rtl_r820t2_band_for_hz(rtl_r820t2_lo_hz(433920000u, 2125000.0))->mhz, 310u);
+    EXPECT_EQ_U(rtl_r820t2_lo_hz(915000000u, 1625000.0), 916625000u);
+    EXPECT_EQ_U(rtl_r820t2_band_for_hz(rtl_r820t2_lo_hz(915000000u, 1625000.0))->mhz, 650u);
+}
+
+/*
+ * The driver table's provenance: the commented-out "settings from Oldenburger" table in the
+ * librtlsdr/librtlsdr fork's src/tuner_r82xx.c @ cd36c28 (rows in kHz, reg 0x0a, reg 0x0b, IF kHz).
+ */
+static const uint32_t kOldenburgerBwKhz[] = {300, 450, 600, 900, 1100, 1200, 1300, 1500, 1800, 2200, 3000, 5000};
+static const uint8_t kOldenburger0a[] = {0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0e, 0x0f, 0x0f, 0x04, 0x0b};
+static const uint8_t kOldenburger0b[] = {0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xaf, 0x8f, 0x8f, 0x6b};
+static const uint32_t kOldenburgerIfKhz[] = {1700, 1650, 1600, 1500, 1400, 1350, 1320, 1270, 1400, 1600, 2000, 3570};
+
+static void test_r820t2_if_table(void)
+{
+    /* host builds have no CONFIG_ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR: the table is the default */
+    EXPECT_TRUE(kR820T2IfModeBuild == R820T2IfMode::Table);
+    /* each row covers rates above the previous row up to and including its own bandwidth */
+    for (size_t i = 0; i < std::size(kOldenburgerBwKhz); ++i) {
+        const uint32_t lo_khz = i == 0 ? 0u : kOldenburgerBwKhz[i - 1] + 1u;
+        for (uint32_t khz : {lo_khz, kOldenburgerBwKhz[i]}) {
+            const int failed_before = g_failed;
+            const R820T2IfSetting s = rtl_r820t2_if_for_rate(khz * 1000u);
+            /* only bit 4 is written (the fork's low nibble is dropped by the 0x10 mask), and like
+             * Oldenburger's values the table never sets it here; osmocom sets it above 2.43 MS/s */
+            EXPECT_EQ_U(s.reg0a & 0x10u, 0u);
+            EXPECT_EQ_U(s.reg0a & 0x10u, kOldenburger0a[i] & 0x10u);
+            if (i < 8) {
+                /* 300-1500 kHz: Oldenburger's rows unchanged */
+                EXPECT_EQ_U(s.reg0b, kOldenburger0b[i]);
+                EXPECT_EQ_U(s.if_hz, kOldenburgerIfKhz[i] * 1000u);
+            }
+            if (g_failed != failed_before) {
+                std::printf("  ^ driver IF table at %u kHz (row %u)\n", static_cast<unsigned>(khz),
+                            static_cast<unsigned>(kOldenburgerBwKhz[i]));
+            }
+        }
+    }
+    /* 1800-5000 kHz: Oldenburger's reg 0x0b kept for 1800/2200, IF changed; 3000/5000 the reverse */
+    R820T2IfSetting s = rtl_r820t2_if_for_rate(1800000u);
+    EXPECT_EQ_U(s.reg0b, kOldenburger0b[8]);
+    EXPECT_EQ_U(s.if_hz, 1600000u);
+    EXPECT_TRUE(s.if_hz != kOldenburgerIfKhz[8] * 1000u);
+    s = rtl_r820t2_if_for_rate(2200000u);
+    EXPECT_EQ_U(s.reg0b, kOldenburger0b[9]);
+    EXPECT_EQ_U(s.if_hz, 1750000u);
+    EXPECT_TRUE(s.if_hz != kOldenburgerIfKhz[9] * 1000u);
+    s = rtl_r820t2_if_for_rate(3000000u);
+    EXPECT_EQ_U(s.reg0b, 0x6fu);
+    EXPECT_TRUE(s.reg0b != kOldenburger0b[10]);
+    EXPECT_EQ_U(s.if_hz, kOldenburgerIfKhz[10] * 1000u);
+    s = rtl_r820t2_if_for_rate(5000000u);
+    EXPECT_EQ_U(s.reg0b, 0x6fu);
+    EXPECT_TRUE(s.reg0b != kOldenburger0b[11]);
+    EXPECT_EQ_U(s.if_hz, kOldenburgerIfKhz[11] * 1000u);
+    /* the rates esphome-rtl433 uses, and where they differ from librtlsdr (the A/B) */
+    s = rtl_r820t2_if_for_rate(250000u);
+    EXPECT_EQ_U(s.reg0b, 0xe8u); EXPECT_EQ_U(s.if_hz, 1700000u);
     s = rtl_r820t2_if_for_rate(1024000u);
     EXPECT_EQ_U(s.reg0b, 0xecu); EXPECT_EQ_U(s.if_hz, 1400000u);
     s = rtl_r820t2_if_for_rate(2048000u);
-    EXPECT_EQ_U(s.reg0a, 0x0fu); EXPECT_EQ_U(s.reg0b, 0x8fu); EXPECT_EQ_U(s.if_hz, 1750000u);
+    EXPECT_EQ_U(s.reg0b, 0x8fu); EXPECT_EQ_U(s.if_hz, 1750000u);
     s = rtl_r820t2_if_for_rate(2560000u);
-    EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 2000000u);
-    s = rtl_r820t2_if_for_rate(3200000u);
-    EXPECT_EQ_U(s.reg0a, 0x00u); EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 3570000u);
-    /* demod IF word: the init table's 3.57 MHz bytes are 38 11 12 */
+    EXPECT_EQ_U(s.reg0a & 0x10u, 0u); EXPECT_EQ_U(s.reg0b, 0x6fu); EXPECT_EQ_U(s.if_hz, 2000000u);
+    for (uint32_t rate : {250000u, 1024000u, 2048000u, 2560000u}) {
+        const R820T2IfSetting t = rtl_r820t2_if_for_rate(rate, R820T2IfMode::Table);
+        const R820T2IfSetting l = rtl_r820t2_if_for_rate(rate, R820T2IfMode::Librtlsdr);
+        EXPECT_TRUE(t.reg0b != l.reg0b && t.if_hz != l.if_hz);
+    }
+    /* above 5 MS/s both use osmocom's fixed 6/7/8 MHz settings */
+    for (uint32_t rate : {5001000u, 6000000u, 6001000u, 7000000u, 7001000u, 8000000u}) {
+        const R820T2IfSetting t = rtl_r820t2_if_for_rate(rate, R820T2IfMode::Table);
+        const R820T2IfSetting l = rtl_r820t2_if_for_rate(rate, R820T2IfMode::Librtlsdr);
+        EXPECT_EQ_U(t.reg0a, l.reg0a); EXPECT_EQ_U(t.reg0b, l.reg0b); EXPECT_EQ_U(t.if_hz, l.if_hz);
+    }
+    /* demod IF words for the table's IFs at those rates (docs/KCONFIG.md), and the init table's
+     * 3.57 MHz bytes 38 11 12 */
+    EXPECT_EQ_U(rtl_demod_if_word(1700000u, 28800000u), 0x3c38e4u);
+    EXPECT_EQ_U(rtl_demod_if_word(1400000u, 28800000u), 0x3ce38fu);
+    EXPECT_EQ_U(rtl_demod_if_word(1750000u, 28800000u), 0x3c1c72u);
+    EXPECT_EQ_U(rtl_demod_if_word(2000000u, 28800000u), 0x3b8e39u);
     EXPECT_EQ_U(rtl_demod_if_word(3570000u, 28800000u), 0x381112u);
 }
 
@@ -471,7 +602,8 @@ int main(void)
 {
     test_r820t2_tune_keeps_auto_vga();
     test_r820t2_band_select();
-    test_r820t2_if_for_rate();
+    test_r820t2_if_librtlsdr();
+    test_r820t2_if_table();
     test_r82xx_bitrev();
     test_detection_matrix();
     test_unknown_reject_and_v3_probe();

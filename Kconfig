@@ -22,4 +22,26 @@ menu "ESP_RTL_SDR-ESP"
         bool "Verbose driver logs"
         default n
 
+    choice ESP_RTL_SDR_ESP_R820T2_IF_MODE
+        prompt "R820T2 IF filter and IF for the sample rate"
+        default ESP_RTL_SDR_ESP_R820T2_IF_TABLE
+        help
+            How R820T2 profiles (Blog V3, Nooelec SMArt v5) set the tuner IF filter
+            (reg 0x0a/0x0b) and the IF (demod IF and PLL LO offset) for the sample rate.
+            See docs/KCONFIG.md for the values each choice gives and an A/B procedure.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_TABLE
+            bool "Driver table (default; Oldenburger-derived, hand-edited above 1.5 MS/s)"
+            help
+                The table the driver has shipped since it started following the sample
+                rate. 250k: 0xe8 / 1.70 MHz IF, 2048k: 0x8f / 1.75 MHz.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR
+            bool "librtlsdr r82xx_set_bandwidth (osmocom / rtl-sdr-blog)"
+            help
+                What osmocom librtlsdr and rtl-sdr-blog (and so a Linux rtl_433) compute.
+                250k: 0xe6 / 2.125 MHz IF, 2048k: 0xaf / 1.625 MHz, above 2.43 MS/s
+                0x6b / 3.57 MHz with reg 0x0a bit 4 set.
+    endchoice
+
 endmenu
