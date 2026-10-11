@@ -347,6 +347,11 @@ struct esp_rtl_sdr_handle {
     /** ctrl_xfer submitted and its callback not yet run. usb_host_device_close()
      *  asserts (usbh num_ctrl_xfers_inflight == 0) while this is true. */
     std::atomic<bool> ctrl_inflight{false};
+    /** Sequence number of the control transfer last submitted, and of the last one whose
+     *  callback ran. A completion that lands after its waiter timed out (and after the next
+     *  request drained ctrl_sem) must not be taken as the next request's completion. */
+    uint32_t ctrl_seq_submitted = 0;
+    std::atomic<uint32_t> ctrl_seq_done{0};
     /** Device handles whose close was skipped because a control transfer never
      *  finished. ESP-IDF keeps a gone device alive while it is still open, so
      *  dropping the handle would leak the device and can block later hotplug;
@@ -731,6 +736,9 @@ static void ctrl_cb(usb_transfer_t *xfer)
     h->ctrl_status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
     h->ctrl_stall = (xfer->status == USB_TRANSFER_STATUS_STALL);
     h->ctrl_data_len = rtl_usb::ctrl_data_bytes(xfer->actual_num_bytes);
+    /* Before ctrl_inflight drops: no new request can be submitted until then, so this is the
+     * sequence number of the transfer completing here. */
+    h->ctrl_seq_done.store(h->ctrl_seq_submitted, std::memory_order_release);
     h->ctrl_inflight.store(false, std::memory_order_release);
     xSemaphoreGive(h->ctrl_sem);
 }
@@ -832,8 +840,18 @@ static bool close_device_safely(esp_rtl_sdr_handle *h, usb_device_handle_t dev)
      * the STALL back-off. ctrl_inflight is false during that back-off, so
      * only holding the lock proves no further attempt can reach dev. */
     const uint32_t lock_ms = 3 * (h->cfg.control_timeout_ms + 200) + 200;
-    if (h->ctrl_mutex == nullptr ||
-        xSemaphoreTake(h->ctrl_mutex, pdMS_TO_TICKS(lock_ms)) != pdTRUE) {
+    bool locked = false;
+    if (h->ctrl_mutex != nullptr && xTaskGetCurrentTaskHandle() == h->client_task) {
+        /* The holder may be waiting for a completion only this task delivers: pump meanwhile. */
+        const TickType_t t0 = xTaskGetTickCount();
+        while (!(locked = xSemaphoreTake(h->ctrl_mutex, 0) == pdTRUE) &&
+               xTaskGetTickCount() - t0 < pdMS_TO_TICKS(lock_ms)) {
+            (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
+        }
+    } else if (h->ctrl_mutex != nullptr) {
+        locked = xSemaphoreTake(h->ctrl_mutex, pdMS_TO_TICKS(lock_ms)) == pdTRUE;
+    }
+    if (!locked) {
         ESP_LOGE(TAG, "device close skipped: control transfer path still busy");
         defer_device_close(h, dev);
         return false;
@@ -982,6 +1000,7 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
         h->ctrl_data_len = 0;
         xSemaphoreTake(h->ctrl_sem, 0);
 
+        const uint32_t seq = ++h->ctrl_seq_submitted;
         h->ctrl_inflight.store(true, std::memory_order_release);
         esp_err_t ret = usb_host_transfer_submit_control(h->client, x);
         if (ret != ESP_OK) {
@@ -991,17 +1010,31 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
         }
         bool completed = false;
         const TickType_t wait_ticks = pdMS_TO_TICKS(h->cfg.control_timeout_ms + 200);
+        const auto ours = [&]() {
+            return h->ctrl_seq_done.load(std::memory_order_acquire) == seq;
+        };
+        const TickType_t started = xTaskGetTickCount();
         if (xTaskGetCurrentTaskHandle() == h->client_task) {
-            const TickType_t started = xTaskGetTickCount();
             do {
-                if (xSemaphoreTake(h->ctrl_sem, 0) == pdTRUE) {
+                if (xSemaphoreTake(h->ctrl_sem, 0) == pdTRUE && ours()) {
                     completed = true;
                     break;
                 }
                 (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
             } while (xTaskGetTickCount() - started < wait_ticks);
         } else {
-            completed = xSemaphoreTake(h->ctrl_sem, wait_ticks) == pdTRUE;
+            /* A give left by an earlier request's late completion is skipped, not counted. */
+            for (;;) {
+                const TickType_t spent = xTaskGetTickCount() - started;
+                if (spent >= wait_ticks ||
+                    xSemaphoreTake(h->ctrl_sem, wait_ticks - spent) != pdTRUE) {
+                    break;
+                }
+                if (ours()) {
+                    completed = true;
+                    break;
+                }
+            }
         }
         if (!completed) {
             final_err = ESP_RTL_SDR_ERR_TIMEOUT;
@@ -1040,6 +1073,20 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
     return final_err;
 }
 
+/* Take ctrl_mutex. On the client task, keep pumping client events while waiting: the holder
+ * (an app-task probe or EP0 window) waits for a control completion that only this task can
+ * deliver, so blocking here stalled both until the holder's control timeout ran out. */
+static void ctrl_mutex_take(esp_rtl_sdr_handle *h)
+{
+    if (xTaskGetCurrentTaskHandle() != h->client_task || h->client == nullptr) {
+        xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+        return;
+    }
+    while (xSemaphoreTake(h->ctrl_mutex, 0) != pdTRUE) {
+        (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
+    }
+}
+
 static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t dev, uint8_t bm,
                                     uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
                                     const uint8_t *data, uint16_t wLength, bool expect_stall,
@@ -1048,7 +1095,7 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
     if (h->ctrl_xfer == nullptr || dev == nullptr) {
         return ESP_RTL_SDR_ERR_USB;
     }
-    xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+    ctrl_mutex_take(h);
     const esp_err_t err = ctrl_transfer_locked(h, dev, bm, bRequest, wValue, wIndex, data,
                                                wLength, expect_stall, response, response_length);
     xSemaphoreGive(h->ctrl_mutex);
@@ -1065,7 +1112,7 @@ static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest
     /* Read h->dev under ctrl_mutex: a disconnect closes it under the same lock, so a transfer can
      * never be submitted to a device that was just closed. device_gone covers the interval between
      * the unplug event and that close. */
-    xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+    ctrl_mutex_take(h);
     usb_device_handle_t dev = h->dev;
     if (h->device_gone) {
         dev = nullptr;
@@ -2287,6 +2334,15 @@ static void bulk_recover_stall(esp_rtl_sdr_handle *h)
  * Safe from delivery task or app tasks. Coalesces: if pending changes mid-apply,
  * leaves the newer pending_retune_hz set for another pass.
  */
+/** Clear pending_retune_hz only if it still holds hz: a retune queued meanwhile (from another
+ * task, outside the API lock) must survive. Compare and clear as one atomic step. */
+static void clear_pending_retune_if(esp_rtl_sdr_handle *h, uint32_t hz)
+{
+    uint32_t expected = hz;
+    (void)__atomic_compare_exchange_n(&h->pending_retune_hz, &expected, 0u, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
 {
     if (h == nullptr || !h->streaming) {
@@ -2318,9 +2374,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
 
     if (!h->streaming) {
         h->pause_resubmit = false;
-        if (h->pending_retune_hz == freq) {
-            h->pending_retune_hz = 0;
-        }
+        clear_pending_retune_if(h, freq);
         h->retune_busy = false;
         h->ep0_sideband_busy = false;
         return ESP_RTL_SDR_ERR_NOT_STREAMING;
@@ -2373,9 +2427,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             h->pending_gain = false;
             h->pending_gain_mode = false;
         }
-        if (h->pending_retune_hz == tune_hz) {
-            h->pending_retune_hz = 0;
-        }
+        clear_pending_retune_if(h, tune_hz);
         ESP_LOGI(TAG, "hot retune applied rf=%u Hz tuner=%u Hz direct=%d",
                  static_cast<unsigned>(tune_hz),
                  static_cast<unsigned>(rtl_profile_tuner_frequency_hz(
@@ -2387,9 +2439,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
         if (measured_bw && h->bandwidth_requested_hz == requested_width) {
             h->pending_bandwidth = false; /* failed bundled request; do not apply at old RF */
         }
-        if (h->pending_retune_hz == tune_hz) {
-            h->pending_retune_hz = 0;
-        }
+        clear_pending_retune_if(h, tune_hz);
         if (h->state == ESP_RTL_SDR_STATE_FAULT) {
             fault = true; /* the bandwidth transaction could not restore the previous plan */
         } else if (!measured_bw && h->streaming) {
@@ -4186,6 +4236,19 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
         if (esp_timer_get_time() >= deadline_us) return ESP_RTL_SDR_ERR_TIMEOUT;
         vTaskDelay(1);
     }
+    if (!have_ep0) {
+        /* stop() checked the state under the API lock, then released it to wait for the window.
+         * Meanwhile another stop() may have finished and a start() may have begun, so look
+         * again: running on would tear down (or mark IDLE) a stream that is starting. */
+        HandleLock lk(h, kQueryLockTicks);
+        const esp_rtl_sdr_state_t st = lk.ok() ? h->state : ESP_RTL_SDR_STATE_STREAMING;
+        if (st == ESP_RTL_SDR_STATE_IDLE || st == ESP_RTL_SDR_STATE_UNINSTALLED ||
+            st == ESP_RTL_SDR_STATE_STARTING) {
+            lk.release();
+            h->ep0_sideband_busy = false;
+            return st == ESP_RTL_SDR_STATE_STARTING ? ESP_RTL_SDR_ERR_BUSY : ESP_OK;
+        }
+    }
 
     const bool was_streaming = h->streaming || h->state == ESP_RTL_SDR_STATE_STREAMING ||
                                h->state == ESP_RTL_SDR_STATE_STOPPING;
@@ -5944,28 +6007,36 @@ static esp_err_t apply_pending_sideband_ep0(esp_rtl_sdr_handle *h)
     }
     if (h->ep0_sideband_busy.exchange(true)) return ESP_OK;
 
-    const bool do_bias = h->pending_bias;
+    /* Take each request with an atomic exchange and read its payload only afterwards. Copying
+     * everything and then clearing the flags lost a request that a setter (which writes outside
+     * the API lock) queued in between. A payload written after the exchange is applied now and,
+     * because its flag is set again, once more on the next pass. */
+    const auto take = [](volatile bool *flag) {
+        return __atomic_exchange_n(flag, false, __ATOMIC_ACQ_REL);
+    };
+    const bool do_bias = take(&h->pending_bias);
     const bool bias_en = h->pending_bias_enable;
-    const bool do_mode = h->pending_gain_mode;
+    const bool do_mode = take(&h->pending_gain_mode);
     const esp_rtl_sdr_gain_mode_t mode_val = h->pending_gain_mode_val;
-    const bool do_gain = h->pending_gain;
+    const bool do_gain = take(&h->pending_gain);
     const int gain_t = h->pending_gain_tenth;
-    const bool do_rtl = h->pending_rtl_agc;
+    const bool do_rtl = take(&h->pending_rtl_agc);
     const bool rtl_en = h->pending_rtl_agc_enable;
-    const bool do_bandwidth = h->pending_bandwidth;
+    const bool do_bandwidth = take(&h->pending_bandwidth);
     const uint32_t width_hz = h->bandwidth_requested_hz;
-    h->pending_bias = false;
-    h->pending_gain = false;
-    h->pending_gain_mode = false;
-    h->pending_rtl_agc = false;
-    h->pending_bandwidth = false;
 
     if (!bulk_pause_and_drain(h)) {
-        h->pending_bias |= do_bias;
-        h->pending_gain |= do_gain;
-        h->pending_gain_mode |= do_mode;
-        h->pending_rtl_agc |= do_rtl;
-        h->pending_bandwidth |= do_bandwidth;
+        /* Put back only what was taken; a newer request may already be pending. */
+        const auto put_back = [](volatile bool *flag, bool taken) {
+            if (taken) {
+                __atomic_store_n(flag, true, __ATOMIC_RELEASE);
+            }
+        };
+        put_back(&h->pending_bias, do_bias);
+        put_back(&h->pending_gain, do_gain);
+        put_back(&h->pending_gain_mode, do_mode);
+        put_back(&h->pending_rtl_agc, do_rtl);
+        put_back(&h->pending_bandwidth, do_bandwidth);
         h->ep0_sideband_busy = false;
         return ESP_RTL_SDR_ERR_TIMEOUT;
     }
@@ -6048,7 +6119,7 @@ static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *ap
     /* Streaming: queue for delivery task (non-blocking for HTTP/UI). */
     if (h->streaming) {
         h->pending_gain_tenth = tenth_db;
-        h->pending_gain = true;
+        __atomic_store_n(&h->pending_gain, true, __ATOMIC_RELEASE); /* after the payload */
         if (applied_tenth != nullptr) {
             *applied_tenth = rtl_profile_uses_r820t2_i2c_remap(h->profile)
                                  ? kR820T2GainSteps[r820t2_nearest_gain_index(tenth_db)].tenth_db
@@ -6064,7 +6135,7 @@ static esp_err_t apply_profile_bias(esp_rtl_sdr_handle *h, bool enable)
 {
     if (h->streaming) {
         h->pending_bias_enable = enable;
-        h->pending_bias = true;
+        __atomic_store_n(&h->pending_bias, true, __ATOMIC_RELEASE); /* after the payload */
         h->bias_tee_want = enable; /* preference immediately; EP0 async */
         return ESP_OK;
     }
@@ -6076,7 +6147,7 @@ static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
 {
     if (h->streaming) {
         h->pending_gain_mode_val = mode;
-        h->pending_gain_mode = true;
+        __atomic_store_n(&h->pending_gain_mode, true, __ATOMIC_RELEASE); /* after the payload */
         if (mode == ESP_RTL_SDR_GAIN_MODE_AUTO) {
             h->pending_gain = false; /* AUTO replaces a queued ladder write */
         }
@@ -6096,6 +6167,32 @@ static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
         h->tuner_auto_applied = false;
     }
     return err;
+}
+
+/**
+ * Gate for the gain / bias / AGC setters (caller holds the API lock). They used to check only
+ * iface_claimed / dev, but start() claims the interface with the lock released and streaming
+ * still false, so a setter took the direct EP0 path in the middle of the init table; and a FAULT
+ * after a failed drain keeps the claim while URBs are still live.
+ */
+static esp_err_t ep0_setter_gate(const esp_rtl_sdr_handle *h)
+{
+    switch (h->state) {
+    case ESP_RTL_SDR_STATE_STARTING:
+    case ESP_RTL_SDR_STATE_STOPPING:
+        return ESP_RTL_SDR_ERR_BUSY;
+    case ESP_RTL_SDR_STATE_FAULT:
+        return ESP_RTL_SDR_ERR_FAULT;
+    default:
+        break;
+    }
+    /* IDLE: a claim kept after a refused release (see release_interface) is not an open stream;
+     * a direct EP0 write there could run into a start() that begins right after this check. */
+    if (h->state != ESP_RTL_SDR_STATE_STREAMING || !h->iface_claimed || h->dev == nullptr ||
+        h->device_gone) {
+        return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+    }
+    return ESP_OK;
 }
 
 esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
@@ -6122,9 +6219,10 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         const uint32_t rf_hz = handle->pending_retune_hz != 0
                                    ? handle->pending_retune_hz
@@ -6194,9 +6292,10 @@ esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         const uint32_t rf_hz = handle->pending_retune_hz != 0
                                    ? handle->pending_retune_hz
@@ -6320,7 +6419,7 @@ esp_err_t esp_rtl_sdr_set_tuner_bandwidth(esp_rtl_sdr_handle_t handle, uint32_t 
         return ESP_RTL_SDR_ERR_UNSUPPORTED;
     }
     handle->bandwidth_requested_hz = hz;
-    handle->pending_bandwidth = true;
+    __atomic_store_n(&handle->pending_bandwidth, true, __ATOMIC_RELEASE); /* after the payload */
     set_error_unlocked(handle, ESP_OK); /* accepted, not yet applied */
     return ESP_OK;
 }
@@ -6393,9 +6492,10 @@ esp_err_t esp_rtl_sdr_set_bias_tee(esp_rtl_sdr_handle_t handle, bool enable)
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         handle->bias_tee_want = enable;
     }
@@ -6439,13 +6539,14 @@ esp_err_t esp_rtl_sdr_set_rtl_agc(esp_rtl_sdr_handle_t handle, bool enable)
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         if (handle->streaming) {
             handle->pending_rtl_agc_enable = enable;
-            handle->pending_rtl_agc = true;
+            __atomic_store_n(&handle->pending_rtl_agc, true, __ATOMIC_RELEASE); /* after the payload */
             handle->rtl_agc_want = enable;
             set_error_unlocked(handle, ESP_OK);
             return ESP_OK;
