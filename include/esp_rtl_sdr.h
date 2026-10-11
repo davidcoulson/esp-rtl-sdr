@@ -716,9 +716,14 @@ typedef struct {
      * esp_rtl_sdr_is_rate_supported().
      */
     uint32_t sample_rate_sps;
-    /** 0 = continuous until stop. Else exact CU8 byte bound (even). */
+    /**
+     * 0 = continuous until stop. Else exact CU8 byte bound (even): at most this many bytes are
+     * delivered (callback blocks and read() together), then the driver stops fetching. read()
+     * returns what is still buffered, then ERR_NOT_STREAMING. Call stop() to release the stream.
+     */
     uint64_t max_bytes;
-    /** Soft wall-clock limit for bounded capture; 0 = none. */
+    /** Soft wall-clock limit for bounded capture (ends delivery like max_bytes, checked about
+     *  every 50 ms); 0 = none. */
     uint32_t timeout_ms;
 } esp_rtl_sdr_stream_config_t;
 
