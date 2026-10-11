@@ -39,9 +39,16 @@ menu "ESP_RTL_SDR-ESP"
         config ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR
             bool "librtlsdr r82xx_set_bandwidth (osmocom / rtl-sdr-blog)"
             help
-                What osmocom librtlsdr and rtl-sdr-blog (and so a Linux rtl_433) compute.
-                250k: 0xe6 / 2.125 MHz IF, 2048k: 0xaf / 1.625 MHz, above 2.43 MS/s
-                0x6b / 3.57 MHz with reg 0x0a bit 4 set.
+                What osmocom librtlsdr and rtl-sdr-blog compute, and what the vendor DLL
+                writes on a Blog V4 at every rate. 250k: 0xe6 / 2.125 MHz IF, 2048k:
+                0xaf / 1.625 MHz, above 2.43 MS/s 0x6b / 3.57 MHz with reg 0x0a bit 4 set.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_VENDOR_FIXED
+            bool "Vendor fixed (wide filter, 3.57 MHz IF at every rate)"
+            help
+                What the vendor DLL leaves on a Blog V3c or Nooelec v5 after a cold open,
+                and what upstream esp-rtl-sdr does: reg 0x0a bit 4 set, 0x0b = 0x6b,
+                3.57 MHz IF, whatever the rate.
     endchoice
 
 endmenu

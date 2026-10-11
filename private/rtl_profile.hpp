@@ -372,16 +372,20 @@ inline double rtl_profile_pll_if_offset_hz(RtlProfileId profile)
  * signal sits at the filter edge and the image (7.14 MHz off) is barely rejected, which on a busy
  * band (915 MHz ISM) buries the wanted signals under the AGC-amplified neighbours.
  *
- * Two mappings, picked at build time (Kconfig ESP_RTL_SDR_ESP_R820T2_IF_MODE, see
- * docs/KCONFIG.md); the default keeps the table the driver has shipped since it gained this step.
+ * Three mappings, picked at build time (Kconfig ESP_RTL_SDR_ESP_R820T2_IF_MODE, see
+ * docs/KCONFIG.md, which also has the A/B procedure between them); the default keeps the table
+ * the driver has shipped since it gained this step.
  */
 enum class R820T2IfMode : uint8_t {
-    Table,     /* rtl_r820t2_if_for_rate_table(): the driver's own table (default) */
-    Librtlsdr, /* rtl_r820t2_if_for_rate_librtlsdr(): r82xx_set_bandwidth() */
+    Table,       /* rtl_r820t2_if_for_rate_table(): the driver's own table (default) */
+    Librtlsdr,   /* rtl_r820t2_if_for_rate_librtlsdr(): r82xx_set_bandwidth() */
+    VendorFixed, /* rtl_r820t2_if_vendor_fixed(): wide filter, 3.57 MHz IF at every rate */
 };
 
 #if defined(CONFIG_ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR)
 constexpr R820T2IfMode kR820T2IfModeBuild = R820T2IfMode::Librtlsdr;
+#elif defined(CONFIG_ESP_RTL_SDR_ESP_R820T2_IF_VENDOR_FIXED)
+constexpr R820T2IfMode kR820T2IfModeBuild = R820T2IfMode::VendorFixed;
 #else
 constexpr R820T2IfMode kR820T2IfModeBuild = R820T2IfMode::Table;
 #endif
@@ -405,7 +409,8 @@ struct R820T2IfSetting {
  * caller uses osmocom's mask 0x10, so only bit 4 reaches the tuner: clear up to 5 MS/s, where
  * osmocom sets it above 2.43 MS/s. The table found 915 MHz utility meters at 2048k on a
  * Nooelec SMArt v5 that the replayed filter missed (0 -> 5 decodes in 10 min, Linux rtl_433: 10);
- * whether the librtlsdr mapping does better is the A/B in docs/KCONFIG.md.
+ * that was measured against the mismatched replayed filter, not against the vendor's matched
+ * wide filter (rtl_r820t2_if_vendor_fixed), which the A/B in docs/KCONFIG.md compares.
  */
 inline R820T2IfSetting rtl_r820t2_if_for_rate_table(uint32_t sample_rate_sps)
 {
@@ -437,6 +442,11 @@ inline R820T2IfSetting rtl_r820t2_if_for_rate_table(uint32_t sample_rate_sps)
  * 380 kHz, bit 6 for 350 kHz; a set bit means off) only while the rate exceeds what the low-pass
  * filter alone can pass, picks the narrowest low-pass corner that still exceeds what is left
  * (reg 0x0b bits 3:0 = 15 - index), and centres the IF on the resulting passband.
+ *
+ * The same values appear in hardcoreerik/esp-rtl-sdr's own vendor-DLL captures (docs/captures,
+ * 2026-10-01): the Blog V4/V4L rate matrix at every accepted rate, and the Nooelec v5's explicit
+ * tuner-bandwidth choices at 2.4 MS/s (200k/300k, 500k, 1M, 1.8M, 2.4M). On a cold open the same
+ * DLL leaves the V3c and the Nooelec at rtl_r820t2_if_vendor_fixed() instead.
  */
 inline R820T2IfSetting rtl_r820t2_if_for_rate_librtlsdr(uint32_t sample_rate_sps)
 {
@@ -484,11 +494,29 @@ inline R820T2IfSetting rtl_r820t2_if_for_rate_librtlsdr(uint32_t sample_rate_sps
     return {0x00, reg0b, static_cast<uint32_t>(if_hz)};
 }
 
+/**
+ * What the RTL-SDR Blog 1.4.0 DLL leaves on a Blog V3c (0a/0b = d5/6b) and a Nooelec v5 (d3/6b)
+ * after a cold open at any accepted rate: the wide filter and a 3.57 MHz IF, the rate ignored
+ * (hardcoreerik/esp-rtl-sdr docs/captures/vendor_dll_rate_matrix_2026-10-01.md, two identical runs
+ * per dongle). Upstream master's cold start ends in the same state (d5/6b, 3.57 MHz). Only bit 4 of
+ * reg 0x0a is written here, so the low nibble stays as the init left it (5, as upstream; the
+ * DLL's Nooelec has 3). The DLL's behaviour on a hot rate change was not captured.
+ */
+inline R820T2IfSetting rtl_r820t2_if_vendor_fixed(uint32_t sample_rate_sps)
+{
+    (void)sample_rate_sps;
+    return {0x10, 0x6b, 3570000u};
+}
+
 inline R820T2IfSetting rtl_r820t2_if_for_rate(uint32_t sample_rate_sps,
                                               R820T2IfMode mode = kR820T2IfModeBuild)
 {
-    return mode == R820T2IfMode::Librtlsdr ? rtl_r820t2_if_for_rate_librtlsdr(sample_rate_sps)
-                                           : rtl_r820t2_if_for_rate_table(sample_rate_sps);
+    switch (mode) {
+    case R820T2IfMode::Librtlsdr: return rtl_r820t2_if_for_rate_librtlsdr(sample_rate_sps);
+    case R820T2IfMode::VendorFixed: return rtl_r820t2_if_vendor_fixed(sample_rate_sps);
+    case R820T2IfMode::Table: break;
+    }
+    return rtl_r820t2_if_for_rate_table(sample_rate_sps);
 }
 
 /** RTL2832 demod IF word (page 1 regs 0x19..0x1b), librtlsdr's rtlsdr_set_if_freq() arithmetic. */

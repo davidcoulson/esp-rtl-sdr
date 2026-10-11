@@ -493,6 +493,83 @@ static void test_r820t2_if_librtlsdr(void)
 }
 
 /*
+ * Vendor DLL (RTL-SDR Blog 1.4.0) register captures from hardcoreerik/esp-rtl-sdr @ a5dc9d8,
+ * docs/captures/rate_matrix_2026-10-01/, the run1 CSVs (run2 identical): a black-box source independent
+ * of both the librtlsdr C and the port. The DLL's IF column is the demod word converted back, so it
+ * reads a few Hz low (2124996 for 2125000); the word itself is compared exactly.
+ */
+struct R820T2VendorRow {
+    uint32_t rate;
+    uint8_t reg0a; /* only bit 4 is compared: the caller writes 0x0a with mask 0x10 */
+    uint8_t reg0b;
+    uint32_t if_hz;
+    uint32_t demod_word;
+};
+
+/* blog_v4_run1.csv: the V4 follows the rate */
+static const R820T2VendorRow kVendorV4RateMatrix[] = {
+    { 250000u, 0xc5u, 0xe6u, 2124996u, 0x3b471du}, { 256000u, 0xc5u, 0xe6u, 2124996u, 0x3b471du},
+    { 960000u, 0xc5u, 0xebu, 1699997u, 0x3c38e4u}, {1024000u, 0xc5u, 0xebu, 1699997u, 0x3c38e4u},
+    {1400000u, 0xc5u, 0xecu, 1575000u, 0x3c8000u}, {1800000u, 0xc5u, 0xacu, 1749998u, 0x3c1c72u},
+    {1920000u, 0xc5u, 0xaeu, 1674996u, 0x3c471du}, {2000000u, 0xc5u, 0xafu, 1624995u, 0x3c638fu},
+    {2048000u, 0xc5u, 0xafu, 1624995u, 0x3c638fu}, {2400000u, 0xc5u, 0x8fu, 1814996u, 0x3bf778u},
+    {2560000u, 0xd5u, 0x6bu, 3569994u, 0x381112u}, {2800000u, 0xd5u, 0x6bu, 3569994u, 0x381112u},
+    {2880000u, 0xd5u, 0x6bu, 3569994u, 0x381112u}, {3200000u, 0xd5u, 0x6bu, 3569994u, 0x381112u},
+};
+
+/* nooelec_v5_run1.csv (d3/6b) and blog_v3c_run1.csv (d5/6b): same at every accepted rate */
+static const uint32_t kVendorAcceptedRates[] = {250000u,  256000u,  960000u,  1024000u, 1400000u,
+                                                1800000u, 1920000u, 2000000u, 2048000u, 2400000u,
+                                                2560000u, 2800000u, 2880000u, 3200000u};
+
+/* nooelec_v5_2026-09-30.md, explicit tuner bandwidth at 2.4 MS/s (reg0a c3): width -> 0b / IF word */
+static const R820T2VendorRow kVendorNooelecBandwidth[] = {
+    { 200000u, 0xc3u, 0xe6u, 2125000u, 0x3b471du}, { 300000u, 0xc3u, 0xe6u, 2125000u, 0x3b471du},
+    { 500000u, 0xc3u, 0xe8u, 2025000u, 0x3b8000u}, {1000000u, 0xc3u, 0xebu, 1700000u, 0x3c38e4u},
+    {1800000u, 0xc3u, 0xacu, 1750000u, 0x3c1c72u}, {2400000u, 0xc3u, 0x8fu, 1815000u, 0x3bf778u},
+};
+
+static void test_r820t2_if_vendor_captures(void)
+{
+    /* librtlsdr mode = the DLL on the V4 at every rate it accepts */
+    for (const R820T2VendorRow &v : kVendorV4RateMatrix) {
+        const int failed_before = g_failed;
+        const R820T2IfSetting s = rtl_r820t2_if_for_rate(v.rate, R820T2IfMode::Librtlsdr);
+        EXPECT_EQ_U(s.reg0a & 0x10u, v.reg0a & 0x10u);
+        EXPECT_EQ_U(s.reg0b, v.reg0b);
+        EXPECT_EQ_U(rtl_demod_if_word(s.if_hz, 28800000u), v.demod_word);
+        EXPECT_TRUE(s.if_hz >= v.if_hz && s.if_hz - v.if_hz < 10u);
+        if (g_failed != failed_before) {
+            std::printf("  ^ librtlsdr vs vendor V4 rate matrix at %u S/s\n", static_cast<unsigned>(v.rate));
+        }
+    }
+    /* and the DLL's Nooelec explicit bandwidths (the same function, bw = width) */
+    for (const R820T2VendorRow &v : kVendorNooelecBandwidth) {
+        const R820T2IfSetting s = rtl_r820t2_if_for_rate(v.rate, R820T2IfMode::Librtlsdr);
+        EXPECT_EQ_U(s.reg0b, v.reg0b);
+        EXPECT_EQ_U(s.if_hz, v.if_hz);
+        EXPECT_EQ_U(rtl_demod_if_word(s.if_hz, 28800000u), v.demod_word);
+    }
+    /* vendor-fixed mode = the DLL's cold open on the V3c (d5/6b) and Nooelec (d3/6b) */
+    for (uint32_t rate : kVendorAcceptedRates) {
+        const R820T2IfSetting s = rtl_r820t2_if_for_rate(rate, R820T2IfMode::VendorFixed);
+        EXPECT_EQ_U(s.reg0a & 0x10u, 0xd3u & 0x10u);
+        EXPECT_EQ_U(s.reg0a & 0x10u, 0xd5u & 0x10u);
+        EXPECT_EQ_U(s.reg0b, 0x6bu);
+        EXPECT_EQ_U(rtl_demod_if_word(s.if_hz, 28800000u), 0x381112u);
+        /* LO = RF + 3.57 MHz, the IF the R820T2 profiles' cold PLL math already uses */
+        EXPECT_EQ_U(s.if_hz, kBlogV3DemodIfHz);
+    }
+    /* the replayed init's c5/8f (2.2 MHz filter) under a 3.57 MHz IF is none of the three */
+    for (R820T2IfMode m : {R820T2IfMode::Table, R820T2IfMode::Librtlsdr, R820T2IfMode::VendorFixed}) {
+        for (uint32_t rate : kVendorAcceptedRates) {
+            const R820T2IfSetting s = rtl_r820t2_if_for_rate(rate, m);
+            EXPECT_TRUE(!(s.reg0b == 0x8fu && s.if_hz == 3570000u));
+        }
+    }
+}
+
+/*
  * The driver table's provenance: the commented-out "settings from Oldenburger" table in the
  * librtlsdr/librtlsdr fork's src/tuner_r82xx.c @ cd36c28 (rows in kHz, reg 0x0a, reg 0x0b, IF kHz).
  */
@@ -604,6 +681,7 @@ int main(void)
     test_r820t2_band_select();
     test_r820t2_if_librtlsdr();
     test_r820t2_if_table();
+    test_r820t2_if_vendor_captures();
     test_r82xx_bitrev();
     test_detection_matrix();
     test_unknown_reject_and_v3_probe();
