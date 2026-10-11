@@ -1820,6 +1820,19 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 /* Defined below; bulk_cb's read-only fast path fills the ring directly. */
 static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
 
+/* 64-bit counters written from the USB client task (bulk_cb) or a reader task without the API
+ * lock. On a 32-bit core a plain 64-bit access is two loads/stores, so get_metrics() could read
+ * a torn value; __atomic on 8 bytes is emulated (critical section) by ESP-IDF where needed. */
+static inline void metric_add64(uint64_t *p, uint64_t v)
+{
+    (void)__atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+}
+
+static inline uint64_t metric_load64(const uint64_t *p)
+{
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
 static uint32_t live_urbs_get(esp_rtl_sdr_handle *h)
 {
     return __atomic_load_n(&h->live_urbs, __ATOMIC_ACQUIRE);
@@ -1895,7 +1908,7 @@ static void bulk_cb(usb_transfer_t *xfer)
             !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode)) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
             pull_ring_push(h, xfer->data_buffer, n);
-            h->metrics.bytes_total += n;
+            metric_add64(&h->metrics.bytes_total, n);
             h->metrics.blocks_total++;
             h->last_xfer_timestamp_us = esp_timer_get_time();
             h->ep_recoveries_at_data = h->ep_recoveries;
@@ -1961,7 +1974,7 @@ static void bulk_cb(usb_transfer_t *xfer)
                 !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode) &&
                 h->pull_buf != nullptr) {
                 pull_ring_push(h, slot->data, slot->bytes);
-                h->metrics.bytes_total += slot->bytes;
+                metric_add64(&h->metrics.bytes_total, slot->bytes);
                 h->metrics.blocks_total++;
                 (void)xQueueSend(h->free_q, &slot, 0);
                 if (h->streaming && !h->pause_resubmit && !h->device_gone) {
@@ -1990,7 +2003,7 @@ static void bulk_cb(usb_transfer_t *xfer)
                 h->metrics.overruns++;
                 slot->flags |= ESP_RTL_SDR_IQ_FLAG_OVERRUN;
             } else {
-                h->metrics.bytes_total += copy;
+                metric_add64(&h->metrics.bytes_total, copy);
                 h->metrics.blocks_total++;
                 if (copy > 0) {
                     uint8_t mn = 255, mx = 0;
@@ -2474,7 +2487,7 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
     if (n < bytes) {
         const size_t lost = bytes - n;
         h->metrics.consumer_drops += static_cast<uint32_t>(lost);
-        h->metrics.ring_overrun_bytes += lost;
+        metric_add64(&h->metrics.ring_overrun_bytes, lost);
         h->metrics.ring_overrun_blocks++;
     }
     if (n == 0) {
@@ -3749,6 +3762,11 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     if (verr != ESP_OK) {
         return verr;
     }
+    /* FreeRTOS asserts (or silently clamps) a priority at or above configMAX_PRIORITIES; the
+     * pure validator cannot see that limit, so check it here. 0 = driver default. */
+    if (config->usb_task_priority >= configMAX_PRIORITIES) {
+        return ESP_ERR_INVALID_ARG;
+    }
 
     auto *h = new (std::nothrow) esp_rtl_sdr_handle();
     if (h == nullptr) {
@@ -4001,13 +4019,17 @@ esp_err_t esp_rtl_sdr_get_metrics(esp_rtl_sdr_handle_t handle,
         return ESP_RTL_SDR_ERR_TIMEOUT;
     }
     *out_metrics = handle->metrics;
+    out_metrics->bytes_total = metric_load64(&handle->metrics.bytes_total);
+    out_metrics->ring_overrun_bytes = metric_load64(&handle->metrics.ring_overrun_bytes);
+    out_metrics->pull_lock_miss_bytes = metric_load64(&handle->metrics.pull_lock_miss_bytes);
+    out_metrics->bytes_consumed = metric_load64(&handle->metrics.bytes_consumed);
     out_metrics->frequency_hz = handle->frequency_hz;
     out_metrics->sample_rate_sps = handle->sample_rate_sps;
     if (handle->state == ESP_RTL_SDR_STATE_STREAMING && handle->stream_start_ms != 0) {
         out_metrics->uptime_ms = now_ms() - handle->stream_start_ms;
         if (out_metrics->uptime_ms > 0) {
             out_metrics->effective_sps = static_cast<uint32_t>(
-                (handle->metrics.bytes_total * 500ull) / out_metrics->uptime_ms);
+                (metric_load64(&handle->metrics.bytes_total) * 500ull) / out_metrics->uptime_ms);
         }
     }
     return ESP_OK;
@@ -4103,15 +4125,15 @@ esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
     }
     esp_rtl_sdr_stream_stats_default(out);
     out->device_id = handle->logical_index;
-    out->bytes_received = handle->metrics.bytes_total;
+    out->bytes_received = metric_load64(&handle->metrics.bytes_total);
     out->slot_starve_blocks = handle->metrics.slot_starve_blocks;
     out->ring_overrun_blocks = handle->metrics.ring_overrun_blocks;
-    out->ring_overrun_bytes = handle->metrics.ring_overrun_bytes;
+    out->ring_overrun_bytes = metric_load64(&handle->metrics.ring_overrun_bytes);
     out->pull_lock_miss_blocks = handle->metrics.pull_lock_miss_blocks;
-    out->pull_lock_miss_bytes = handle->metrics.pull_lock_miss_bytes;
-    out->bytes_consumed = handle->metrics.bytes_consumed;
+    out->pull_lock_miss_bytes = metric_load64(&handle->metrics.pull_lock_miss_bytes);
+    out->bytes_consumed = metric_load64(&handle->metrics.bytes_consumed);
     out->ring_high_water_bytes = handle->metrics.ring_high_water;
-    out->samples_received = handle->metrics.bytes_total / 2u;
+    out->samples_received = metric_load64(&handle->metrics.bytes_total) / 2u;
     out->usb_transfer_count = handle->usb_xfer_count;
     out->usb_transfer_errors = handle->usb_xfer_errors;
     out->usb_timeouts = handle->usb_timeouts;
@@ -4124,7 +4146,7 @@ esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
         out->stream_uptime_ms = now_ms() - handle->stream_start_ms;
         if (out->stream_uptime_ms > 0) {
             out->effective_sample_rate = static_cast<uint32_t>(
-                (handle->metrics.bytes_total * 500ull) / out->stream_uptime_ms);
+                (metric_load64(&handle->metrics.bytes_total) * 500ull) / out->stream_uptime_ms);
         }
     }
     return ESP_OK;
@@ -4259,8 +4281,21 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         return ESP_RTL_SDR_ERR_STALE_HANDLE;
     }
 
+    /* Copy only the struct_size bytes the caller has (an app built against an older header
+     * passes a shorter struct; reading sizeof(*stream) overruns it), defaults for the rest.
+     * stream_config_validate() below range-checks struct_size itself. */
+    if (stream->struct_size == 0 || stream->struct_size > sizeof(esp_rtl_sdr_stream_config_t)) {
+        HandleLock lk(handle, kQueryLockTicks);
+        if (lk.ok()) {
+            set_error_unlocked(handle, ESP_ERR_INVALID_ARG);
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_rtl_sdr_stream_config_t local;
+    esp_rtl_sdr_stream_config_default(&local);
+    std::memcpy(&local, stream, stream->struct_size);
+
     /* Fill zeros from preferred LO/rate (Phase 1 desktop-shaped set_* APIs). */
-    esp_rtl_sdr_stream_config_t local = *stream;
     {
         HandleLock lk(handle, kQueryLockTicks);
         if (lk.ok()) {
@@ -4893,8 +4928,11 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
         }
     }
 
-    const TickType_t deadline =
-        timeout_ms == 0 ? 0 : (xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms));
+    /* Elapsed-time arithmetic (unsigned subtraction) stays right across a tick-counter wrap;
+     * comparing an absolute deadline with the tick count did not, and returned TIMEOUT at once
+     * for every read whose deadline wrapped (every ~49.7 days at 1 kHz). */
+    const TickType_t t_start = xTaskGetTickCount();
+    const TickType_t t_total = pdMS_TO_TICKS(timeout_ms);
     size_t copied = 0;
 
     for (;;) {
@@ -4921,7 +4959,7 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
                 handle->pull_r.store((r + n) % handle->pull_cap,
                                      std::memory_order_release);
                 copied += n;
-                handle->metrics.bytes_consumed += n;
+                metric_add64(&handle->metrics.bytes_consumed, n);
             }
         }
 
@@ -4932,22 +4970,18 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
         if (timeout_ms == 0) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        TickType_t wait = pdMS_TO_TICKS(20);
-        if (deadline > xTaskGetTickCount()) {
-            const TickType_t left = deadline - xTaskGetTickCount();
-            if (left < wait) {
-                wait = left;
-            }
-        } else {
+        const TickType_t elapsed = xTaskGetTickCount() - t_start;
+        if (elapsed >= t_total) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
+        }
+        TickType_t wait = pdMS_TO_TICKS(20);
+        if (t_total - elapsed < wait) {
+            wait = t_total - elapsed;
         }
         if (handle->pull_sem != nullptr) {
             (void)xSemaphoreTake(handle->pull_sem, wait);
         } else {
             vTaskDelay(wait);
-        }
-        if (xTaskGetTickCount() >= deadline) {
-            return ESP_RTL_SDR_ERR_TIMEOUT;
         }
     }
     return copied > 0 ? ESP_OK : ESP_RTL_SDR_ERR_TIMEOUT;
@@ -5369,7 +5403,7 @@ static void fill_health_info(const esp_rtl_sdr_handle *h, esp_rtl_sdr_health_inf
     const uint32_t up = now_ms() - h->stream_start_ms;
     if (up > 0) {
         out->effective_sps =
-            static_cast<uint32_t>((h->metrics.bytes_total * 500ull) / up);
+            static_cast<uint32_t>((metric_load64(&h->metrics.bytes_total) * 500ull) / up);
     }
     if (out->programmed_sps > 0 && out->effective_sps > 0) {
         out->efficiency =
