@@ -57,8 +57,9 @@ HARNESS = r'''
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
-#define RTL_LOGW(...) ((void)0)
 #define RTL_LOGI(...) ((void)0)
+static unsigned rtl_warnings = 0;
+#define RTL_LOGW(...) ((void)++rtl_warnings)
 #define RTL_LOGE(...) ((void)0)
 #define RTL_LOGD(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
@@ -77,7 +78,7 @@ struct esp_rtl_sdr_handle {
     esp_err_t last_error = ESP_OK;
     uint32_t frequency_hz = 99100000, preferred_frequency_hz = 99100000;
     int32_t freq_correction_ppm = 0;
-    uint32_t last_pll_if_hz = 0, last_lo_hz = 0;
+    uint32_t last_pll_if_hz = 0, last_lo_hz = 0, pll_unlocked_tunes = 0;
     bool e4000_offset_requested = false;
     uint32_t e4000_rate_sps = 2400000, e4000_offset_applied_hz = 0;
     bool ctrl_stall = false, bias_tee_want = false, tuner_auto_applied = false;
@@ -98,7 +99,7 @@ static bool handle_ok(esp_rtl_sdr_handle *h) { return h != nullptr; }
 static esp_err_t check_not_reentrant(esp_rtl_sdr_handle *) { return api_reentrant; }
 constexpr size_t kDemodBringupRecordCount = 86;
 static std::vector<RtlControlRecord> wire;
-static constexpr bool kFailTuneOnPllUnlock = true; // as in the driver
+static constexpr bool kFailTuneOnPllUnlock = false; // as in the driver
 static bool pll_locked = true; // what the tuner status read (regs 00..02) reports
 static size_t fail_transfer = 0;
 static uint8_t e4000_registers[256] = {};
@@ -496,9 +497,10 @@ int main() {
     // Mode A (the default) has no plan: the cold reinit + demod IF restore above is its whole state.
     { MeasuredTunerBandwidthPlan plan{};
       CHECK(!r820t2_rate_plan(RtlProfileId::NooelecSmartV5, 2048000, 915000000, &plan)); }
-    // The PLL lock read is checked: an unlocked PLL fails the tune (and its re-reads go over the wire).
-    h = {}; wire.clear(); pll_locked = false;
-    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_RTL_SDR_ERR_PLL_UNLOCKED);
+    // The PLL lock read is checked: an unlocked PLL is re-read, warned about and counted, and the tune goes on.
+    h = {}; wire.clear(); pll_locked = false; const unsigned warned = rtl_warnings;
+    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_OK);
+    CHECK(rtl_warnings == warned + 1); CHECK(h.pll_unlocked_tunes == 1);
     size_t lock_reads = 0;
     for (const auto &r : wire)
         if (r.request_type == 0xc0 && r.index == 0x0600 && r.length == 3) ++lock_reads;

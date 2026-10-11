@@ -264,7 +264,7 @@ Any in-window rate is quantized to an exact RTL2832 ratio (`quantize_sample_rate
 | `ESP_RTL_SDR_ERR_STALE_HANDLE` | Use after uninstall | Clear pointer |
 | `ESP_RTL_SDR_ERR_REENTRANT` | Forbidden API from event callback | Defer to app task |
 | `ESP_RTL_SDR_ERR_NOT_CLAIMED` | Present but not claimed, or gain/bias/AGC setter while not streaming | Start / claim path |
-| `ESP_RTL_SDR_ERR_PLL_UNLOCKED` | Tuner PLL did not lock after a tune (start fails; a hot retune is rolled back) | Try another frequency / report |
+| `ESP_RTL_SDR_ERR_PLL_UNLOCKED` | Reserved: only with the driver's strict PLL-lock policy (off by default; an unlocked read is logged) | Try another frequency / report |
 
 ### `esp_rtl_sdr_err_to_name`
 
