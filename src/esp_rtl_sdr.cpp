@@ -38,6 +38,7 @@
 #include "measured_gain_bias_v4.hpp"
 #include "measured_v4l_frontend.hpp"
 #include "measured_tuner_bandwidth.hpp"
+#include "r820t2_if_mode.hpp"
 #include "gain_r820t2.hpp"
 #include "r820t2_band.hpp"
 #include "rtl_usb_guard.hpp"
@@ -2505,6 +2506,17 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             applied_width = 0; /* width from a different route class */
         }
         err = apply_bandwidth_transaction(h, tune_hz, applied_width);
+    } else if (MeasuredTunerBandwidthPlan if_plan{};
+               r820t2_rate_plan(h->profile, h->sample_rate_sps, tune_hz, &if_plan)) {
+        /* R820T2 IF mode B/C: keep the plan's IF; leaving direct sampling replays the cold
+         * filter and 3.57 MHz demod IF, so re-apply the whole plan then. */
+        if (h->frequency_hz != 0 &&
+            rtl_profile_uses_v3_direct_sampling(h->profile, h->frequency_hz)) {
+            err = run_bandwidth_program(h, tune_hz, h->frequency_hz, if_plan);
+        } else {
+            err = run_profile_tune(h, tune_hz, h->frequency_hz, if_plan.if_hz);
+            if (err == ESP_OK) err = run_band_frontend(h, tune_hz);
+        }
     } else {
         err = run_profile_tune(h, tune_hz, previous_hz);
         if (err == ESP_OK) err = run_band_frontend(h, tune_hz);
@@ -2550,7 +2562,12 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
              * direct sampling), while frequency_hz and the IQ metadata still say previous_hz.
              * Tune back, with the failed target as the "previous" frequency so the matching
              * transition sequence runs. The bandwidth transaction does its own rollback. */
-            esp_err_t rb = run_profile_tune(h, previous_hz, tune_hz);
+            /* In R820T2 IF mode B/C the demod IF stays at the plan's value, so the PLL must be
+             * restored at that IF too (0 = the profile default, as in mode A). */
+            MeasuredTunerBandwidthPlan rb_plan{};
+            const uint32_t rb_if_hz =
+                r820t2_rate_plan(h->profile, h->sample_rate_sps, previous_hz, &rb_plan) ? rb_plan.if_hz : 0;
+            esp_err_t rb = run_profile_tune(h, previous_hz, tune_hz, rb_if_hz);
             if (rb == ESP_OK) rb = run_band_frontend(h, previous_hz);
             if (rb == ESP_OK) {
                 ESP_LOGW(TAG, "hot retune to %u Hz failed; kept %u Hz",
@@ -4753,6 +4770,18 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
             local.sample_rate_sps == ESP_RTL_SDR_RATE_2400K &&
             measured_tuner_bandwidth_count(handle->profile, freq, hf_direct_route(handle, freq)) != 0) {
             ret = apply_bandwidth_transaction(handle, freq, 0);
+        } else if (MeasuredTunerBandwidthPlan if_plan{};
+                   handle->bandwidth_requested_hz == 0 &&
+                   r820t2_rate_plan(handle->profile, local.sample_rate_sps, freq, &if_plan)) {
+            /* R820T2 IF mode B/C (Kconfig); mode A, the default, is the cold state above. */
+            ret = run_bandwidth_program(handle, freq, 0, if_plan);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "r820t2 IF mode=%s rate=%u r0a=%02x r0b=%02x if=%u Hz demod=%02x%02x%02x",
+                         rtl_r820t2_if_mode_name(kR820T2IfModeBuild),
+                         static_cast<unsigned>(local.sample_rate_sps), if_plan.reg0a,
+                         if_plan.reg0b, static_cast<unsigned>(if_plan.if_hz), if_plan.if19,
+                         if_plan.if1a, if_plan.if1b);
+            }
         } else {
             ret = run_profile_tune(handle, freq, 0);
             if (ret == ESP_OK) ret = run_band_frontend(handle, freq);

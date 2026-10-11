@@ -47,6 +47,7 @@ HARNESS = r'''
 #include "measured_gain_bias_v4.hpp"
 #include "measured_v4l_frontend.hpp"
 #include "measured_tuner_bandwidth.hpp"
+#include "r820t2_if_mode.hpp"
 #include "gain_r820t2.hpp"
 #define ESP_FAIL (-1)
 #define ESP_LOGI(...) ((void)0)
@@ -215,6 +216,30 @@ int main() {
         if (r.request_type == 0x40 && r.index == 0x0610 && r.length == 2 && r.data[0] == 0x1a && r.data[1] == 0x61)
             pll_1a_seen = true;
     CHECK(pll_1a_seen);
+    // R820T2 IF mode B/C (r820t2_if_mode.hpp): the plan start applies lands in 0a/0b, the demod IF
+    // (each byte with its settle read) and the PLL; a native retune keeps the plan's IF without
+    // rewriting the filter; leaving Q re-applies the plan over the reinit's d3/6b and 3.57 MHz.
+    for (R820T2IfMode mode : {R820T2IfMode::Table, R820T2IfMode::Librtlsdr}) {
+        for (uint32_t rate : {250000u, 1024000u, 2048000u, 2400000u, 2560000u}) {
+            MeasuredTunerBandwidthPlan plan{};
+            CHECK(r820t2_rate_plan(RtlProfileId::NooelecSmartV5, rate, 915000000, &plan, mode));
+            h = {}; wire.clear();
+            CHECK(run_v3_tuner_reinit(&h) == ESP_OK); CHECK(run_profile_demod_if_restore(&h) == ESP_OK);
+            CHECK(run_bandwidth_program(&h, 915000000, 0, plan) == ESP_OK);
+            CHECK(last_tuner(10) == plan.reg0a && last_tuner(11) == plan.reg0b);
+            if_bytes(plan.if19, plan.if1a, plan.if1b); CHECK(h.last_pll_if_hz == plan.if_hz);
+            wire.clear(); CHECK(run_profile_tune(&h, 433920000, 915000000, plan.if_hz) == ESP_OK);
+            CHECK(last_tuner(10) == -1 && last_tuner(11) == -1); CHECK(h.last_pll_if_hz == plan.if_hz);
+            wire.clear(); CHECK(run_profile_tune(&h, 1600000, 433920000) == ESP_OK); q_route();
+            wire.clear(); CHECK(run_bandwidth_program(&h, 433920000, 1600000, plan) == ESP_OK);
+            records_seen(kBlogV3DirectDisable, std::size(kBlogV3DirectDisable));
+            CHECK(last_tuner(10) == plan.reg0a && last_tuner(11) == plan.reg0b);
+            if_bytes(plan.if19, plan.if1a, plan.if1b); CHECK(h.last_pll_if_hz == plan.if_hz);
+        }
+    }
+    // Mode A (the default) has no plan: the cold reinit + demod IF restore above is its whole state.
+    { MeasuredTunerBandwidthPlan plan{};
+      CHECK(!r820t2_rate_plan(RtlProfileId::NooelecSmartV5, 2048000, 915000000, &plan)); }
     // The PLL lock read is checked: an unlocked PLL is re-read, warned about and counted, and the tune goes on.
     h = {}; wire.clear(); pll_locked = false; const unsigned warned = rtl_warnings;
     CHECK(run_profile_tune(&h, 433920000, 0) == ESP_OK);
