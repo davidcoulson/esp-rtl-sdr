@@ -169,6 +169,10 @@ const char *esp_rtl_sdr_get_version_string(void);
  * See esp_rtl_sdr_usb_fault_guard_reset() / esp_rtl_sdr_usb_safe_mode_active().
  */
 #define ESP_RTL_SDR_ERR_USB_SAFE_MODE  (ESP_RTL_SDR_ERR_BASE + 16)
+/** The tuner reported its PLL unlocked after a tune. Reserved: the driver currently only logs an
+ *  unlocked status read (working dongles report it too); with its strict policy enabled, a start
+ *  fails and a hot retune is rolled back to the previous frequency with this code. */
+#define ESP_RTL_SDR_ERR_PLL_UNLOCKED   (ESP_RTL_SDR_ERR_BASE + 17)
 
 /** Convert esp_err_t (including component codes) to a stable string. Never NULL. */
 const char *esp_rtl_sdr_err_to_name(esp_err_t err);
@@ -716,9 +720,14 @@ typedef struct {
      * esp_rtl_sdr_is_rate_supported().
      */
     uint32_t sample_rate_sps;
-    /** 0 = continuous until stop. Else exact CU8 byte bound (even). */
+    /**
+     * 0 = continuous until stop. Else exact CU8 byte bound (even): at most this many bytes are
+     * delivered (callback blocks and read() together), then the driver stops fetching. read()
+     * returns what is still buffered, then ERR_NOT_STREAMING. Call stop() to release the stream.
+     */
     uint64_t max_bytes;
-    /** Soft wall-clock limit for bounded capture; 0 = none. */
+    /** Soft wall-clock limit for bounded capture (ends delivery like max_bytes, checked about
+     *  every 50 ms); 0 = none. */
     uint32_t timeout_ms;
 } esp_rtl_sdr_stream_config_t;
 

@@ -218,6 +218,8 @@ struct UsbSession {
     bool external_host = false; /* app called usb_host_install */
     volatile bool bringing_up = false;
     volatile bool host_task_run = false;
+    /** True from host_lib_task_fn's entry until just before it deletes itself. */
+    volatile bool host_task_alive = false;
     TaskHandle_t host_task = nullptr;
     TaskHandle_t host_join_waiter = nullptr;
     RtlClaimTable claims{};
@@ -301,6 +303,7 @@ struct IqSlot {
     int gain_tenth_db = 0;
     uint32_t bandwidth_hz = 0;
     uint32_t flags = 0;
+    uint32_t epoch = 0; /* h->iq_epoch when filled; older blocks are dropped on delivery */
 };
 
 struct esp_rtl_sdr_handle {
@@ -316,9 +319,9 @@ struct esp_rtl_sdr_handle {
     uint32_t frequency_hz = 0;
     uint32_t sample_rate_sps = 0;
     uint32_t stream_start_ms = 0;
-    uint32_t in_callback_depth = 0;
-    /** Task currently inside emit_after_unlock; null if depth == 0. */
-    TaskHandle_t callback_task = nullptr;
+    /** Tasks currently inside emit_after_unlock (per task, so two emitting tasks never see each
+     *  other as reentrant). */
+    EspRtlSdrCallbackTracker callbacks;
     bool destroying = false;
 
     bool owns_host = false;
@@ -344,10 +347,16 @@ struct esp_rtl_sdr_handle {
     bool ctrl_stall = false;
     uint16_t ctrl_data_len = 0; /* bytes the device returned in the data stage of the last control transfer */
     uint32_t last_pll_if_hz = 0; /* PLL IF used by the last run_tune */
+    uint32_t pll_unlocked_tunes = 0; /* tunes whose PLL status read said unlocked (logged) */
     uint32_t last_lo_hz = 0;     /* LO the last run_tune programmed (ppm-corrected tuner frequency + IF); band rows key on it */
     /** ctrl_xfer submitted and its callback not yet run. usb_host_device_close()
      *  asserts (usbh num_ctrl_xfers_inflight == 0) while this is true. */
     std::atomic<bool> ctrl_inflight{false};
+    /** Sequence number of the control transfer last submitted, and of the last one whose
+     *  callback ran. A completion that lands after its waiter timed out (and after the next
+     *  request drained ctrl_sem) must not be taken as the next request's completion. */
+    uint32_t ctrl_seq_submitted = 0;
+    std::atomic<uint32_t> ctrl_seq_done{0};
     /** Device handles whose close was skipped because a control transfer never
      *  finished. ESP-IDF keeps a gone device alive while it is still open, so
      *  dropping the handle would leak the device and can block later hotplug;
@@ -362,9 +371,11 @@ struct esp_rtl_sdr_handle {
     volatile bool streaming = false;
     /** Live bulk URBs currently submitted (not yet completed without resubmit).
      * Free-pool gate: free_bulk_pool / stop / reset refuse while >0.
-     * Relies on aligned 32-bit loads plus USB callback serialization
-     * (bulk_cb vs stop/reset under handle lock / streaming=false). */
-    volatile uint32_t live_urbs = 0;
+     * Only touched through the live_urbs_* helpers (atomic): bulk_cb runs on the USB client
+     * task while submitters run on the app or delivery task, and a plain ++/-- pair loses
+     * updates. Submitters count a URB before submitting it (submit_bulk_urb), so its
+     * callback can never run ahead of the increment. */
+    uint32_t live_urbs = 0;
     /** When true, bulk_cb must not resubmit (stop or retune drain). */
     volatile bool pause_resubmit = false;
     /** Set by bulk_cb when a resubmit fails, meaning the bulk IN endpoint has
@@ -476,6 +487,23 @@ struct esp_rtl_sdr_handle {
      * a shared count - that count was the field that forced the lock. */
     std::atomic<size_t> pull_r{0};
     std::atomic<size_t> pull_w{0};
+    /** Bumped by start, stop and retune. Slots queued under an older value belong to a stopped
+     *  stream or an old frequency and are dropped instead of delivered. */
+    std::atomic<uint32_t> iq_epoch{0};
+    /** Bounded capture (stream config max_bytes / timeout_ms; 0 = unbounded). cap_bytes counts
+     *  delivered bytes (written by bulk_cb only); cap_done stops delivery and resubmits. */
+    uint64_t cap_max_bytes = 0;
+    uint32_t cap_timeout_ms = 0;
+    uint64_t cap_bytes = 0;
+    std::atomic<bool> cap_done{false};
+    /** Slots handed to the delivery task (filled_q) and not yet pushed or dropped by it. With
+     *  live_urbs, tells read() that no producer can still add bytes to a finished capture. */
+    std::atomic<uint32_t> slots_pending{0};
+    /** Flush request for the reader: skip everything up to pull_flush_w. Only the reader moves
+     *  pull_r, so it applies the flush itself on its next read (pull_flush_seen is its copy). */
+    std::atomic<uint32_t> pull_flush_gen{0};
+    std::atomic<size_t> pull_flush_w{0};
+    uint32_t pull_flush_seen = 0;
     SemaphoreHandle_t pull_mux = nullptr;
     SemaphoreHandle_t pull_sem = nullptr;
 };
@@ -562,9 +590,7 @@ static esp_err_t check_not_reentrant(const esp_rtl_sdr_handle *h)
     if (h == nullptr) {
         return ESP_OK;
     }
-    const uint32_t depth = __atomic_load_n(&h->in_callback_depth, __ATOMIC_SEQ_CST);
-    const TaskHandle_t cb = __atomic_load_n(&h->callback_task, __ATOMIC_SEQ_CST);
-    if (esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle())) {
+    if (esp_rtl_sdr_cb_is_inside(&h->callbacks, xTaskGetCurrentTaskHandle())) {
         return ESP_RTL_SDR_ERR_REENTRANT;
     }
     return ESP_OK;
@@ -578,8 +604,8 @@ static uint32_t now_ms(void)
 
 /**
  * Invoke app callback without holding the API mutex.
- * Depth + callback_task are atomic so another task can call setters while
- * we emit; only the callback task itself is ERR_REENTRANT.
+ * Tracked per task (EspRtlSdrCallbackTracker), so another task can call setters while we emit;
+ * only a task that is itself inside a callback is ERR_REENTRANT.
  */
 static void emit_after_unlock(esp_rtl_sdr_handle *h,
                               esp_rtl_sdr_event_t ev,
@@ -591,17 +617,10 @@ static void emit_after_unlock(esp_rtl_sdr_handle *h,
         return;
     }
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    if (handle_live(h)) {
-        __atomic_store_n(&h->callback_task, self, __ATOMIC_SEQ_CST);
-        __atomic_add_fetch(&h->in_callback_depth, 1u, __ATOMIC_SEQ_CST);
-    }
+    const int slot = handle_live(h) ? esp_rtl_sdr_cb_enter(&h->callbacks, self) : -1;
     cb(ev, payload, ctx);
-    if (handle_live(h)) {
-        const uint32_t d = __atomic_sub_fetch(&h->in_callback_depth, 1u, __ATOMIC_SEQ_CST);
-        if (d == 0) {
-            __atomic_store_n(&h->callback_task, static_cast<TaskHandle_t>(nullptr),
-                             __ATOMIC_SEQ_CST);
-        }
+    if (slot >= 0 && handle_live(h)) {
+        esp_rtl_sdr_cb_exit(&h->callbacks, slot);
     }
 }
 
@@ -730,6 +749,9 @@ static void ctrl_cb(usb_transfer_t *xfer)
     h->ctrl_status = (xfer->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
     h->ctrl_stall = (xfer->status == USB_TRANSFER_STATUS_STALL);
     h->ctrl_data_len = rtl_usb::ctrl_data_bytes(xfer->actual_num_bytes);
+    /* Before ctrl_inflight drops: no new request can be submitted until then, so this is the
+     * sequence number of the transfer completing here. */
+    h->ctrl_seq_done.store(h->ctrl_seq_submitted, std::memory_order_release);
     h->ctrl_inflight.store(false, std::memory_order_release);
     xSemaphoreGive(h->ctrl_sem);
 }
@@ -831,8 +853,18 @@ static bool close_device_safely(esp_rtl_sdr_handle *h, usb_device_handle_t dev)
      * the STALL back-off. ctrl_inflight is false during that back-off, so
      * only holding the lock proves no further attempt can reach dev. */
     const uint32_t lock_ms = 3 * (h->cfg.control_timeout_ms + 200) + 200;
-    if (h->ctrl_mutex == nullptr ||
-        xSemaphoreTake(h->ctrl_mutex, pdMS_TO_TICKS(lock_ms)) != pdTRUE) {
+    bool locked = false;
+    if (h->ctrl_mutex != nullptr && xTaskGetCurrentTaskHandle() == h->client_task) {
+        /* The holder may be waiting for a completion only this task delivers: pump meanwhile. */
+        const TickType_t t0 = xTaskGetTickCount();
+        while (!(locked = xSemaphoreTake(h->ctrl_mutex, 0) == pdTRUE) &&
+               xTaskGetTickCount() - t0 < pdMS_TO_TICKS(lock_ms)) {
+            (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
+        }
+    } else if (h->ctrl_mutex != nullptr) {
+        locked = xSemaphoreTake(h->ctrl_mutex, pdMS_TO_TICKS(lock_ms)) == pdTRUE;
+    }
+    if (!locked) {
         ESP_LOGE(TAG, "device close skipped: control transfer path still busy");
         defer_device_close(h, dev);
         return false;
@@ -848,6 +880,44 @@ static bool close_device_safely(esp_rtl_sdr_handle *h, usb_device_handle_t dev)
         defer_device_close(h, dev);
     }
     return closed;
+}
+
+/* Release interface 0, and drop iface_claimed only once the host library has. IDF counts a
+ * transfer as in flight until the client task has run its callback and left its dequeue loop, so
+ * a release straight after live_urbs reaches 0 can still fail with ESP_ERR_INVALID_STATE: retry
+ * for up to wait_ms. pump_client is for the client task itself, which must process those
+ * completions; nobody else may call usb_host_client_handle_events(). On failure the claim is
+ * kept, and the next start() reuses it. Clearing the flag regardless left the interface claimed
+ * in the host library with nothing left to release it: every later start() then failed its claim
+ * with ERR_USB -> FAULT, and stop() / reset() could not bring the receiver back. */
+static constexpr uint32_t kIfaceReleaseWaitMs = 100;
+
+static esp_err_t release_interface(esp_rtl_sdr_handle *h, uint32_t wait_ms, bool pump_client)
+{
+    if (!h->iface_claimed) {
+        return ESP_OK;
+    }
+    if (h->dev == nullptr || h->client == nullptr) {
+        h->iface_claimed = false;
+        return ESP_OK;
+    }
+    esp_err_t err = ESP_FAIL;
+    for (uint32_t waited = 0;; waited += 5) {
+        err = usb_host_interface_release(h->client, h->dev, 0);
+        if (err == ESP_OK || err == ESP_ERR_NOT_FOUND) { /* NOT_FOUND: not claimed by us */
+            h->iface_claimed = false;
+            return ESP_OK;
+        }
+        if (waited >= wait_ms) {
+            break;
+        }
+        if (pump_client) {
+            (void)usb_host_client_handle_events(h->client, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    RTL_LOGW(h, "interface release failed: %s; keeping the claim", esp_err_to_name(err));
+    return err;
 }
 
 /* Client task: close parked handles once the control path is idle. Never
@@ -866,8 +936,13 @@ static void retry_deferred_closes(esp_rtl_sdr_handle *h)
         return;
     }
     for (usb_device_handle_t &slot : h->deferred_close) {
-        if (slot != nullptr && !h->ctrl_inflight.load(std::memory_order_acquire) &&
-            usb_host_device_close(h->client, slot) == ESP_OK) {
+        if (slot == nullptr || h->ctrl_inflight.load(std::memory_order_acquire)) {
+            continue;
+        }
+        /* A handle parked with its interface still claimed (the release was refused while a
+         * transfer was in flight) cannot close until that claim is gone. */
+        (void)usb_host_interface_release(h->client, slot, 0);
+        if (usb_host_device_close(h->client, slot) == ESP_OK) {
             ESP_LOGI(TAG, "deferred device close completed");
             slot = nullptr;
         }
@@ -881,10 +956,10 @@ static void close_opened_device(esp_rtl_sdr_handle *h)
         return;
     }
     const uint8_t addr = h->open_addr;
-    if (h->iface_claimed && h->dev != nullptr && h->client != nullptr) {
-        usb_host_interface_release(h->client, h->dev, 0);
-        h->iface_claimed = false;
-    }
+    /* A refused release leaves the claim with the handle: close_device_safely() then parks it,
+     * and retry_deferred_closes() releases the interface before it closes. */
+    (void)release_interface(h, kIfaceReleaseWaitMs, xTaskGetCurrentTaskHandle() == h->client_task);
+    h->iface_claimed = false;
     if (h->dev != nullptr && h->client != nullptr) {
         close_device_safely(h, h->dev);
         h->dev = nullptr;
@@ -938,6 +1013,7 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
         h->ctrl_data_len = 0;
         xSemaphoreTake(h->ctrl_sem, 0);
 
+        const uint32_t seq = ++h->ctrl_seq_submitted;
         h->ctrl_inflight.store(true, std::memory_order_release);
         esp_err_t ret = usb_host_transfer_submit_control(h->client, x);
         if (ret != ESP_OK) {
@@ -947,17 +1023,31 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
         }
         bool completed = false;
         const TickType_t wait_ticks = pdMS_TO_TICKS(h->cfg.control_timeout_ms + 200);
+        const auto ours = [&]() {
+            return h->ctrl_seq_done.load(std::memory_order_acquire) == seq;
+        };
+        const TickType_t started = xTaskGetTickCount();
         if (xTaskGetCurrentTaskHandle() == h->client_task) {
-            const TickType_t started = xTaskGetTickCount();
             do {
-                if (xSemaphoreTake(h->ctrl_sem, 0) == pdTRUE) {
+                if (xSemaphoreTake(h->ctrl_sem, 0) == pdTRUE && ours()) {
                     completed = true;
                     break;
                 }
                 (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
             } while (xTaskGetTickCount() - started < wait_ticks);
         } else {
-            completed = xSemaphoreTake(h->ctrl_sem, wait_ticks) == pdTRUE;
+            /* A give left by an earlier request's late completion is skipped, not counted. */
+            for (;;) {
+                const TickType_t spent = xTaskGetTickCount() - started;
+                if (spent >= wait_ticks ||
+                    xSemaphoreTake(h->ctrl_sem, wait_ticks - spent) != pdTRUE) {
+                    break;
+                }
+                if (ours()) {
+                    completed = true;
+                    break;
+                }
+            }
         }
         if (!completed) {
             final_err = ESP_RTL_SDR_ERR_TIMEOUT;
@@ -996,6 +1086,20 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h, usb_device_handle_t
     return final_err;
 }
 
+/* Take ctrl_mutex. On the client task, keep pumping client events while waiting: the holder
+ * (an app-task probe or EP0 window) waits for a control completion that only this task can
+ * deliver, so blocking here stalled both until the holder's control timeout ran out. */
+static void ctrl_mutex_take(esp_rtl_sdr_handle *h)
+{
+    if (xTaskGetCurrentTaskHandle() != h->client_task || h->client == nullptr) {
+        xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+        return;
+    }
+    while (xSemaphoreTake(h->ctrl_mutex, 0) != pdTRUE) {
+        (void)usb_host_client_handle_events(h->client, pdMS_TO_TICKS(5));
+    }
+}
+
 static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t dev, uint8_t bm,
                                     uint8_t bRequest, uint16_t wValue, uint16_t wIndex,
                                     const uint8_t *data, uint16_t wLength, bool expect_stall,
@@ -1004,7 +1108,7 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
     if (h->ctrl_xfer == nullptr || dev == nullptr) {
         return ESP_RTL_SDR_ERR_USB;
     }
-    xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+    ctrl_mutex_take(h);
     const esp_err_t err = ctrl_transfer_locked(h, dev, bm, bRequest, wValue, wIndex, data,
                                                wLength, expect_stall, response, response_length);
     xSemaphoreGive(h->ctrl_mutex);
@@ -1013,7 +1117,8 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
 
 static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest,
                              uint16_t wValue, uint16_t wIndex, const uint8_t *data,
-                             uint16_t wLength, bool expect_stall)
+                             uint16_t wLength, bool expect_stall,
+                             uint8_t *response = nullptr, uint16_t response_length = 0)
 {
     if (h == nullptr || h->ctrl_xfer == nullptr) {
         return ESP_RTL_SDR_ERR_USB;
@@ -1021,7 +1126,7 @@ static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest
     /* Read h->dev under ctrl_mutex: a disconnect closes it under the same lock, so a transfer can
      * never be submitted to a device that was just closed. device_gone covers the interval between
      * the unplug event and that close. */
-    xSemaphoreTake(h->ctrl_mutex, portMAX_DELAY);
+    ctrl_mutex_take(h);
     usb_device_handle_t dev = h->dev;
     if (h->device_gone) {
         dev = nullptr;
@@ -1029,7 +1134,7 @@ static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest
     const esp_err_t err =
         dev == nullptr ? ESP_RTL_SDR_ERR_USB
                        : ctrl_transfer_locked(h, dev, bm, bRequest, wValue, wIndex, data,
-                                              wLength, expect_stall, nullptr, 0);
+                                              wLength, expect_stall, response, response_length);
     xSemaphoreGive(h->ctrl_mutex);
     return err;
 }
@@ -1325,10 +1430,14 @@ static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 /* Reinit resets 05/07 to 83/75. Restore an explicitly applied gain mode before native IQ resumes,
  * rather than reporting a stale gain. This must run only once the I2C repeater has been switched
  * back on (kBlogV3TunerRepeaterOn after the reinit and demod IF restore): written inside the reinit
- * itself it is STALLed, which made every start after a manual gain fail on the Nooelec. */
-static esp_err_t run_nooelec_gain_restore(esp_rtl_sdr_handle *h)
+ * itself it is STALLed, which made every start after a manual gain fail on the Nooelec.
+ * Every R820-family profile cold-reinits (rtl_profile_needs_cold_tuner_reinit), not only the
+ * Nooelec: on the V3 / V4L the gain state survived the reinit, so the stream ran at the reinit
+ * default while get_tuner_gain() and set_tuner_gain_mode(MANUAL) ("already applied") said
+ * otherwise. These are the same records the gain setters write on those profiles. */
+static esp_err_t run_r820_gain_restore(esp_rtl_sdr_handle *h)
 {
-    if (h->profile != RtlProfileId::NooelecSmartV5) return ESP_OK;
+    if (!rtl_profile_uses_r820t2_i2c_remap(h->profile)) return ESP_OK;
     if (h->gain_mode == ESP_RTL_SDR_GAIN_MODE_MANUAL) {
         return apply_r820t2_gain_records(h, h->gain_tenth_db, &h->gain_tenth_db);
     }
@@ -1373,6 +1482,50 @@ static bool hf_direct_route(const esp_rtl_sdr_handle *h, uint32_t rf_hz)
  * Blog V4 HF (public): RF < 28.8 MHz is upconverted by 28.8 MHz before the tuner.
  * User-facing metrics keep RF; only the PLL pack uses tuner_hz.
  */
+/* Fail a tune whose PLL does not report lock? Off: a working V3 reads unlocked (3B 69 01) twice ~6 ms
+ * apart in docs/captures/v3c_live_bandwidth_pc_control_transfers_2026-09-28.txt, and librtlsdr only
+ * warns ("PLL not locked!", see NOTES.md) after raising the VCO current, which this template does not
+ * do. So an unlocked read is logged and counted, and the tune goes on. The strict path (start fails,
+ * a hot retune is rolled back with ERR_PLL_UNLOCKED) stays here for when lock reads are trusted. */
+static constexpr bool kFailTuneOnPllUnlock = false;
+
+/**
+ * Run the template's pointer write + 3-byte status read and check VCO lock: R82xx register 02
+ * bit 6. Tuner reads come back bit-reversed per byte (librtlsdr r82xx_read() reverses them), so
+ * that is bit 1 of the raw third byte. Re-reads twice, 2 ms apart, before calling it unlocked.
+ * Unlocked: warn and count; fail only if kFailTuneOnPllUnlock.
+ */
+static esp_err_t check_tuner_pll_lock(esp_rtl_sdr_handle *h, const RtlControlRecord &pointer,
+                                      const RtlControlRecord &read, uint32_t tune_hz)
+{
+    uint8_t st[3] = {0, 0, 0};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+            /* at least one tick: pdMS_TO_TICKS(2) is 0 at CONFIG_FREERTOS_HZ=100 */
+            vTaskDelay(pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1);
+            const esp_err_t pe = run_record(h, pointer, false);
+            if (pe != ESP_OK) {
+                return pe;
+            }
+        }
+        const RtlControlRecord mapped = map_tuner_record_for_profile(h, read);
+        const esp_err_t e = ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index,
+                                        mapped.data, mapped.length, false, st, sizeof(st));
+        if (e != ESP_OK) {
+            h->tuner_reg_known = 0;
+            return e;
+        }
+        if ((st[2] & 0x02) != 0) {
+            return ESP_OK;
+        }
+    }
+    h->pll_unlocked_tunes++;
+    RTL_LOGW(h, "tuner PLL not locked at %u Hz (status %02x %02x %02x; %u unlocked tunes)%s",
+             static_cast<unsigned>(tune_hz), st[0], st[1], st[2],
+             static_cast<unsigned>(h->pll_unlocked_tunes), kFailTuneOnPllUnlock ? "" : "; continuing");
+    return kFailTuneOnPllUnlock ? ESP_RTL_SDR_ERR_PLL_UNLOCKED : ESP_OK;
+}
+
 static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
                           uint32_t tuner_if_hz = 0)
 {
@@ -1463,7 +1616,14 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
             }
         }
         const int64_t t_rec0 = esp_timer_get_time();
-        esp_err_t e = run_record(h, rec, false);
+        esp_err_t e = ESP_OK;
+        if (rec.request_type == 0xc0 && rec.length == 3 && i > 0) {
+            /* The PLL lock read (regs 00..02 after the N/SDM writes). It used to be run and
+             * its answer dropped, so a tune "succeeded" with the PLL unlocked. */
+            e = check_tuner_pll_lock(h, kRtlFinalTuneTemplate[i - 1], rec, tune_hz);
+        } else {
+            e = run_record(h, rec, false);
+        }
         rec_us[i] = (uint32_t)(esp_timer_get_time() - t_rec0);
         if (e != ESP_OK) {
             return e;
@@ -1510,7 +1670,7 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
         if (err != ESP_OK) {
             return err;
         }
-        err = run_nooelec_gain_restore(h);
+        err = run_r820_gain_restore(h);
         if (err != ESP_OK) {
             return err;
         }
@@ -1673,7 +1833,7 @@ static esp_err_t run_bandwidth_program(esp_rtl_sdr_handle *h, uint32_t rf_hz,
     }
     esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
                                  std::size(kBlogV3TunerRepeaterOn));
-    if (err == ESP_OK && left_direct) err = run_nooelec_gain_restore(h);
+    if (err == ESP_OK && left_direct) err = run_r820_gain_restore(h);
     if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0a, plan.reg0a), false);
     if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0b, plan.reg0b), false);
     if (err == ESP_OK) err = run_profile_tune(h, rf_hz, previous_rf_hz, plan.if_hz);
@@ -1775,6 +1935,71 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 
 /* Defined below; bulk_cb's read-only fast path fills the ring directly. */
 static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
+static void pull_ring_request_flush(esp_rtl_sdr_handle *h);
+
+/* 64-bit counters written from the USB client task (bulk_cb) or a reader task without the API
+ * lock. On a 32-bit core a plain 64-bit access is two loads/stores, so get_metrics() could read
+ * a torn value; __atomic on 8 bytes is emulated (critical section) by ESP-IDF where needed. */
+static inline void metric_add64(uint64_t *p, uint64_t v)
+{
+    (void)__atomic_fetch_add(p, v, __ATOMIC_RELAXED);
+}
+
+static inline uint64_t metric_load64(const uint64_t *p)
+{
+    return __atomic_load_n(p, __ATOMIC_RELAXED);
+}
+
+static uint32_t live_urbs_get(esp_rtl_sdr_handle *h)
+{
+    return __atomic_load_n(&h->live_urbs, __ATOMIC_ACQUIRE);
+}
+
+static void live_urbs_set(esp_rtl_sdr_handle *h, uint32_t v)
+{
+    __atomic_store_n(&h->live_urbs, v, __ATOMIC_RELEASE);
+}
+
+/** Decrement unless already 0 (a stale count must not wrap to 4 billion). */
+static void live_urbs_dec(esp_rtl_sdr_handle *h)
+{
+    uint32_t cur = __atomic_load_n(&h->live_urbs, __ATOMIC_ACQUIRE);
+    while (cur > 0 && !__atomic_compare_exchange_n(&h->live_urbs, &cur, cur - 1u, true,
+                                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    }
+}
+
+static void bulk_cb(usb_transfer_t *xfer);
+
+/** Bulk callback: how many of n bytes may still be delivered under max_bytes (all of them when
+ *  unbounded). Marks the capture complete once the bound is reached. */
+static size_t capture_take(esp_rtl_sdr_handle *h, size_t n)
+{
+    if (h->cap_max_bytes == 0) {
+        return n;
+    }
+    const uint64_t done = h->cap_bytes;
+    const uint64_t left = (done < h->cap_max_bytes) ? h->cap_max_bytes - done : 0;
+    const size_t take = static_cast<size_t>((n < left) ? n : left) & ~size_t{1};
+    h->cap_bytes = done + take;
+    if (h->cap_bytes >= h->cap_max_bytes) {
+        h->cap_done.store(true, std::memory_order_release);
+    }
+    return take;
+}
+
+/** Submit one bulk URB, counting it as live first: its callback may run (on the USB client
+ * task) before usb_host_transfer_submit() even returns, and a decrement that ran ahead of the
+ * increment left the count one too high for good. */
+static esp_err_t submit_bulk_urb(esp_rtl_sdr_handle *h, usb_transfer_t *xfer)
+{
+    (void)__atomic_add_fetch(&h->live_urbs, 1u, __ATOMIC_ACQ_REL);
+    const esp_err_t ret = usb_host_transfer_submit(xfer);
+    if (ret != ESP_OK) {
+        live_urbs_dec(h);
+    }
+    return ret;
+}
 
 static void bulk_cb(usb_transfer_t *xfer)
 {
@@ -1816,38 +2041,43 @@ static void bulk_cb(usb_transfer_t *xfer)
             esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
             !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode)) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
-            pull_ring_push(h, xfer->data_buffer, n);
-            h->metrics.bytes_total += n;
+            const size_t take = h->cap_done.load(std::memory_order_acquire) ? 0 : capture_take(h, n);
+            if (take > 0) {
+                pull_ring_push(h, xfer->data_buffer, take);
+            }
+            metric_add64(&h->metrics.bytes_total, n);
             h->metrics.blocks_total++;
             h->last_xfer_timestamp_us = esp_timer_get_time();
             h->ep_recoveries_at_data = h->ep_recoveries;
             if (n != static_cast<size_t>(h->bulk_len)) {
                 h->metrics.short_transfers++;
             }
-            if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+            if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
                 const esp_err_t rs = usb_host_transfer_submit(xfer);
                 if (rs != ESP_OK) {
                     RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
                              esp_err_to_name(rs));
                     h->ep_stall_recover = true;
-                    if (h->live_urbs > 0) {
-                        h->live_urbs--;
-                    }
+                    live_urbs_dec(h);
                     xSemaphoreGive(h->bulk_done_sem);
                 }
-            } else if (h->live_urbs > 0) {
-                h->live_urbs--;
+            } else {
+                live_urbs_dec(h);
                 xSemaphoreGive(h->bulk_done_sem);
             }
             return;
         }
         IqSlot *slot = nullptr;
-        if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
+        if (h->cap_done.load(std::memory_order_acquire)) {
+            /* bounded capture complete: nothing more is delivered */
+        } else if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
-            const size_t copy = (n <= slot->capacity) ? n : slot->capacity;
+            const size_t copy = capture_take(h, (n <= slot->capacity) ? n : slot->capacity);
             std::memcpy(slot->data, xfer->data_buffer, copy);
             slot->bytes = copy;
             slot->sequence = ++h->iq_sequence;
+            slot->epoch = h->iq_epoch.load(std::memory_order_acquire);
             slot->frequency_hz = h->frequency_hz;
             slot->sample_rate_sps = h->sample_rate_sps;
             slot->host_timestamp_us = esp_timer_get_time();
@@ -1885,22 +2115,21 @@ static void bulk_cb(usb_transfer_t *xfer)
                 !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode) &&
                 h->pull_buf != nullptr) {
                 pull_ring_push(h, slot->data, slot->bytes);
-                h->metrics.bytes_total += slot->bytes;
+                metric_add64(&h->metrics.bytes_total, slot->bytes);
                 h->metrics.blocks_total++;
                 (void)xQueueSend(h->free_q, &slot, 0);
-                if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+                if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
                     esp_err_t rs = usb_host_transfer_submit(xfer);
                     if (rs != ESP_OK) {
                         RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
                                  esp_err_to_name(rs));
                         h->ep_stall_recover = true;
-                        if (h->live_urbs > 0) {
-                            h->live_urbs--;
-                        }
+                        live_urbs_dec(h);
                         xSemaphoreGive(h->bulk_done_sem);
                     }
-                } else if (h->live_urbs > 0) {
-                    h->live_urbs--;
+                } else {
+                    live_urbs_dec(h);
                     xSemaphoreGive(h->bulk_done_sem);
                 }
                 return;
@@ -1911,12 +2140,14 @@ static void bulk_cb(usb_transfer_t *xfer)
                     h->queue_high_water = static_cast<uint32_t>(waiting) + 1u;
                 }
             }
+            h->slots_pending.fetch_add(1, std::memory_order_acq_rel);
             if (xQueueSend(h->filled_q, &slot, 0) != pdTRUE) {
+                h->slots_pending.fetch_sub(1, std::memory_order_acq_rel);
                 (void)xQueueSend(h->free_q, &slot, 0);
                 h->metrics.overruns++;
                 slot->flags |= ESP_RTL_SDR_IQ_FLAG_OVERRUN;
             } else {
-                h->metrics.bytes_total += copy;
+                metric_add64(&h->metrics.bytes_total, copy);
                 h->metrics.blocks_total++;
                 if (copy > 0) {
                     uint8_t mn = 255, mx = 0;
@@ -1947,7 +2178,7 @@ static void bulk_cb(usb_transfer_t *xfer)
              * here and a byte count elsewhere, which is what made it
              * uninterpretable. */
             h->metrics.overruns++;
-            h->metrics.consumer_drops++;
+            (void)__atomic_fetch_add(&h->metrics.consumer_drops, 1u, __ATOMIC_RELAXED);
             h->metrics.slot_starve_blocks++;
         }
     } else if (xfer->status != USB_TRANSFER_STATUS_CANCELED &&
@@ -1956,7 +2187,8 @@ static void bulk_cb(usb_transfer_t *xfer)
     }
 
     /* Resubmit only while streaming and not draining for stop/retune. */
-    if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+    if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
             /* A bulk transfer error halts the endpoint, and every later
@@ -1975,16 +2207,12 @@ static void bulk_cb(usb_transfer_t *xfer)
             RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
                      esp_err_to_name(ret));
             h->ep_stall_recover = true;
-            if (h->live_urbs > 0) {
-                h->live_urbs--;
-            }
+            live_urbs_dec(h);
             xSemaphoreGive(h->bulk_done_sem);
         }
         /* still in flight after successful resubmit */
     } else {
-        if (h->live_urbs > 0) {
-            h->live_urbs--;
-        }
+        live_urbs_dec(h);
         xSemaphoreGive(h->bulk_done_sem);
     }
 }
@@ -2000,26 +2228,26 @@ static bool drain_live_urbs(esp_rtl_sdr_handle *h, uint32_t poll_ms, uint32_t fl
     if (h == nullptr) {
         return true;
     }
-    if (poll_ms > 0 && h->live_urbs > 0) {
+    if (poll_ms > 0 && live_urbs_get(h) > 0) {
         const TickType_t start = xTaskGetTickCount();
         const TickType_t wait = pdMS_TO_TICKS(poll_ms);
-        while (h->live_urbs > 0 && (xTaskGetTickCount() - start) < wait) {
+        while (live_urbs_get(h) > 0 && (xTaskGetTickCount() - start) < wait) {
             vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
-    if (h->live_urbs > 0 && h->dev != nullptr) {
+    if (live_urbs_get(h) > 0 && h->dev != nullptr) {
         usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
         usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
         usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
         if (flush_poll_ms > 0) {
             const TickType_t start2 = xTaskGetTickCount();
             const TickType_t wait2 = pdMS_TO_TICKS(flush_poll_ms);
-            while (h->live_urbs > 0 && (xTaskGetTickCount() - start2) < wait2) {
+            while (live_urbs_get(h) > 0 && (xTaskGetTickCount() - start2) < wait2) {
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         }
     }
-    return h->live_urbs == 0;
+    return live_urbs_get(h) == 0;
 }
 
 /** Pause bulk IN and drain live URBs so EP0 is safe (retune / gain / bias). */
@@ -2032,22 +2260,35 @@ static bool bulk_pause_and_drain(esp_rtl_sdr_handle *h)
     const bool drained = drain_live_urbs(h, 800, 300);
     if (!drained) {
         ESP_LOGW(TAG, "bulk pause timeout live_urbs=%u; defer EP0/resume",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
     }
     return drained;
 }
 
-/** Resume multi-URB bulk IN after a paused EP0 window. */
+/**
+ * Resume multi-URB bulk IN after a paused EP0 window. Only call it once the pause drained
+ * (live_urbs == 0): resubmitting a URB the host stack still owns double-counts it, and the old
+ * "live_urbs = 0" here hid exactly that.
+ */
 static void bulk_resume(esp_rtl_sdr_handle *h)
 {
-    if (h == nullptr) {
+    if (h == nullptr || !h->streaming) {
+        return; /* stopping: pause_resubmit belongs to stop() */
+    }
+    if (h->cap_done.load(std::memory_order_acquire)) {
+        return; /* bounded capture complete: nothing more to fetch */
+    }
+    if (live_urbs_get(h) != 0) {
+        RTL_LOGE(h, "bulk resume with %u URBs still live; staying paused for EP recovery",
+                 static_cast<unsigned>(live_urbs_get(h)));
+        h->ep_stall_recover = true;
         return;
     }
     h->pause_resubmit = false;
-    if (!h->streaming || h->bulk == nullptr) {
+    if (h->bulk == nullptr || h->dev == nullptr || h->device_gone) {
         return;
     }
-    h->live_urbs = 0;
+    bool failed = false;
     for (uint32_t i = 0; i < h->bulk_num; ++i) {
         if (h->bulk[i] == nullptr) {
             continue;
@@ -2057,9 +2298,14 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
         h->bulk[i]->num_bytes = h->bulk_len;
         h->bulk[i]->callback = bulk_cb;
         h->bulk[i]->context = h;
-        if (usb_host_transfer_submit(h->bulk[i]) == ESP_OK) {
-            h->live_urbs++;
+        if (submit_bulk_urb(h, h->bulk[i]) != ESP_OK) {
+            failed = true;
         }
+    }
+    if (failed) {
+        /* A short pool, or none in flight at all (a silent STREAMING handle): let the delivery
+         * task clear the endpoint and resubmit everything. */
+        h->ep_stall_recover = true;
     }
 }
 
@@ -2076,30 +2322,111 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
  */
 static constexpr uint32_t kEpRecoverAttempts = 8;
 
+/**
+ * The stream died on the device side and will not come back by itself: leave STREAMING for
+ * FAULT (read() then reports ERR_FAULT rather than NOT_STREAMING, which callers wait out) and
+ * say so with EVT_ERROR. stop() or reset() clears FAULT. No-op if the stream was stopped
+ * meanwhile. Call without the EP0 window held: the app callback may call retune.
+ */
+static void fail_stream(esp_rtl_sdr_handle *h, esp_err_t code, const char *message)
+{
+    esp_rtl_sdr_event_cb_t cb = nullptr;
+    void *ctx = nullptr;
+    {
+        HandleLock lk(h);
+        if (!lk.ok() || h->state != ESP_RTL_SDR_STATE_STREAMING) {
+            return;
+        }
+        h->state = ESP_RTL_SDR_STATE_FAULT;
+        set_error_unlocked(h, code);
+        cb = h->cfg.event_cb;
+        ctx = h->cfg.event_ctx;
+    }
+    if (h->pull_sem != nullptr) {
+        xSemaphoreGive(h->pull_sem); /* wake a blocked read() so it sees FAULT now */
+    }
+    if (cb != nullptr) {
+        esp_rtl_sdr_error_info_t info{};
+        info.code = code;
+        std::snprintf(info.message, sizeof(info.message), "%s", message);
+        emit_after_unlock(h, ESP_RTL_SDR_EVT_ERROR, &info, cb, ctx);
+    }
+}
+
+/**
+ * A configuration change failed. Set last_error and send EVT_ERROR, so a caller whose request
+ * was deferred to the delivery task (and so never saw a return code) learns of it. Call
+ * without the EP0 window held: the app callback may call retune.
+ */
+static void report_config_error(esp_rtl_sdr_handle *h, esp_err_t code, const char *message)
+{
+    esp_rtl_sdr_event_cb_t cb = nullptr;
+    void *ctx = nullptr;
+    {
+        HandleLock lk(h, kQueryLockTicks);
+        if (lk.ok()) {
+            set_error_unlocked(h, code);
+            cb = h->cfg.event_cb;
+            ctx = h->cfg.event_ctx;
+        }
+    }
+    if (cb != nullptr) {
+        esp_rtl_sdr_error_info_t info{};
+        info.code = code;
+        std::snprintf(info.message, sizeof(info.message), "%s", message);
+        emit_after_unlock(h, ESP_RTL_SDR_EVT_ERROR, &info, cb, ctx);
+    }
+}
+
 static void bulk_recover_stall(esp_rtl_sdr_handle *h)
 {
     if (h == nullptr || h->bulk == nullptr) {
         return;
     }
-    h->ep_stall_recover = false;
-    if (h->ep_recoveries - h->ep_recoveries_at_data >= kEpRecoverAttempts) {
-        RTL_LOGE(h, "bulk EP recovery failed %u times with no data; stopping",
-                 static_cast<unsigned>(kEpRecoverAttempts));
-        h->streaming = false;
+    /* Same EP0 window as retune / sideband / stop / start / unplug: never clear the endpoint
+     * and resubmit under one of them. Flag stays set if the window is busy. */
+    if (h->ep0_sideband_busy.exchange(true)) {
         return;
     }
-    h->ep_recoveries++;
-    h->pause_resubmit = true;
-    (void)drain_live_urbs(h, 100, 100);
-    if (h->dev != nullptr) {
-        usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
-        usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
-        usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+    if (!h->streaming || h->device_gone || h->dev == nullptr) {
+        h->ep_stall_recover = false;
+        h->ep0_sideband_busy = false;
+        return; /* stopped, or unplugged: the client task tears the stream down */
     }
+    if (h->ep_recoveries - h->ep_recoveries_at_data >= kEpRecoverAttempts) {
+        RTL_LOGE(h, "bulk EP recovery failed %u times with no data; stream FAULT",
+                 static_cast<unsigned>(kEpRecoverAttempts));
+        h->ep_stall_recover = false;
+        h->pause_resubmit = true;
+        h->streaming = false;
+        (void)drain_live_urbs(h, 100, 100);
+        h->ep0_sideband_busy = false;
+        fail_stream(h, ESP_RTL_SDR_ERR_USB, "bulk IN endpoint recovery failed; stream stopped");
+        return;
+    }
+    h->ep_recoveries = h->ep_recoveries + 1; /* ++ on a volatile is an error from C++20 on */
+    h->pause_resubmit = true;
+    if (!drain_live_urbs(h, 100, 100)) {
+        /* Clearing the endpoint and resubmitting now would put URBs the host stack still owns
+         * back in flight. Stay paused with the flag set: the next delivery pass tries again,
+         * and the attempt counter above bounds how long. */
+        h->ep_stall_recover = true;
+        RTL_LOGW(h, "bulk EP recovery: %u URBs still live (attempt %u); staying paused",
+                 static_cast<unsigned>(live_urbs_get(h)),
+                 static_cast<unsigned>(h->ep_recoveries));
+        h->ep0_sideband_busy = false;
+        return;
+    }
+    /* Cleared before the resume: a failure from here on schedules another pass. */
+    h->ep_stall_recover = false;
+    usb_host_endpoint_halt(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+    usb_host_endpoint_flush(h->dev, ESP_RTL_SDR_BULK_EP_IN);
+    usb_host_endpoint_clear(h->dev, ESP_RTL_SDR_BULK_EP_IN);
     bulk_resume(h);
+    h->ep0_sideband_busy = false;
     RTL_LOGW(h, "bulk EP recovered (attempt %u, live_urbs=%u)",
              static_cast<unsigned>(h->ep_recoveries),
-             static_cast<unsigned>(h->live_urbs));
+             static_cast<unsigned>(live_urbs_get(h)));
 }
 
 /**
@@ -2108,6 +2435,15 @@ static void bulk_recover_stall(esp_rtl_sdr_handle *h)
  * Safe from delivery task or app tasks. Coalesces: if pending changes mid-apply,
  * leaves the newer pending_retune_hz set for another pass.
  */
+/** Clear pending_retune_hz only if it still holds hz: a retune queued meanwhile (from another
+ * task, outside the API lock) must survive. Compare and clear as one atomic step. */
+static void clear_pending_retune_if(esp_rtl_sdr_handle *h, uint32_t hz)
+{
+    uint32_t expected = hz;
+    (void)__atomic_compare_exchange_n(&h->pending_retune_hz, &expected, 0u, false,
+                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
 {
     if (h == nullptr || !h->streaming) {
@@ -2139,9 +2475,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
 
     if (!h->streaming) {
         h->pause_resubmit = false;
-        if (h->pending_retune_hz == freq) {
-            h->pending_retune_hz = 0;
-        }
+        clear_pending_retune_if(h, freq);
         h->retune_busy = false;
         h->ep0_sideband_busy = false;
         return ESP_RTL_SDR_ERR_NOT_STREAMING;
@@ -2151,7 +2485,12 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     const uint32_t tune_hz =
         (h->pending_retune_hz != 0) ? h->pending_retune_hz : freq;
 
+    /* Bulk is drained: what is queued or buffered now was captured at the old frequency. */
+    pull_ring_request_flush(h);
+
     t_drained = esp_timer_get_time();
+    const uint32_t previous_hz = h->frequency_hz;
+    bool fault = false;
     h->frontend_applied_valid = false;
     esp_err_t err = ESP_OK;
     const uint32_t requested_width = h->bandwidth_requested_hz;
@@ -2179,7 +2518,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             if (err == ESP_OK) err = run_band_frontend(h, tune_hz);
         }
     } else {
-        err = run_profile_tune(h, tune_hz, h->frequency_hz);
+        err = run_profile_tune(h, tune_hz, previous_hz);
         if (err == ESP_OK) err = run_band_frontend(h, tune_hz);
     }
     t_tuned = esp_timer_get_time();
@@ -2203,9 +2542,7 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
             h->pending_gain = false;
             h->pending_gain_mode = false;
         }
-        if (h->pending_retune_hz == tune_hz) {
-            h->pending_retune_hz = 0;
-        }
+        clear_pending_retune_if(h, tune_hz);
         ESP_LOGI(TAG, "hot retune applied rf=%u Hz tuner=%u Hz direct=%d",
                  static_cast<unsigned>(tune_hz),
                  static_cast<unsigned>(rtl_profile_tuner_frequency_hz(
@@ -2217,12 +2554,30 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
         if (measured_bw && h->bandwidth_requested_hz == requested_width) {
             h->pending_bandwidth = false; /* failed bundled request; do not apply at old RF */
         }
-        if (h->pending_retune_hz == tune_hz) {
-            h->pending_retune_hz = 0;
+        clear_pending_retune_if(h, tune_hz);
+        if (h->state == ESP_RTL_SDR_STATE_FAULT) {
+            fault = true; /* the bandwidth transaction could not restore the previous plan */
+        } else if (!measured_bw && h->streaming) {
+            /* The tune or route may be half applied (for V3, possibly half way into or out of
+             * direct sampling), while frequency_hz and the IQ metadata still say previous_hz.
+             * Tune back, with the failed target as the "previous" frequency so the matching
+             * transition sequence runs. The bandwidth transaction does its own rollback. */
+            esp_err_t rb = run_profile_tune(h, previous_hz, tune_hz);
+            if (rb == ESP_OK) rb = run_band_frontend(h, previous_hz);
+            if (rb == ESP_OK) {
+                ESP_LOGW(TAG, "hot retune to %u Hz failed; kept %u Hz",
+                         static_cast<unsigned>(tune_hz), static_cast<unsigned>(previous_hz));
+            } else {
+                ESP_LOGE(TAG, "restoring %u Hz after the failed retune failed too: %s",
+                         static_cast<unsigned>(previous_hz), esp_rtl_sdr_err_to_name(rb));
+                fault = true;
+                h->streaming = false;
+                h->pause_resubmit = true;
+            }
         }
     }
 
-    if (h->state != ESP_RTL_SDR_STATE_FAULT) bulk_resume(h);
+    if (!fault && h->state != ESP_RTL_SDR_STATE_FAULT) bulk_resume(h);
     const int64_t t_resumed = esp_timer_get_time();
     RTL_LOGD(h, "retune phases us: drain=%lld tune=%lld frontend=%lld resume=%lld total=%lld",
              (long long)(t_drained - t_rt0), (long long)(t_tuned - t_drained),
@@ -2238,6 +2593,24 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
         if (cb != nullptr) {
             uint32_t f = h->frequency_hz;
             emit_after_unlock(h, ESP_RTL_SDR_EVT_RETUNED, &f, cb, ctx);
+        }
+    } else if (err != ESP_RTL_SDR_ERR_NOT_STREAMING) {
+        /* A retune queued from the event callback runs here on the delivery task, so nobody
+         * sees the return code: last_error + EVT_ERROR say the stream is not where it was
+         * asked to be. */
+        char msg[96];
+        if (fault && h->state == ESP_RTL_SDR_STATE_STREAMING) {
+            std::snprintf(msg, sizeof(msg), "retune to %u Hz failed and %u Hz could not be restored",
+                          static_cast<unsigned>(tune_hz), static_cast<unsigned>(previous_hz));
+            fail_stream(h, err, msg);
+        } else if (fault || h->state == ESP_RTL_SDR_STATE_FAULT) {
+            std::snprintf(msg, sizeof(msg), "retune to %u Hz failed; stream FAULT",
+                          static_cast<unsigned>(tune_hz));
+            report_config_error(h, ESP_RTL_SDR_ERR_FAULT, msg);
+        } else {
+            std::snprintf(msg, sizeof(msg), "retune to %u Hz failed; stream kept at %u Hz",
+                          static_cast<unsigned>(tune_hz), static_cast<unsigned>(previous_hz));
+            report_config_error(h, err, msg);
         }
     }
     return err;
@@ -2278,8 +2651,8 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
     n &= ~(size_t)1;                    /* keep CU8 I/Q pairs together */
     if (n < bytes) {
         const size_t lost = bytes - n;
-        h->metrics.consumer_drops += static_cast<uint32_t>(lost);
-        h->metrics.ring_overrun_bytes += lost;
+        (void)__atomic_fetch_add(&h->metrics.consumer_drops, static_cast<uint32_t>(lost), __ATOMIC_RELAXED);
+        metric_add64(&h->metrics.ring_overrun_bytes, lost);
         h->metrics.ring_overrun_blocks++;
     }
     if (n == 0) {
@@ -2318,12 +2691,30 @@ static void pull_ring_reset(esp_rtl_sdr_handle *h)
          * longer provides that - the USB callback does not take it. */
         h->pull_r.store(0, std::memory_order_relaxed);
         h->pull_w.store(0, std::memory_order_relaxed);
+        h->pull_flush_w.store(0, std::memory_order_release); /* a pending flush lands on 0 too */
         xSemaphoreGive(h->pull_mux);
     }
     if (h->pull_sem != nullptr) {
         while (xSemaphoreTake(h->pull_sem, 0) == pdTRUE) {
         }
     }
+}
+
+/**
+ * Retune: make the reader drop what the ring holds now (it was captured at the old frequency;
+ * read() has no metadata to tell). Call with the bulk URBs drained, so the USB callback is not
+ * producing. Bumps iq_epoch first, then publishes the flush under pull_mux: a delivery-task push
+ * either lands before the flush point (and is skipped) or sees the new epoch (and is dropped).
+ */
+static void pull_ring_request_flush(esp_rtl_sdr_handle *h)
+{
+    h->iq_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (h->pull_mux == nullptr || xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+    h->pull_flush_w.store(h->pull_w.load(std::memory_order_acquire), std::memory_order_release);
+    h->pull_flush_gen.fetch_add(1, std::memory_order_acq_rel);
+    xSemaphoreGive(h->pull_mux);
 }
 
 /** Tear down pull ring under handle lock (or during uninstall). Fail-closed. */
@@ -2493,9 +2884,19 @@ static void delivery_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
     while (h->tasks_run) {
-        /* A halted bulk IN endpoint can only be cleared from a task. */
-        if (h->streaming && h->ep_stall_recover && !h->pause_resubmit &&
-            !h->retune_busy && !h->ep0_sideband_busy) {
+        /* Bounded capture: the wall-clock limit ends delivery like the byte limit does (bulk_cb
+         * stops resubmitting, so the URBs retire). */
+        if (h->streaming && h->cap_timeout_ms != 0 && h->stream_start_ms != 0 &&
+            !h->cap_done.load(std::memory_order_acquire) &&
+            now_ms() - h->stream_start_ms >= h->cap_timeout_ms) {
+            h->cap_done.store(true, std::memory_order_release);
+            RTL_LOGI(h, "bounded capture: %u ms limit reached",
+                     static_cast<unsigned>(h->cap_timeout_ms));
+        }
+        /* A halted bulk IN endpoint can only be cleared from a task. Not gated on
+         * pause_resubmit: a recovery whose drain timed out leaves the stream paused and must
+         * run again; bulk_recover_stall() takes the EP0 window itself. */
+        if (h->streaming && h->ep_stall_recover && !h->retune_busy && !h->ep0_sideband_busy) {
             bulk_recover_stall(h);
         }
         /* Async EP0 off the USB client task (retune first, then gain/bias). */
@@ -2554,15 +2955,28 @@ static void delivery_task_fn(void *arg)
             }
         }
 
+        if (slot->epoch != h->iq_epoch.load(std::memory_order_acquire)) {
+            /* Captured before a stop/start or a retune: not this stream, or not this frequency. */
+            (void)xQueueSend(h->free_q, &slot, portMAX_DELAY);
+            h->slots_pending.fetch_sub(1, std::memory_order_acq_rel);
+            continue;
+        }
+
         /* Lazy pull ring: allocate only when mode uses read() and IQ arrives. */
         if (esp_rtl_sdr_delivery_mode_uses_read(mode)) {
             if (ensure_pull_ring(h) == ESP_OK) {
-                pull_ring_push(h, slot->data, slot->bytes);
+                /* Under pull_mux, so a ring reset or retune flush cannot land mid-push; the epoch
+                 * is checked again inside it. */
+                if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    if (slot->epoch == h->iq_epoch.load(std::memory_order_acquire)) {
+                        pull_ring_push(h, slot->data, slot->bytes);
+                    }
+                    xSemaphoreGive(h->pull_mux);
+                }
             } else {
                 HandleLock lk(h, kQueryLockTicks);
                 if (lk.ok()) {
-                    h->metrics.consumer_drops +=
-                        static_cast<uint32_t>(slot->bytes > 0 ? slot->bytes : 1);
+                    (void)__atomic_fetch_add(&h->metrics.consumer_drops, static_cast<uint32_t>(slot->bytes > 0 ? slot->bytes : 1), __ATOMIC_RELAXED);
                 }
             }
         }
@@ -2576,6 +2990,7 @@ static void delivery_task_fn(void *arg)
             }
         }
         (void)xQueueSend(h->free_q, &slot, portMAX_DELAY);
+        h->slots_pending.fetch_sub(1, std::memory_order_acq_rel); /* after its bytes are in the ring */
     }
     worker_task_exit(h);
 }
@@ -2587,9 +3002,9 @@ static void free_bulk_pool(esp_rtl_sdr_handle *h)
     }
     /* Never free usb_transfer_t while IDF DWC HCD may still own a bulk desc
      * (Tab5 _buffer_parse_bulk assert: desc_status != SUCCESS). */
-    if (h->live_urbs > 0) {
+    if (live_urbs_get(h) > 0) {
         ESP_LOGW(TAG, "free_bulk_pool refused: live_urbs=%u",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
         return;
     }
     if (h->bulk != nullptr) {
@@ -2623,12 +3038,12 @@ static esp_err_t alloc_bulk_pool(esp_rtl_sdr_handle *h, uint32_t num, uint32_t l
      * really are still live, fail loudly rather than leak - the caller gets
      * an error it can report instead of a receiver that silently never
      * comes back. */
-    if (h->live_urbs > 0) {
+    if (live_urbs_get(h) > 0) {
         (void)drain_live_urbs(h, 800, 300);
     }
-    if (h->live_urbs > 0) {
+    if (live_urbs_get(h) > 0) {
         ESP_LOGE(TAG, "alloc_bulk_pool: %u URBs still live; refusing to leak the pool",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
         return ESP_ERR_INVALID_STATE;
     }
     free_bulk_pool(h);
@@ -3121,11 +3536,13 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
 static void host_lib_task_fn(void *arg)
 {
     (void)arg;
+    s_usb_session.host_task_alive = true;
     while (s_usb_session.host_task_run) {
         uint32_t flags = 0;
         /* 50 ms: faster join on uninstall than 100 ms. */
         usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
     }
+    s_usb_session.host_task_alive = false;
     if (s_usb_session.host_join_waiter != nullptr) {
         xTaskNotifyGive(s_usb_session.host_join_waiter);
     }
@@ -3136,6 +3553,8 @@ static void host_lib_task_fn(void *arg)
 static constexpr uint32_t kUnplugWaitMs = 2000;      /* plus control_timeout_ms */
 static constexpr uint32_t kUnplugFlushMs = 1000;
 static constexpr uint32_t kUnplugFinalFlushMs = 1000;
+static constexpr uint32_t kUnplugRetryMs = 500; /* between attempts while another task holds EP0 */
+static constexpr uint32_t kJoinWaitMs = 3000;   /* uninstall: worker / host task exit, device free */
 static constexpr uint32_t kEnumCheckEveryMs = 500;
 static constexpr uint32_t kRootPortOffMs = 300; /* VBUS stays off long enough for a device to drop fully */
 
@@ -3145,7 +3564,7 @@ static void pump_until_bulk_idle(esp_rtl_sdr_handle *h, uint32_t ms)
 {
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
     for (;;) {
-        if (h->live_urbs == 0 || !h->tasks_run) {
+        if (live_urbs_get(h) == 0 || !h->tasks_run) {
             break;
         }
         if (static_cast<int32_t>(deadline - xTaskGetTickCount()) <= 0) {
@@ -3185,31 +3604,33 @@ static bool release_after_unplug(esp_rtl_sdr_handle *h)
     const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(kUnplugWaitMs + h->cfg.control_timeout_ms);
     while (static_cast<int32_t>(deadline - xTaskGetTickCount()) > 0) {
         try_take_ep0();
-        if (owns_ep0 && h->live_urbs == 0) {
+        if (owns_ep0 && live_urbs_get(h) == 0) {
             return true;
         }
         (void)usb_host_client_handle_events(h->client, 0);
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     if (!owns_ep0) {
+        /* The caller retries later rather than flush and close under the window's owner. */
         RTL_LOGW(h, "usb: device unplugged while another task still held the EP0 window");
+        return false;
     }
 
     /* Phase 2: push the endpoint's queue back to the host stack, twice, pumping events after each push. */
     for (const uint32_t window_ms : {kUnplugFlushMs, kUnplugFinalFlushMs}) {
-        if (h->live_urbs == 0 || h->dev == nullptr) {
+        if (live_urbs_get(h) == 0 || h->dev == nullptr) {
             break;
         }
         RTL_LOGW(h, "usb: unplugged with %u bulk URBs outstanding, flushing the endpoint",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
         kick_bulk_endpoint(h);
         pump_until_bulk_idle(h, window_ms);
     }
 
     /* Phase 3: whatever is still out will not return; closing proceeds and the pool is kept (not freed). */
-    if (h->live_urbs > 0) {
+    if (live_urbs_get(h) > 0) {
         RTL_LOGW(h, "usb: %u bulk URBs did not return after the unplug; keeping them allocated and closing",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
     }
     return owns_ep0;
 }
@@ -3278,15 +3699,50 @@ static void recover_failed_enumeration(esp_rtl_sdr_handle *h)
 static void client_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
+    uint32_t gone_attempts = 0;
+    TickType_t gone_next_try = 0;
     while (h->tasks_run) {
         usb_host_client_handle_events(h->client, pdMS_TO_TICKS(20));
         retry_deferred_closes(h);
         recover_failed_enumeration(h);
         if (h->device_gone) {
-            RTL_LOGW(h, "usb disconnected profile=%s addr=%u (other handles unaffected)",
-                     rtl_profile_name(h->profile), static_cast<unsigned>(h->open_addr));
+            if (gone_attempts == 0) {
+                RTL_LOGW(h, "usb disconnected profile=%s addr=%u (other handles unaffected)",
+                         rtl_profile_name(h->profile), static_cast<unsigned>(h->open_addr));
+            } else if (static_cast<int32_t>(xTaskGetTickCount() - gone_next_try) < 0) {
+                continue; /* back off between attempts; events are still pumped above */
+            }
             h->streaming = false;
             const bool ep0_held = release_after_unplug(h);
+            if (!ep0_held) {
+                /* start() or a retune / sideband window still uses h->dev between its own
+                 * checks. Closing under it is a use-after-close; it finishes (its transfers fail
+                 * NO_DEVICE) and the next attempt gets the window. Events keep being pumped. */
+                if (gone_attempts == 0) {
+                    esp_rtl_sdr_event_cb_t cb = h->cfg.event_cb;
+                    void *ctx = h->cfg.event_ctx;
+                    if (cb) {
+                        esp_rtl_sdr_error_info_t info{};
+                        info.code = ESP_RTL_SDR_ERR_NO_DEVICE;
+                        std::snprintf(info.message, sizeof(info.message),
+                                      "unplugged; close deferred until the EP0 window is free");
+                        emit_after_unlock(h, ESP_RTL_SDR_EVT_ERROR, &info, cb, ctx);
+                    }
+                }
+                gone_attempts++;
+                gone_next_try = xTaskGetTickCount() + pdMS_TO_TICKS(kUnplugRetryMs);
+                continue; /* no rescan: h->dev is still this device's handle */
+            }
+            gone_attempts = 0;
+            /* The host library's own count decides: it refuses the interface release while a
+             * transfer is still in flight. Once it has released, a leftover live_urbs is stale,
+             * and keeping it would refuse every later start (alloc_bulk_pool) and reset. */
+            if (release_interface(h, kIfaceReleaseWaitMs, true) == ESP_OK &&
+                live_urbs_get(h) > 0) {
+                RTL_LOGW(h, "usb: interface released with live_urbs=%u; none in flight, clearing",
+                         static_cast<unsigned>(live_urbs_get(h)));
+                live_urbs_set(h, 0);
+            }
             close_opened_device(h);
             /* Only now: other tasks keep seeing device_gone until h->dev is closed. */
             h->device_gone = false;
@@ -3361,6 +3817,23 @@ static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
     h->owns_host = false;
     h->host_task = nullptr;
 
+    /* A teardown that failed (host task did not exit, or usb_host_uninstall() refused) leaves
+     * our host library installed with nothing pumping it. Installing again fails with
+     * INVALID_STATE until a reboot, so adopt it: let a late host task finish, then start a new
+     * one below instead of calling usb_host_install(). */
+    bool reuse_host = false;
+    if (need_install && s_usb_session.host_installed) {
+        for (int i = 0; i < 200 && s_usb_session.host_task_alive; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        reuse_host = !s_usb_session.host_task_alive;
+        if (!reuse_host) {
+            ESP_LOGE(TAG, "usb host task from the last uninstall is still running");
+        } else {
+            ESP_LOGW(TAG, "reusing the host library left installed by a failed uninstall");
+        }
+    }
+
     if (need_install) {
         usb_host_config_t hc{};
         hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
@@ -3368,7 +3841,9 @@ static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
          * Do not set peripheral_map here: field is not present on all IDF 5.3/5.4
          * headers. Default install selects the primary HS host on ESP32-P4.
          */
-        esp_err_t ret = usb_host_install(&hc);
+        esp_err_t ret = reuse_host                     ? ESP_OK
+                        : s_usb_session.host_installed ? ESP_ERR_INVALID_STATE
+                                                       : usb_host_install(&hc);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "usb_host_install: %s", esp_err_to_name(ret));
             if (session_lock()) {
@@ -3410,10 +3885,12 @@ static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
     return ESP_OK;
 }
 
-static void session_release(esp_rtl_sdr_handle *h)
+/* @return true only if this call uninstalled the host library (so no transfer of this handle
+ * can still be owned by the host stack). */
+static bool session_release(esp_rtl_sdr_handle *h)
 {
     if (h == nullptr) {
-        return;
+        return false;
     }
     const int slot = (h->logical_index < ESP_RTL_SDR_MAX_DEVICES) ? h->logical_index : -1;
     bool last = false;
@@ -3433,23 +3910,43 @@ static void session_release(esp_rtl_sdr_handle *h)
     std::snprintf(h->log_id, sizeof(h->log_id), "RTL?");
 
     if (!we_installed) {
-        return;
+        return false;
     }
 
     s_usb_session.host_join_waiter = xTaskGetCurrentTaskHandle();
     s_usb_session.host_task_run = false;
-    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+    const bool host_joined = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(kJoinWaitMs)) > 0;
     s_usb_session.host_join_waiter = nullptr;
+    if (!host_joined) {
+        /* Still inside usb_host_lib_handle_events(): uninstalling under it is a use-after-free. */
+        ESP_LOGE(TAG, "usb host task did not exit; host library left installed");
+        return false;
+    }
     s_usb_session.host_task = nullptr;
 
+    /* usb_host_uninstall() refuses (in espressif/usb it asserts) while the host library still
+     * holds device objects, e.g. a dongle that is still attached. Free them first, pumping the
+     * library events ourselves now that the host task is gone, until ALL_FREE. */
+    if (usb_host_device_free_all() == ESP_ERR_NOT_FINISHED) {
+        const TickType_t t0 = xTaskGetTickCount();
+        while (xTaskGetTickCount() - t0 < pdMS_TO_TICKS(kJoinWaitMs)) {
+            uint32_t flags = 0;
+            (void)usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
+            if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
+                break;
+            }
+        }
+    }
     const esp_err_t uerr = usb_host_uninstall();
     if (uerr != ESP_OK) {
         ESP_LOGE(TAG, "usb_host_uninstall failed (%s)", esp_err_to_name(uerr));
+        return false;
     }
     if (session_lock()) {
         s_usb_session.host_installed = false;
         session_unlock();
     }
+    return true;
 }
 
 static esp_err_t start_usb_stack(esp_rtl_sdr_handle *h)
@@ -3514,6 +4011,11 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     esp_err_t verr = esp_rtl_sdr_config_validate(config);
     if (verr != ESP_OK) {
         return verr;
+    }
+    /* FreeRTOS asserts (or silently clamps) a priority at or above configMAX_PRIORITIES; the
+     * pure validator cannot see that limit, so check it here. 0 = driver default. */
+    if (config->usb_task_priority >= configMAX_PRIORITIES) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     auto *h = new (std::nothrow) esp_rtl_sdr_handle();
@@ -3592,7 +4094,8 @@ esp_err_t esp_rtl_sdr_install(const esp_rtl_sdr_config_t *config,
     return ESP_OK;
 }
 
-static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms);
+static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms,
+                                      bool have_ep0 = false);
 
 esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
 {
@@ -3610,9 +4113,7 @@ esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
         if (handle->destroying) {
             return ESP_RTL_SDR_ERR_BUSY;
         }
-        const uint32_t depth = __atomic_load_n(&handle->in_callback_depth, __ATOMIC_SEQ_CST);
-        const TaskHandle_t cb = __atomic_load_n(&handle->callback_task, __ATOMIC_SEQ_CST);
-        if (esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle())) {
+        if (esp_rtl_sdr_cb_is_inside(&handle->callbacks, xTaskGetCurrentTaskHandle())) {
             return ESP_RTL_SDR_ERR_REENTRANT;
         }
         handle->destroying = true;
@@ -3621,14 +4122,24 @@ esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
     usb_fault_guard_disarm();
     (void)stop_stream_internal(handle, ESP_RTL_SDR_DEFAULT_STOP_TIMEOUT_MS);
 
-    /* Deterministic worker join (no fixed 50 ms hope). */
+    /* Deterministic worker join (no fixed 50 ms hope). Each exiting worker notifies once;
+     * ulTaskNotifyTake(pdTRUE) returns how many notifications it consumed. */
     handle->join_waiter = xTaskGetCurrentTaskHandle();
     const uint8_t expect = handle->worker_task_count;
     handle->tasks_run = false;
-    for (uint8_t i = 0; i < expect; ++i) {
-        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+    uint32_t joined = 0;
+    const TickType_t join_t0 = xTaskGetTickCount();
+    while (joined < expect && xTaskGetTickCount() - join_t0 < pdMS_TO_TICKS(kJoinWaitMs)) {
+        joined += ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
     }
     handle->join_waiter = nullptr;
+    if (joined < expect) {
+        /* A worker is still running on this handle. Freeing it now is a use-after-free; leak
+         * it instead (it stays "destroying", so every API call refuses it). */
+        ESP_LOGE(TAG, "uninstall: %u of %u worker tasks did not exit; handle leaked",
+                 static_cast<unsigned>(expect - joined), static_cast<unsigned>(expect));
+        return ESP_RTL_SDR_ERR_TIMEOUT;
+    }
     handle->host_task = nullptr;
     handle->client_task = nullptr;
     handle->delivery_task = nullptr;
@@ -3640,13 +4151,16 @@ esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
         usb_host_client_deregister(handle->client);
         handle->client_registered = false;
     }
-    session_release(handle);
+    const bool host_torn_down = session_release(handle);
 
-    /* Host/HCD torn down (or never owned) - safe to clear stuck live_urbs. */
-    if (handle->live_urbs > 0) {
+    /* Only a host that was really torn down owns none of this handle's transfers. With the host
+     * still installed (another handle shares it, or the uninstall failed), live URBs keep the
+     * pool: free_bulk_pool() refuses and it is leaked on purpose, as stop() does. Its callbacks
+     * cannot run any more: this handle's client is deregistered and its client task is gone. */
+    if (live_urbs_get(handle) > 0 && host_torn_down) {
         ESP_LOGW(TAG, "uninstall: clearing stuck live_urbs=%u after host teardown",
-                 static_cast<unsigned>(handle->live_urbs));
-        handle->live_urbs = 0;
+                 static_cast<unsigned>(live_urbs_get(handle)));
+        live_urbs_set(handle, 0);
     }
     free_bulk_pool(handle);
     if (handle->ctrl_xfer) {
@@ -3766,13 +4280,17 @@ esp_err_t esp_rtl_sdr_get_metrics(esp_rtl_sdr_handle_t handle,
         return ESP_RTL_SDR_ERR_TIMEOUT;
     }
     *out_metrics = handle->metrics;
+    out_metrics->bytes_total = metric_load64(&handle->metrics.bytes_total);
+    out_metrics->ring_overrun_bytes = metric_load64(&handle->metrics.ring_overrun_bytes);
+    out_metrics->pull_lock_miss_bytes = metric_load64(&handle->metrics.pull_lock_miss_bytes);
+    out_metrics->bytes_consumed = metric_load64(&handle->metrics.bytes_consumed);
     out_metrics->frequency_hz = handle->frequency_hz;
     out_metrics->sample_rate_sps = handle->sample_rate_sps;
     if (handle->state == ESP_RTL_SDR_STATE_STREAMING && handle->stream_start_ms != 0) {
         out_metrics->uptime_ms = now_ms() - handle->stream_start_ms;
         if (out_metrics->uptime_ms > 0) {
             out_metrics->effective_sps = static_cast<uint32_t>(
-                (handle->metrics.bytes_total * 500ull) / out_metrics->uptime_ms);
+                (metric_load64(&handle->metrics.bytes_total) * 500ull) / out_metrics->uptime_ms);
         }
     }
     return ESP_OK;
@@ -3868,15 +4386,15 @@ esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
     }
     esp_rtl_sdr_stream_stats_default(out);
     out->device_id = handle->logical_index;
-    out->bytes_received = handle->metrics.bytes_total;
+    out->bytes_received = metric_load64(&handle->metrics.bytes_total);
     out->slot_starve_blocks = handle->metrics.slot_starve_blocks;
     out->ring_overrun_blocks = handle->metrics.ring_overrun_blocks;
-    out->ring_overrun_bytes = handle->metrics.ring_overrun_bytes;
+    out->ring_overrun_bytes = metric_load64(&handle->metrics.ring_overrun_bytes);
     out->pull_lock_miss_blocks = handle->metrics.pull_lock_miss_blocks;
-    out->pull_lock_miss_bytes = handle->metrics.pull_lock_miss_bytes;
-    out->bytes_consumed = handle->metrics.bytes_consumed;
+    out->pull_lock_miss_bytes = metric_load64(&handle->metrics.pull_lock_miss_bytes);
+    out->bytes_consumed = metric_load64(&handle->metrics.bytes_consumed);
     out->ring_high_water_bytes = handle->metrics.ring_high_water;
-    out->samples_received = handle->metrics.bytes_total / 2u;
+    out->samples_received = metric_load64(&handle->metrics.bytes_total) / 2u;
     out->usb_transfer_count = handle->usb_xfer_count;
     out->usb_transfer_errors = handle->usb_xfer_errors;
     out->usb_timeouts = handle->usb_timeouts;
@@ -3889,7 +4407,7 @@ esp_err_t esp_rtl_sdr_get_stream_stats(esp_rtl_sdr_handle_t handle,
         out->stream_uptime_ms = now_ms() - handle->stream_start_ms;
         if (out->stream_uptime_ms > 0) {
             out->effective_sample_rate = static_cast<uint32_t>(
-                (handle->metrics.bytes_total * 500ull) / out->stream_uptime_ms);
+                (metric_load64(&handle->metrics.bytes_total) * 500ull) / out->stream_uptime_ms);
         }
     }
     return ESP_OK;
@@ -3909,7 +4427,10 @@ esp_err_t esp_rtl_sdr_get_hub_stats(esp_rtl_sdr_handle_t handle, esp_rtl_sdr_hub
 /* Streaming                                                                  */
 /* -------------------------------------------------------------------------- */
 
-static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms)
+static constexpr uint32_t kStartEp0WaitMs = 1000;
+
+/* have_ep0: the caller (start()'s failure path) already owns the EP0 window and releases it. */
+static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms, bool have_ep0)
 {
     if (timeout_ms == 0) {
         timeout_ms = ESP_RTL_SDR_DEFAULT_STOP_TIMEOUT_MS;
@@ -3922,9 +4443,22 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
      * bias ON can never race the final OFF cleanup. */
     const int64_t deadline_us = esp_timer_get_time() +
                                 static_cast<int64_t>(timeout_ms) * 1000;
-    while (h->ep0_sideband_busy.exchange(true)) {
+    while (!have_ep0 && h->ep0_sideband_busy.exchange(true)) {
         if (esp_timer_get_time() >= deadline_us) return ESP_RTL_SDR_ERR_TIMEOUT;
         vTaskDelay(1);
+    }
+    if (!have_ep0) {
+        /* stop() checked the state under the API lock, then released it to wait for the window.
+         * Meanwhile another stop() may have finished and a start() may have begun, so look
+         * again: running on would tear down (or mark IDLE) a stream that is starting. */
+        HandleLock lk(h, kQueryLockTicks);
+        const esp_rtl_sdr_state_t st = lk.ok() ? h->state : ESP_RTL_SDR_STATE_STREAMING;
+        if (st == ESP_RTL_SDR_STATE_IDLE || st == ESP_RTL_SDR_STATE_UNINSTALLED ||
+            st == ESP_RTL_SDR_STATE_STARTING) {
+            lk.release();
+            h->ep0_sideband_busy = false;
+            return st == ESP_RTL_SDR_STATE_STARTING ? ESP_RTL_SDR_ERR_BUSY : ESP_OK;
+        }
     }
 
     const bool was_streaming = h->streaming || h->state == ESP_RTL_SDR_STATE_STREAMING ||
@@ -3932,6 +4466,7 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->state = ESP_RTL_SDR_STATE_STOPPING;
     h->pause_resubmit = true;
     h->streaming = false;
+    h->iq_epoch.fetch_add(1, std::memory_order_acq_rel); /* queued slots are this stream's last */
     h->frontend_applied_valid = false;
     h->pending_retune_hz = 0;
     h->pending_gain = false;
@@ -3963,18 +4498,20 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
             while (xSemaphoreTake(h->bulk_done_sem, 0) == pdTRUE) {
             }
         }
-        h->live_urbs = 0;
+        live_urbs_set(h, 0);
         h->pause_resubmit = false;
     } else {
         ESP_LOGW(TAG, "stop: drain timeout live_urbs=%u; skip free_bulk_pool",
-                 static_cast<unsigned>(h->live_urbs));
+                 static_cast<unsigned>(live_urbs_get(h)));
         /* Keep pause_resubmit so late bulk_cb does not resubmit. */
     }
 
     if (drained && h->iface_claimed && h->dev != nullptr) {
-        run_cleanup_best_effort(h);
-        usb_host_interface_release(h->client, h->dev, 0);
-        h->iface_claimed = false;
+        if (!h->device_gone) {
+            run_cleanup_best_effort(h);
+        }
+        /* A refused release keeps the claim (start() reuses it) instead of losing track of it. */
+        (void)release_interface(h, kIfaceReleaseWaitMs, false);
     }
 
     if (drained) {
@@ -3996,7 +4533,9 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
         set_error_unlocked(h, ESP_RTL_SDR_ERR_TIMEOUT);
     }
 
-    h->ep0_sideband_busy = false;
+    if (!have_ep0) {
+        h->ep0_sideband_busy = false;
+    }
     if (was_streaming && !h->destroying) {
         esp_rtl_sdr_event_cb_t cb = h->cfg.event_cb;
         void *ctx = h->cfg.event_ctx;
@@ -4017,8 +4556,21 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         return ESP_RTL_SDR_ERR_STALE_HANDLE;
     }
 
+    /* Copy only the struct_size bytes the caller has (an app built against an older header
+     * passes a shorter struct; reading sizeof(*stream) overruns it), defaults for the rest.
+     * stream_config_validate() below range-checks struct_size itself. */
+    if (stream->struct_size == 0 || stream->struct_size > sizeof(esp_rtl_sdr_stream_config_t)) {
+        HandleLock lk(handle, kQueryLockTicks);
+        if (lk.ok()) {
+            set_error_unlocked(handle, ESP_ERR_INVALID_ARG);
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_rtl_sdr_stream_config_t local;
+    esp_rtl_sdr_stream_config_default(&local);
+    std::memcpy(&local, stream, stream->struct_size);
+
     /* Fill zeros from preferred LO/rate (Phase 1 desktop-shaped set_* APIs). */
-    esp_rtl_sdr_stream_config_t local = *stream;
     {
         HandleLock lk(handle, kQueryLockTicks);
         if (lk.ok()) {
@@ -4094,14 +4646,45 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
     /* USB work without holding API mutex across long EP0 sequences */
     lk.release();
 
+    /* Own the device for the whole USB sequence, like a retune or sideband window: the unplug
+     * handler waits for this window before it releases the interface and closes h->dev, and a
+     * deferred retune / sideband request cannot interleave its EP0 writes with the init table.
+     * Bounded: a window from a stream that is just ending can still hold it briefly. */
+    {
+        const int64_t claim_deadline_us = esp_timer_get_time() + kStartEp0WaitMs * 1000;
+        bool owned = !handle->ep0_sideband_busy.exchange(true);
+        while (!owned && esp_timer_get_time() < claim_deadline_us) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            owned = !handle->ep0_sideband_busy.exchange(true);
+        }
+        if (!owned || handle->device_gone || handle->dev == nullptr) {
+            const esp_err_t why = owned ? ESP_RTL_SDR_ERR_NO_DEVICE : ESP_RTL_SDR_ERR_BUSY;
+            if (owned) {
+                handle->ep0_sideband_busy = false;
+            }
+            HandleLock lk4(handle);
+            if (lk4.ok()) {
+                if (handle->state == ESP_RTL_SDR_STATE_STARTING) {
+                    handle->state = ESP_RTL_SDR_STATE_IDLE;
+                }
+                set_error_unlocked(handle, why);
+            }
+            return why;
+        }
+    }
+
     esp_err_t ret = ESP_OK;
     do {
-        ret = usb_host_interface_claim(handle->client, handle->dev, 0, 0);
-        if (ret != ESP_OK) {
-            ret = ESP_RTL_SDR_ERR_USB;
-            break;
+        /* A stop whose release the host library refused keeps the claim; reuse it. */
+        if (!handle->iface_claimed) {
+            ret = usb_host_interface_claim(handle->client, handle->dev, 0, 0);
+            if (ret != ESP_OK) {
+                RTL_LOGW(handle, "interface claim failed: %s", esp_err_to_name(ret));
+                ret = ESP_RTL_SDR_ERR_USB;
+                break;
+            }
+            handle->iface_claimed = true;
         }
-        handle->iface_claimed = true;
 
         if (rtl_profile_uses_r820t2_i2c_remap(handle->profile)) {
             /* Shared R820-family addressing, independently captured board
@@ -4170,7 +4753,7 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
             if (ret != ESP_OK) {
                 break;
             }
-            ret = run_nooelec_gain_restore(handle);
+            ret = run_r820_gain_restore(handle);
             if (ret != ESP_OK) {
                 break;
             }
@@ -4282,23 +4865,35 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->pending_retune_hz = 0;
         handle->retune_busy = false;
         handle->pause_resubmit = false;
-        handle->live_urbs = 0;
+        /* alloc_bulk_pool() refused unless this was already 0 */
+        live_urbs_set(handle, 0);
+        /* a new stream: queued slots from any earlier one are dropped on delivery */
+        handle->iq_epoch.fetch_add(1, std::memory_order_acq_rel);
+        handle->cap_max_bytes = local.max_bytes;
+        handle->cap_timeout_ms = local.timeout_ms;
+        handle->cap_bytes = 0;
+        handle->cap_done.store(false, std::memory_order_release);
+        /* a new stream gets the full recovery budget */
+        handle->ep_stall_recover = false;
+        handle->ep_recoveries_at_data = handle->ep_recoveries;
         handle->health_emit_blocks = 0;
         handle->last_emitted_health = ESP_RTL_SDR_HEALTH_UNKNOWN;
         handle->streaming = true;
 
         for (uint32_t i = 0; i < handle->bulk_num; ++i) {
-            ret = usb_host_transfer_submit(handle->bulk[i]);
+            ret = submit_bulk_urb(handle, handle->bulk[i]);
             if (ret != ESP_OK) {
                 handle->streaming = false;
                 ret = ESP_RTL_SDR_ERR_USB;
                 break;
             }
-            handle->live_urbs++;
         }
         if (ret != ESP_OK) {
             break;
         }
+        /* The tuner is reprogrammed from scratch on a stream start, so any
+         * cached register values from a previous session are stale. */
+        handle->tuner_reg_known = 0;
 
         esp_rtl_sdr_event_cb_t cb = nullptr;
         void *ctx = nullptr;
@@ -4311,12 +4906,12 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
                 ctx = handle->cfg.event_ctx;
             }
         }
+        /* Only now: an unplug handled after this sees STREAMING and leaves IDLE, never the
+         * reverse. Before any app callback, which may call retune. */
+        handle->ep0_sideband_busy = false;
         if (cb) {
             emit_after_unlock(handle, ESP_RTL_SDR_EVT_STREAM_STARTED, nullptr, cb, ctx);
         }
-        /* The tuner is reprogrammed from scratch on a stream start, so any
-         * cached register values from a previous session are stale. */
-        handle->tuner_reg_known = 0;
         ESP_LOGI(TAG, "stream start freq=%u exact_rate=%u urbs=%ux%u",
                  static_cast<unsigned>(freq), static_cast<unsigned>(exact_sps),
                  static_cast<unsigned>(handle->bulk_num),
@@ -4324,16 +4919,24 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         return ESP_OK;
     } while (0);
 
-    (void)stop_stream_internal(handle, 1000);
-    HandleLock lk3(handle);
-    if (lk3.ok()) {
-        set_error_unlocked(handle, ret);
-        if (ret == ESP_RTL_SDR_ERR_USB) {
-            handle->state = ESP_RTL_SDR_STATE_FAULT;
-        } else {
-            handle->state = ESP_RTL_SDR_STATE_IDLE;
+    (void)stop_stream_internal(handle, 1000, true);
+    if (handle->device_gone) {
+        /* Unplugged mid-init: the unplug handler takes over once the window is released and
+         * leaves the handle IDLE, so this is not a FAULT. */
+        ret = ESP_RTL_SDR_ERR_NO_DEVICE;
+    }
+    {
+        HandleLock lk3(handle);
+        if (lk3.ok()) {
+            set_error_unlocked(handle, ret);
+            if (ret == ESP_RTL_SDR_ERR_USB) {
+                handle->state = ESP_RTL_SDR_STATE_FAULT;
+            } else {
+                handle->state = ESP_RTL_SDR_STATE_IDLE;
+            }
         }
     }
+    handle->ep0_sideband_busy = false;
     return ret;
 }
 
@@ -4367,10 +4970,8 @@ esp_err_t esp_rtl_sdr_retune_hz(esp_rtl_sdr_handle_t handle, uint32_t frequency_
         }
         handle->pending_retune_hz = q;
         {
-            const uint32_t depth = __atomic_load_n(&handle->in_callback_depth, __ATOMIC_SEQ_CST);
-            const TaskHandle_t cb = __atomic_load_n(&handle->callback_task, __ATOMIC_SEQ_CST);
             from_callback =
-                esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle());
+                esp_rtl_sdr_cb_is_inside(&handle->callbacks, xTaskGetCurrentTaskHandle());
         }
         set_error_unlocked(handle, ESP_OK);
     }
@@ -4433,7 +5034,7 @@ esp_err_t esp_rtl_sdr_reset(esp_rtl_sdr_handle_t handle)
     /* After timed-out stop (FAULT, live_urbs>0, pool kept): refuse reset so
      * start cannot alloc_bulk_pool -> free_bulk_pool orphan the old array
      * while callbacks may still fire. Caller should retry stop until drain. */
-    if (handle->live_urbs > 0) {
+    if (live_urbs_get(handle) > 0) {
         set_error_unlocked(handle, ESP_RTL_SDR_ERR_BUSY);
         return ESP_RTL_SDR_ERR_BUSY;
     }
@@ -4577,6 +5178,14 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
+        /* Distinct errors for a dead stream, so a reader does not wait out NOT_STREAMING on a
+         * stream that will not come back. */
+        if (handle->state == ESP_RTL_SDR_STATE_FAULT) {
+            return ESP_RTL_SDR_ERR_FAULT;
+        }
+        if (handle->device_gone) {
+            return ESP_RTL_SDR_ERR_NO_DEVICE;
+        }
         if (handle->state != ESP_RTL_SDR_STATE_STREAMING || !handle->streaming) {
             set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_STREAMING);
             return ESP_RTL_SDR_ERR_NOT_STREAMING;
@@ -4610,8 +5219,11 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
         }
     }
 
-    const TickType_t deadline =
-        timeout_ms == 0 ? 0 : (xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms));
+    /* Elapsed-time arithmetic (unsigned subtraction) stays right across a tick-counter wrap;
+     * comparing an absolute deadline with the tick count did not, and returned TIMEOUT at once
+     * for every read whose deadline wrapped (every ~49.7 days at 1 kHz). */
+    const TickType_t t_start = xTaskGetTickCount();
+    const TickType_t t_total = pdMS_TO_TICKS(timeout_ms);
     size_t copied = 0;
 
     for (;;) {
@@ -4620,6 +5232,22 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
          * lock here would be waited on from a context ESP-IDF says must not
          * block. */
         {
+            /* A retune asked to drop what was buffered at the old frequency (only the reader
+             * moves pull_r, so the reader applies it). */
+            const uint32_t fg = handle->pull_flush_gen.load(std::memory_order_acquire);
+            if (fg != handle->pull_flush_seen) {
+                handle->pull_flush_seen = fg;
+                /* Only forward: if this reader already consumed past the flush point (it raced
+                 * the whole retune), moving pull_r back would re-deliver bytes the producer may
+                 * be overwriting. */
+                const size_t cap = handle->pull_cap;
+                const size_t r0 = handle->pull_r.load(std::memory_order_relaxed);
+                const size_t w0 = handle->pull_w.load(std::memory_order_acquire);
+                const size_t fw = handle->pull_flush_w.load(std::memory_order_acquire);
+                if (cap != 0 && (fw + cap - r0) % cap <= (w0 + cap - r0) % cap) {
+                    handle->pull_r.store(fw, std::memory_order_release);
+                }
+            }
             const size_t r = handle->pull_r.load(std::memory_order_relaxed);
             const size_t w = handle->pull_w.load(std::memory_order_acquire);
             const size_t used = (w >= r) ? (w - r) : (handle->pull_cap - r + w);
@@ -4638,7 +5266,7 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
                 handle->pull_r.store((r + n) % handle->pull_cap,
                                      std::memory_order_release);
                 copied += n;
-                handle->metrics.bytes_consumed += n;
+                metric_add64(&handle->metrics.bytes_consumed, n);
             }
         }
 
@@ -4646,25 +5274,31 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             *out_bytes = copied;
             return ESP_OK;
         }
+        /* End of a bounded capture only once no producer can add bytes: every URB has retired
+         * (bulk_cb pushes before it retires) and no slot sits between bulk_cb and the ring.
+         * cap_done alone is set before the last chunk is published. */
+        if (handle->cap_done.load(std::memory_order_acquire) && live_urbs_get(handle) == 0 &&
+            handle->slots_pending.load(std::memory_order_acquire) == 0 &&
+            handle->pull_r.load(std::memory_order_relaxed) ==
+                handle->pull_w.load(std::memory_order_acquire)) {
+            /* Bounded capture complete and every byte read: the stream has ended. */
+            return ESP_RTL_SDR_ERR_NOT_STREAMING;
+        }
         if (timeout_ms == 0) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        TickType_t wait = pdMS_TO_TICKS(20);
-        if (deadline > xTaskGetTickCount()) {
-            const TickType_t left = deadline - xTaskGetTickCount();
-            if (left < wait) {
-                wait = left;
-            }
-        } else {
+        const TickType_t elapsed = xTaskGetTickCount() - t_start;
+        if (elapsed >= t_total) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
+        }
+        TickType_t wait = pdMS_TO_TICKS(20);
+        if (t_total - elapsed < wait) {
+            wait = t_total - elapsed;
         }
         if (handle->pull_sem != nullptr) {
             (void)xSemaphoreTake(handle->pull_sem, wait);
         } else {
             vTaskDelay(wait);
-        }
-        if (xTaskGetTickCount() >= deadline) {
-            return ESP_RTL_SDR_ERR_TIMEOUT;
         }
     }
     return copied > 0 ? ESP_OK : ESP_RTL_SDR_ERR_TIMEOUT;
@@ -5086,7 +5720,7 @@ static void fill_health_info(const esp_rtl_sdr_handle *h, esp_rtl_sdr_health_inf
     const uint32_t up = now_ms() - h->stream_start_ms;
     if (up > 0) {
         out->effective_sps =
-            static_cast<uint32_t>((h->metrics.bytes_total * 500ull) / up);
+            static_cast<uint32_t>((metric_load64(&h->metrics.bytes_total) * 500ull) / up);
     }
     if (out->programmed_sps > 0 && out->effective_sps > 0) {
         out->efficiency =
@@ -5627,28 +6261,36 @@ static esp_err_t apply_pending_sideband_ep0(esp_rtl_sdr_handle *h)
     }
     if (h->ep0_sideband_busy.exchange(true)) return ESP_OK;
 
-    const bool do_bias = h->pending_bias;
+    /* Take each request with an atomic exchange and read its payload only afterwards. Copying
+     * everything and then clearing the flags lost a request that a setter (which writes outside
+     * the API lock) queued in between. A payload written after the exchange is applied now and,
+     * because its flag is set again, once more on the next pass. */
+    const auto take = [](volatile bool *flag) {
+        return __atomic_exchange_n(flag, false, __ATOMIC_ACQ_REL);
+    };
+    const bool do_bias = take(&h->pending_bias);
     const bool bias_en = h->pending_bias_enable;
-    const bool do_mode = h->pending_gain_mode;
+    const bool do_mode = take(&h->pending_gain_mode);
     const esp_rtl_sdr_gain_mode_t mode_val = h->pending_gain_mode_val;
-    const bool do_gain = h->pending_gain;
+    const bool do_gain = take(&h->pending_gain);
     const int gain_t = h->pending_gain_tenth;
-    const bool do_rtl = h->pending_rtl_agc;
+    const bool do_rtl = take(&h->pending_rtl_agc);
     const bool rtl_en = h->pending_rtl_agc_enable;
-    const bool do_bandwidth = h->pending_bandwidth;
+    const bool do_bandwidth = take(&h->pending_bandwidth);
     const uint32_t width_hz = h->bandwidth_requested_hz;
-    h->pending_bias = false;
-    h->pending_gain = false;
-    h->pending_gain_mode = false;
-    h->pending_rtl_agc = false;
-    h->pending_bandwidth = false;
 
     if (!bulk_pause_and_drain(h)) {
-        h->pending_bias |= do_bias;
-        h->pending_gain |= do_gain;
-        h->pending_gain_mode |= do_mode;
-        h->pending_rtl_agc |= do_rtl;
-        h->pending_bandwidth |= do_bandwidth;
+        /* Put back only what was taken; a newer request may already be pending. */
+        const auto put_back = [](volatile bool *flag, bool taken) {
+            if (taken) {
+                __atomic_store_n(flag, true, __ATOMIC_RELEASE);
+            }
+        };
+        put_back(&h->pending_bias, do_bias);
+        put_back(&h->pending_gain, do_gain);
+        put_back(&h->pending_gain_mode, do_mode);
+        put_back(&h->pending_rtl_agc, do_rtl);
+        put_back(&h->pending_bandwidth, do_bandwidth);
         h->ep0_sideband_busy = false;
         return ESP_RTL_SDR_ERR_TIMEOUT;
     }
@@ -5731,7 +6373,7 @@ static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *ap
     /* Streaming: queue for delivery task (non-blocking for HTTP/UI). */
     if (h->streaming) {
         h->pending_gain_tenth = tenth_db;
-        h->pending_gain = true;
+        __atomic_store_n(&h->pending_gain, true, __ATOMIC_RELEASE); /* after the payload */
         if (applied_tenth != nullptr) {
             *applied_tenth = rtl_profile_uses_r820t2_i2c_remap(h->profile)
                                  ? kR820T2GainSteps[r820t2_nearest_gain_index(tenth_db)].tenth_db
@@ -5740,18 +6382,24 @@ static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *ap
         }
         return ESP_OK;
     }
-    return apply_gain_records(h, tenth_db, applied_tenth);
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
 }
 
 static esp_err_t apply_profile_bias(esp_rtl_sdr_handle *h, bool enable)
 {
     if (h->streaming) {
         h->pending_bias_enable = enable;
-        h->pending_bias = true;
+        __atomic_store_n(&h->pending_bias, true, __ATOMIC_RELEASE); /* after the payload */
         h->bias_tee_want = enable; /* preference immediately; EP0 async */
         return ESP_OK;
     }
-    return apply_bias_records(h, enable);
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
 }
 
 static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
@@ -5759,26 +6407,42 @@ static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
 {
     if (h->streaming) {
         h->pending_gain_mode_val = mode;
-        h->pending_gain_mode = true;
+        __atomic_store_n(&h->pending_gain_mode, true, __ATOMIC_RELEASE); /* after the payload */
         if (mode == ESP_RTL_SDR_GAIN_MODE_AUTO) {
             h->pending_gain = false; /* AUTO replaces a queued ladder write */
         }
         return ESP_OK;
     }
-    if (mode == ESP_RTL_SDR_GAIN_MODE_AUTO) {
-        const esp_err_t aerr = apply_tuner_agc_auto_records(h);
-        if (aerr == ESP_OK) {
-            h->tuner_auto_applied = true;
-        }
-        return aerr;
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
+}
+
+/**
+ * Gate for the gain / bias / AGC setters (caller holds the API lock). They used to check only
+ * iface_claimed / dev, but start() claims the interface with the lock released and streaming
+ * still false, so a setter took the direct EP0 path in the middle of the init table; and a FAULT
+ * after a failed drain keeps the claim while URBs are still live.
+ */
+static esp_err_t ep0_setter_gate(const esp_rtl_sdr_handle *h)
+{
+    switch (h->state) {
+    case ESP_RTL_SDR_STATE_STARTING:
+    case ESP_RTL_SDR_STATE_STOPPING:
+        return ESP_RTL_SDR_ERR_BUSY;
+    case ESP_RTL_SDR_STATE_FAULT:
+        return ESP_RTL_SDR_ERR_FAULT;
+    default:
+        break;
     }
-    int applied = 0;
-    const esp_err_t err = apply_gain_records(h, h->gain_tenth_db, &applied);
-    if (err == ESP_OK) {
-        h->gain_tenth_db = applied;
-        h->tuner_auto_applied = false;
+    /* IDLE: a claim kept after a refused release (see release_interface) is not an open stream;
+     * a direct EP0 write there could run into a start() that begins right after this check. */
+    if (h->state != ESP_RTL_SDR_STATE_STREAMING || !h->iface_claimed || h->dev == nullptr ||
+        h->device_gone) {
+        return ESP_RTL_SDR_ERR_NOT_CLAIMED;
     }
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
@@ -5805,9 +6469,10 @@ esp_err_t esp_rtl_sdr_set_tuner_gain_mode(esp_rtl_sdr_handle_t handle,
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         const uint32_t rf_hz = handle->pending_retune_hz != 0
                                    ? handle->pending_retune_hz
@@ -5877,9 +6542,10 @@ esp_err_t esp_rtl_sdr_set_tuner_gain(esp_rtl_sdr_handle_t handle, int gain_tenth
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         const uint32_t rf_hz = handle->pending_retune_hz != 0
                                    ? handle->pending_retune_hz
@@ -6003,7 +6669,7 @@ esp_err_t esp_rtl_sdr_set_tuner_bandwidth(esp_rtl_sdr_handle_t handle, uint32_t 
         return ESP_RTL_SDR_ERR_UNSUPPORTED;
     }
     handle->bandwidth_requested_hz = hz;
-    handle->pending_bandwidth = true;
+    __atomic_store_n(&handle->pending_bandwidth, true, __ATOMIC_RELEASE); /* after the payload */
     set_error_unlocked(handle, ESP_OK); /* accepted, not yet applied */
     return ESP_OK;
 }
@@ -6076,9 +6742,10 @@ esp_err_t esp_rtl_sdr_set_bias_tee(esp_rtl_sdr_handle_t handle, bool enable)
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         handle->bias_tee_want = enable;
     }
@@ -6122,33 +6789,23 @@ esp_err_t esp_rtl_sdr_set_rtl_agc(esp_rtl_sdr_handle_t handle, bool enable)
         if (!lk.ok()) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
         }
-        if (!handle->iface_claimed || handle->dev == nullptr) {
-            set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_CLAIMED);
-            return ESP_RTL_SDR_ERR_NOT_CLAIMED;
+        const esp_err_t gate = ep0_setter_gate(handle);
+        if (gate != ESP_OK) {
+            set_error_unlocked(handle, gate);
+            return gate;
         }
         if (handle->streaming) {
             handle->pending_rtl_agc_enable = enable;
-            handle->pending_rtl_agc = true;
+            __atomic_store_n(&handle->pending_rtl_agc, true, __ATOMIC_RELEASE); /* after the payload */
             handle->rtl_agc_want = enable;
             set_error_unlocked(handle, ESP_OK);
             return ESP_OK;
         }
+        /* STREAMING but streaming already false: a recovery give-up or failed retune is moving
+         * the stream to FAULT. No direct EP0 write without the EP0 window. */
+        set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_STREAMING);
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
     }
-
-    const esp_err_t err = apply_rtl_agc_records(handle, enable);
-
-    HandleLock lk(handle);
-    if (!lk.ok()) {
-        return (err == ESP_OK) ? ESP_RTL_SDR_ERR_TIMEOUT : err;
-    }
-    if (err == ESP_OK) {
-        handle->rtl_agc_want = enable;
-        set_error_unlocked(handle, ESP_OK);
-        ESP_LOGI(TAG, "RTL AGC %s [measured demod 0x19]", enable ? "ON" : "OFF");
-    } else {
-        set_error_unlocked(handle, err);
-    }
-    return err;
 }
 
 esp_err_t esp_rtl_sdr_get_rtl_agc(esp_rtl_sdr_handle_t handle, bool *out_enable)

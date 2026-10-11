@@ -13,8 +13,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = """apply_freq_correction_hz encode_r820_pll tuner_i2c_value_for_handle
 map_tuner_record_for_profile run_record run_records run_profile_demod_if_restore
-run_v3_direct_tune run_v3_enter_direct run_v3_tuner_reinit run_nooelec_gain_restore run_v3_leave_direct
-run_tune run_profile_tune frontend_rf_hz apply_r820t2_gain_records apply_gain_records
+run_v3_direct_tune run_v3_enter_direct run_v3_tuner_reinit run_r820_gain_restore run_v3_leave_direct
+check_tuner_pll_lock run_tune run_profile_tune frontend_rf_hz apply_r820t2_gain_records apply_gain_records
 apply_tuner_agc_auto_records apply_rtl_agc_records run_bandwidth_program""".split()
 
 
@@ -53,7 +53,8 @@ HARNESS = r'''
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
-#define RTL_LOGW(...) ((void)0)
+static unsigned rtl_warnings = 0;
+#define RTL_LOGW(...) ((void)++rtl_warnings)
 #define RTL_LOGE(...) ((void)0)
 #define RTL_LOGD(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
@@ -65,7 +66,7 @@ struct esp_rtl_sdr_handle {
     RtlProfileId profile = RtlProfileId::NooelecSmartV5;
     uint32_t frequency_hz = 99100000, preferred_frequency_hz = 99100000;
     int32_t freq_correction_ppm = 0;
-    uint32_t last_pll_if_hz = 0, last_lo_hz = 0;
+    uint32_t last_pll_if_hz = 0, last_lo_hz = 0, pll_unlocked_tunes = 0;
     bool ctrl_stall = false, bias_tee_want = false, tuner_auto_applied = false;
     uint32_t tuner_reg_known = 0;
     uint8_t tuner_reg_val[32] = {}, tuner_reg05_low_bits = 3, tuner_reg07 = 0x75;
@@ -73,12 +74,20 @@ struct esp_rtl_sdr_handle {
     int gain_tenth_db = 0;
 };
 static std::vector<RtlControlRecord> wire;
+static constexpr bool kFailTuneOnPllUnlock = false; // as in the driver
+static bool pll_locked = true; // what the tuner status read (regs 00..02) reports
 static esp_err_t ctrl_submit(esp_rtl_sdr_handle *, uint8_t type, uint8_t,
-    uint16_t value, uint16_t index, const uint8_t *data, uint8_t length, bool) {
+    uint16_t value, uint16_t index, const uint8_t *data, uint8_t length, bool,
+    uint8_t *response = nullptr, uint16_t response_length = 0) {
     CHECK(length <= 8);
     RtlControlRecord r{value, index, type, length, {}};
     if (length) std::memcpy(r.data, data, length);
     wire.push_back(r);
+    if (response != nullptr && response_length > 0) {
+        std::memset(response, 0, response_length);
+        // VCO lock is reg 02 bit 6; tuner reads come back bit-reversed, so bit 1 of the raw byte
+        if (type == 0xc0 && response_length >= 3 && pll_locked) response[2] = 0x02;
+    }
     return ESP_OK;
 }
 static bool hf_direct_route(const esp_rtl_sdr_handle *h, uint32_t) {
@@ -179,7 +188,7 @@ int main() {
     // The restore runs separately, once the repeater is on.
     h = {}; wire.clear(); h.gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL; h.gain_tenth_db = 496;
     CHECK(run_v3_tuner_reinit(&h) == ESP_OK); gain(0x83, 0x75, 0xf0);
-    wire.clear(); CHECK(run_nooelec_gain_restore(&h) == ESP_OK); gain(0x9f, 0x6e, 0x68);
+    wire.clear(); CHECK(run_r820_gain_restore(&h) == ESP_OK); gain(0x9f, 0x6e, 0x68);
     // A Q retune can cancel queued MANUAL while the old AUTO-applied flag remains.
     h.gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL; h.gain_tenth_db = 496;
     h.tuner_auto_applied = true;
@@ -231,6 +240,15 @@ int main() {
     // Mode A (the default) has no plan: the cold reinit + demod IF restore above is its whole state.
     { MeasuredTunerBandwidthPlan plan{};
       CHECK(!r820t2_rate_plan(RtlProfileId::NooelecSmartV5, 2048000, 915000000, &plan)); }
+    // The PLL lock read is checked: an unlocked PLL is re-read, warned about and counted, and the tune goes on.
+    h = {}; wire.clear(); pll_locked = false; const unsigned warned = rtl_warnings;
+    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_OK);
+    CHECK(rtl_warnings == warned + 1); CHECK(h.pll_unlocked_tunes == 1);
+    size_t lock_reads = 0;
+    for (const auto &r : wire)
+        if (r.request_type == 0xc0 && r.index == 0x0600 && r.length == 3) ++lock_reads;
+    CHECK(lock_reads == 3);
+    pll_locked = true;
     std::printf("RESULT nooelec_runtime_trace passed=%u failed=0\n", checks);
 }
 '''

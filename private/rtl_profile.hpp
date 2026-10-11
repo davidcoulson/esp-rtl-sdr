@@ -98,6 +98,17 @@ inline bool rtl_profile_v3_probe_matches(const RtlProfileProbeResult &probe)
  * Final selector. Descriptor wins. Only when descriptors are ambiguous on the
  * shared 0bda:2838 identity may a completed R820T2 chip-id probe select BlogV3.
  * Bare unknown sticks are never BlogV4.
+ *
+ * The probe proves the tuner, not the board: a generic 0bda:2838 R820T2 stick and
+ * a Blog V3 with factory strings (the tested V3c reports RTL2838UHIDIR) look the
+ * same over USB, so a probed stick is assumed to have Blog V3 wiring. For a generic
+ * stick that means CAP_DIRECT_SAMPLING (RF below kR820T2NativeMinHz goes to the
+ * RTL2832 Q-branch ADC, which may not be wired: noise or silence) and CAP_BIAS_TEE.
+ * With CAP_BIAS_TEE, start and cleanup write the bias GPIO records (off) whether or
+ * not bias tee was asked for, and those are whole-register writes of GPD/GPOE/GPO
+ * (0x3004/0x3003/0x3001), so they set GPIO 0, 3 and 4 as the V3 wants them on a
+ * board whose wiring is unknown. Splitting a generic-R820T2 profile from BlogV3
+ * would take these from real V3s with factory strings, so it is not done here.
  */
 inline RtlProfileId rtl_profile_select(uint16_t vid, uint16_t pid, const char *manufacturer,
                                        const char *product,
