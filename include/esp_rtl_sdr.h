@@ -844,8 +844,10 @@ esp_err_t esp_rtl_sdr_get_sample_rate(esp_rtl_sdr_handle_t handle, uint32_t *out
  * @param timeout_ms  0 = return immediately with whatever is buffered.
  * @param out_bytes  Required; set to bytes copied (0 on timeout with empty buffer).
  * @return ESP_OK if any bytes copied, ERR_TIMEOUT if none within timeout while
- *         streaming, ERR_NOT_STREAMING if idle, ERR_UNSUPPORTED if mode is
- *         CALLBACK-only, other errors as usual.
+ *         streaming, ERR_NOT_STREAMING if idle, ERR_FAULT if the stream died
+ *         (stop() or reset() clears it), ERR_NO_DEVICE once the dongle is
+ *         unplugged, ERR_UNSUPPORTED if mode is CALLBACK-only, other errors as
+ *         usual.
  */
 esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t max_bytes,
                            uint32_t timeout_ms, size_t *out_bytes);

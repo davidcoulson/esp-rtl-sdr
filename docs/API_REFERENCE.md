@@ -1055,7 +1055,9 @@ Blocking pull of interleaved CU8 IQ. Works **with or without** an event callback
 | `ESP_OK` | **Any** bytes copied (`*out_bytes > 0`) |
 | `ERR_TIMEOUT` | None within timeout while streaming |
 | `ERR_NOT_STREAMING` | Idle |
-| Other | Fault / arg errors |
+| `ERR_FAULT` | Stream died (bulk endpoint recovery gave up; `EVT_ERROR` sent); `stop` or `reset` |
+| `ERR_NO_DEVICE` | Dongle unplugged |
+| Other | Arg errors |
 
 ```c
 uint8_t buf[16384];
