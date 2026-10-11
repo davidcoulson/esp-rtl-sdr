@@ -277,6 +277,46 @@ static void test_callback_reentry_is_task_local(void)
     EXPECT_TRUE(esp_rtl_sdr_caller_is_event_callback(2, app, app));
 }
 
+/* Two tasks inside callbacks at once (EVT_HEALTH on the delivery task while EVT_RETUNED runs on
+ * an app task): each is reentrant only for itself, and one leaving does not clear the other. */
+static void test_callback_tracker_overlapping_tasks(void)
+{
+    const void *delivery = reinterpret_cast<const void *>(0x1000);
+    const void *app = reinterpret_cast<const void *>(0x2000);
+    const void *other = reinterpret_cast<const void *>(0x3000);
+    EspRtlSdrCallbackTracker t;
+
+    const int d = esp_rtl_sdr_cb_enter(&t, delivery);
+    EXPECT_TRUE(d >= 0);
+    EXPECT_TRUE(esp_rtl_sdr_cb_is_inside(&t, delivery));
+    EXPECT_TRUE(!esp_rtl_sdr_cb_is_inside(&t, app));
+
+    const int a = esp_rtl_sdr_cb_enter(&t, app);
+    EXPECT_TRUE(a >= 0 && a != d);
+    EXPECT_TRUE(esp_rtl_sdr_cb_is_inside(&t, app));
+    EXPECT_TRUE(!esp_rtl_sdr_cb_is_inside(&t, other));
+
+    /* The first emitter leaving must not clear the second (the old single field did). */
+    esp_rtl_sdr_cb_exit(&t, d);
+    EXPECT_TRUE(!esp_rtl_sdr_cb_is_inside(&t, delivery));
+    EXPECT_TRUE(esp_rtl_sdr_cb_is_inside(&t, app));
+
+    /* Nested emit on one task: still inside until the outer one leaves. */
+    const int a2 = esp_rtl_sdr_cb_enter(&t, app);
+    EXPECT_TRUE(a2 == a);
+    esp_rtl_sdr_cb_exit(&t, a2);
+    EXPECT_TRUE(esp_rtl_sdr_cb_is_inside(&t, app));
+    esp_rtl_sdr_cb_exit(&t, a);
+    EXPECT_TRUE(!esp_rtl_sdr_cb_is_inside(&t, app));
+
+    /* Full table: entry fails (-1) rather than overwrite another task's slot. */
+    for (int i = 0; i < EspRtlSdrCallbackTracker::kSlots; ++i) {
+        EXPECT_TRUE(esp_rtl_sdr_cb_enter(&t, reinterpret_cast<const void *>(0x5000 + 16 * i)) >= 0);
+    }
+    EXPECT_TRUE(esp_rtl_sdr_cb_enter(&t, other) == -1);
+    EXPECT_TRUE(!esp_rtl_sdr_cb_is_inside(&t, nullptr));
+}
+
 static void test_rate_windows(void)
 {
     /* Named + continuous */
@@ -856,6 +896,7 @@ int main(void)
     test_measured_agc_tables();
     test_v4_frontend_composition();
     test_callback_reentry_is_task_local();
+    test_callback_tracker_overlapping_tasks();
     test_delivery_mode_helpers();
     test_rate_windows();
     test_recommended_rates();
