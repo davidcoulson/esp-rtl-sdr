@@ -2562,7 +2562,12 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
              * direct sampling), while frequency_hz and the IQ metadata still say previous_hz.
              * Tune back, with the failed target as the "previous" frequency so the matching
              * transition sequence runs. The bandwidth transaction does its own rollback. */
-            esp_err_t rb = run_profile_tune(h, previous_hz, tune_hz);
+            /* In R820T2 IF mode B/C the demod IF stays at the plan's value, so the PLL must be
+             * restored at that IF too (0 = the profile default, as in mode A). */
+            MeasuredTunerBandwidthPlan rb_plan{};
+            const uint32_t rb_if_hz =
+                r820t2_rate_plan(h->profile, h->sample_rate_sps, previous_hz, &rb_plan) ? rb_plan.if_hz : 0;
+            esp_err_t rb = run_profile_tune(h, previous_hz, tune_hz, rb_if_hz);
             if (rb == ESP_OK) rb = run_band_frontend(h, previous_hz);
             if (rb == ESP_OK) {
                 ESP_LOGW(TAG, "hot retune to %u Hz failed; kept %u Hz",
