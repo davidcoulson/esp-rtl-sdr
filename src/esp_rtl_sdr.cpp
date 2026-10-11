@@ -217,6 +217,8 @@ struct UsbSession {
     bool external_host = false; /* app called usb_host_install */
     volatile bool bringing_up = false;
     volatile bool host_task_run = false;
+    /** True from host_lib_task_fn's entry until just before it deletes itself. */
+    volatile bool host_task_alive = false;
     TaskHandle_t host_task = nullptr;
     TaskHandle_t host_join_waiter = nullptr;
     RtlClaimTable claims{};
@@ -492,6 +494,9 @@ struct esp_rtl_sdr_handle {
     uint32_t cap_timeout_ms = 0;
     uint64_t cap_bytes = 0;
     std::atomic<bool> cap_done{false};
+    /** Slots handed to the delivery task (filled_q) and not yet pushed or dropped by it. With
+     *  live_urbs, tells read() that no producer can still add bytes to a finished capture. */
+    std::atomic<uint32_t> slots_pending{0};
     /** Flush request for the reader: skip everything up to pull_flush_w. Only the reader moves
      *  pull_r, so it applies the flush itself on its next read (pull_flush_seen is its copy). */
     std::atomic<uint32_t> pull_flush_gen{0};
@@ -2128,7 +2133,9 @@ static void bulk_cb(usb_transfer_t *xfer)
                     h->queue_high_water = static_cast<uint32_t>(waiting) + 1u;
                 }
             }
+            h->slots_pending.fetch_add(1, std::memory_order_acq_rel);
             if (xQueueSend(h->filled_q, &slot, 0) != pdTRUE) {
+                h->slots_pending.fetch_sub(1, std::memory_order_acq_rel);
                 (void)xQueueSend(h->free_q, &slot, 0);
                 h->metrics.overruns++;
                 slot->flags |= ESP_RTL_SDR_IQ_FLAG_OVERRUN;
@@ -2933,6 +2940,7 @@ static void delivery_task_fn(void *arg)
         if (slot->epoch != h->iq_epoch.load(std::memory_order_acquire)) {
             /* Captured before a stop/start or a retune: not this stream, or not this frequency. */
             (void)xQueueSend(h->free_q, &slot, portMAX_DELAY);
+            h->slots_pending.fetch_sub(1, std::memory_order_acq_rel);
             continue;
         }
 
@@ -2964,6 +2972,7 @@ static void delivery_task_fn(void *arg)
             }
         }
         (void)xQueueSend(h->free_q, &slot, portMAX_DELAY);
+        h->slots_pending.fetch_sub(1, std::memory_order_acq_rel); /* after its bytes are in the ring */
     }
     worker_task_exit(h);
 }
@@ -3509,11 +3518,13 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
 static void host_lib_task_fn(void *arg)
 {
     (void)arg;
+    s_usb_session.host_task_alive = true;
     while (s_usb_session.host_task_run) {
         uint32_t flags = 0;
         /* 50 ms: faster join on uninstall than 100 ms. */
         usb_host_lib_handle_events(pdMS_TO_TICKS(50), &flags);
     }
+    s_usb_session.host_task_alive = false;
     if (s_usb_session.host_join_waiter != nullptr) {
         xTaskNotifyGive(s_usb_session.host_join_waiter);
     }
@@ -3788,6 +3799,23 @@ static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
     h->owns_host = false;
     h->host_task = nullptr;
 
+    /* A teardown that failed (host task did not exit, or usb_host_uninstall() refused) leaves
+     * our host library installed with nothing pumping it. Installing again fails with
+     * INVALID_STATE until a reboot, so adopt it: let a late host task finish, then start a new
+     * one below instead of calling usb_host_install(). */
+    bool reuse_host = false;
+    if (need_install && s_usb_session.host_installed) {
+        for (int i = 0; i < 200 && s_usb_session.host_task_alive; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        reuse_host = !s_usb_session.host_task_alive;
+        if (!reuse_host) {
+            ESP_LOGE(TAG, "usb host task from the last uninstall is still running");
+        } else {
+            ESP_LOGW(TAG, "reusing the host library left installed by a failed uninstall");
+        }
+    }
+
     if (need_install) {
         usb_host_config_t hc{};
         hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
@@ -3795,7 +3823,9 @@ static esp_err_t session_acquire(esp_rtl_sdr_handle *h)
          * Do not set peripheral_map here: field is not present on all IDF 5.3/5.4
          * headers. Default install selects the primary HS host on ESP32-P4.
          */
-        esp_err_t ret = usb_host_install(&hc);
+        esp_err_t ret = reuse_host                     ? ESP_OK
+                        : s_usb_session.host_installed ? ESP_ERR_INVALID_STATE
+                                                       : usb_host_install(&hc);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "usb_host_install: %s", esp_err_to_name(ret));
             if (session_lock()) {
@@ -5177,8 +5207,16 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             const uint32_t fg = handle->pull_flush_gen.load(std::memory_order_acquire);
             if (fg != handle->pull_flush_seen) {
                 handle->pull_flush_seen = fg;
-                handle->pull_r.store(handle->pull_flush_w.load(std::memory_order_acquire),
-                                     std::memory_order_release);
+                /* Only forward: if this reader already consumed past the flush point (it raced
+                 * the whole retune), moving pull_r back would re-deliver bytes the producer may
+                 * be overwriting. */
+                const size_t cap = handle->pull_cap;
+                const size_t r0 = handle->pull_r.load(std::memory_order_relaxed);
+                const size_t w0 = handle->pull_w.load(std::memory_order_acquire);
+                const size_t fw = handle->pull_flush_w.load(std::memory_order_acquire);
+                if (cap != 0 && (fw + cap - r0) % cap <= (w0 + cap - r0) % cap) {
+                    handle->pull_r.store(fw, std::memory_order_release);
+                }
             }
             const size_t r = handle->pull_r.load(std::memory_order_relaxed);
             const size_t w = handle->pull_w.load(std::memory_order_acquire);
@@ -5206,8 +5244,11 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
             *out_bytes = copied;
             return ESP_OK;
         }
-        if (handle->cap_done.load(std::memory_order_acquire) &&
-            (handle->filled_q == nullptr || uxQueueMessagesWaiting(handle->filled_q) == 0) &&
+        /* End of a bounded capture only once no producer can add bytes: every URB has retired
+         * (bulk_cb pushes before it retires) and no slot sits between bulk_cb and the ring.
+         * cap_done alone is set before the last chunk is published. */
+        if (handle->cap_done.load(std::memory_order_acquire) && live_urbs_get(handle) == 0 &&
+            handle->slots_pending.load(std::memory_order_acquire) == 0 &&
             handle->pull_r.load(std::memory_order_relaxed) ==
                 handle->pull_w.load(std::memory_order_acquire)) {
             /* Bounded capture complete and every byte read: the stream has ended. */
@@ -6311,7 +6352,10 @@ static esp_err_t apply_profile_gain(esp_rtl_sdr_handle *h, int tenth_db, int *ap
         }
         return ESP_OK;
     }
-    return apply_gain_records(h, tenth_db, applied_tenth);
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
 }
 
 static esp_err_t apply_profile_bias(esp_rtl_sdr_handle *h, bool enable)
@@ -6322,7 +6366,10 @@ static esp_err_t apply_profile_bias(esp_rtl_sdr_handle *h, bool enable)
         h->bias_tee_want = enable; /* preference immediately; EP0 async */
         return ESP_OK;
     }
-    return apply_bias_records(h, enable);
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
 }
 
 static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
@@ -6336,20 +6383,10 @@ static esp_err_t apply_profile_gain_mode(esp_rtl_sdr_handle *h,
         }
         return ESP_OK;
     }
-    if (mode == ESP_RTL_SDR_GAIN_MODE_AUTO) {
-        const esp_err_t aerr = apply_tuner_agc_auto_records(h);
-        if (aerr == ESP_OK) {
-            h->tuner_auto_applied = true;
-        }
-        return aerr;
-    }
-    int applied = 0;
-    const esp_err_t err = apply_gain_records(h, h->gain_tenth_db, &applied);
-    if (err == ESP_OK) {
-        h->gain_tenth_db = applied;
-        h->tuner_auto_applied = false;
-    }
-    return err;
+    /* ep0_setter_gate() admitted this setter only while STREAMING. streaming is false now, so a
+     * stop (or a give-up) began after the gate: a direct EP0 write here would run without the EP0
+     * window, into stop()'s cleanup or the next start()'s init table. */
+    return ESP_RTL_SDR_ERR_NOT_STREAMING;
 }
 
 /**
@@ -6734,22 +6771,11 @@ esp_err_t esp_rtl_sdr_set_rtl_agc(esp_rtl_sdr_handle_t handle, bool enable)
             set_error_unlocked(handle, ESP_OK);
             return ESP_OK;
         }
+        /* STREAMING but streaming already false: a recovery give-up or failed retune is moving
+         * the stream to FAULT. No direct EP0 write without the EP0 window. */
+        set_error_unlocked(handle, ESP_RTL_SDR_ERR_NOT_STREAMING);
+        return ESP_RTL_SDR_ERR_NOT_STREAMING;
     }
-
-    const esp_err_t err = apply_rtl_agc_records(handle, enable);
-
-    HandleLock lk(handle);
-    if (!lk.ok()) {
-        return (err == ESP_OK) ? ESP_RTL_SDR_ERR_TIMEOUT : err;
-    }
-    if (err == ESP_OK) {
-        handle->rtl_agc_want = enable;
-        set_error_unlocked(handle, ESP_OK);
-        ESP_LOGI(TAG, "RTL AGC %s [measured demod 0x19]", enable ? "ON" : "OFF");
-    } else {
-        set_error_unlocked(handle, err);
-    }
-    return err;
 }
 
 esp_err_t esp_rtl_sdr_get_rtl_agc(esp_rtl_sdr_handle_t handle, bool *out_enable)
