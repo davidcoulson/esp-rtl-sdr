@@ -169,6 +169,9 @@ const char *esp_rtl_sdr_get_version_string(void);
  * See esp_rtl_sdr_usb_fault_guard_reset() / esp_rtl_sdr_usb_safe_mode_active().
  */
 #define ESP_RTL_SDR_ERR_USB_SAFE_MODE  (ESP_RTL_SDR_ERR_BASE + 16)
+/** The tuner reported its PLL unlocked after a tune: the stream would not be at the requested
+ *  frequency. A start fails; a hot retune is rolled back to the previous frequency. */
+#define ESP_RTL_SDR_ERR_PLL_UNLOCKED   (ESP_RTL_SDR_ERR_BASE + 17)
 
 /** Convert esp_err_t (including component codes) to a stable string. Never NULL. */
 const char *esp_rtl_sdr_err_to_name(esp_err_t err);

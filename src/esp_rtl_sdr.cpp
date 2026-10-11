@@ -1110,7 +1110,8 @@ static esp_err_t ctrl_submit_device(esp_rtl_sdr_handle *h, usb_device_handle_t d
 
 static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest,
                              uint16_t wValue, uint16_t wIndex, const uint8_t *data,
-                             uint16_t wLength, bool expect_stall)
+                             uint16_t wLength, bool expect_stall,
+                             uint8_t *response = nullptr, uint16_t response_length = 0)
 {
     if (h == nullptr || h->ctrl_xfer == nullptr) {
         return ESP_RTL_SDR_ERR_USB;
@@ -1126,7 +1127,7 @@ static esp_err_t ctrl_submit(esp_rtl_sdr_handle *h, uint8_t bm, uint8_t bRequest
     const esp_err_t err =
         dev == nullptr ? ESP_RTL_SDR_ERR_USB
                        : ctrl_transfer_locked(h, dev, bm, bRequest, wValue, wIndex, data,
-                                              wLength, expect_stall, nullptr, 0);
+                                              wLength, expect_stall, response, response_length);
     xSemaphoreGive(h->ctrl_mutex);
     return err;
 }
@@ -1474,6 +1475,45 @@ static bool hf_direct_route(const esp_rtl_sdr_handle *h, uint32_t rf_hz)
  * Blog V4 HF (public): RF < 28.8 MHz is upconverted by 28.8 MHz before the tuner.
  * User-facing metrics keep RF; only the PLL pack uses tuner_hz.
  */
+/* Fail a tune whose PLL does not report lock. librtlsdr only warns (after raising the VCO current,
+ * which this template does not do), so this is a policy, not a register fact: set it false if a
+ * frequency that does receive keeps reporting unlocked on real hardware. */
+static constexpr bool kFailTuneOnPllUnlock = true;
+
+/**
+ * Run the template's pointer write + 3-byte status read and check VCO lock: R82xx register 02
+ * bit 6. Tuner reads come back bit-reversed per byte (librtlsdr r82xx_read() reverses them), so
+ * that is bit 1 of the raw third byte. Re-reads twice, 2 ms apart, before calling it unlocked.
+ */
+static esp_err_t check_tuner_pll_lock(esp_rtl_sdr_handle *h, const RtlControlRecord &pointer,
+                                      const RtlControlRecord &read, uint32_t tune_hz)
+{
+    uint8_t st[3] = {0, 0, 0};
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            const esp_err_t pe = run_record(h, pointer, false);
+            if (pe != ESP_OK) {
+                return pe;
+            }
+        }
+        const RtlControlRecord mapped = map_tuner_record_for_profile(h, read);
+        const esp_err_t e = ctrl_submit(h, mapped.request_type, 0, mapped.value, mapped.index,
+                                        mapped.data, mapped.length, false, st, sizeof(st));
+        if (e != ESP_OK) {
+            h->tuner_reg_known = 0;
+            return e;
+        }
+        if ((st[2] & 0x02) != 0) {
+            return ESP_OK;
+        }
+    }
+    RTL_LOGW(h, "tuner PLL not locked at %u Hz (status %02x %02x %02x)%s",
+             static_cast<unsigned>(tune_hz), st[0], st[1], st[2],
+             kFailTuneOnPllUnlock ? "" : "; continuing");
+    return kFailTuneOnPllUnlock ? ESP_RTL_SDR_ERR_PLL_UNLOCKED : ESP_OK;
+}
+
 static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
                           uint32_t tuner_if_hz = 0)
 {
@@ -1564,7 +1604,14 @@ static esp_err_t run_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
             }
         }
         const int64_t t_rec0 = esp_timer_get_time();
-        esp_err_t e = run_record(h, rec, false);
+        esp_err_t e = ESP_OK;
+        if (rec.request_type == 0xc0 && rec.length == 3 && i > 0) {
+            /* The PLL lock read (regs 00..02 after the N/SDM writes). It used to be run and
+             * its answer dropped, so a tune "succeeded" with the PLL unlocked. */
+            e = check_tuner_pll_lock(h, kRtlFinalTuneTemplate[i - 1], rec, tune_hz);
+        } else {
+            e = run_record(h, rec, false);
+        }
         rec_us[i] = (uint32_t)(esp_timer_get_time() - t_rec0);
         if (e != ESP_OK) {
             return e;
