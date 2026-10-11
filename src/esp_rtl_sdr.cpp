@@ -517,6 +517,12 @@ struct esp_rtl_sdr_handle {
     /** Bumped by start, stop and retune. Slots queued under an older value belong to a stopped
      *  stream or an old frequency and are dropped instead of delivered. */
     std::atomic<uint32_t> iq_epoch{0};
+    /** Bounded capture (stream config max_bytes / timeout_ms; 0 = unbounded). cap_bytes counts
+     *  delivered bytes (written by bulk_cb only); cap_done stops delivery and resubmits. */
+    uint64_t cap_max_bytes = 0;
+    uint32_t cap_timeout_ms = 0;
+    uint64_t cap_bytes = 0;
+    std::atomic<bool> cap_done{false};
     /** Flush request for the reader: skip everything up to pull_flush_w. Only the reader moves
      *  pull_r, so it applies the flush itself on its next read (pull_flush_seen is its copy). */
     std::atomic<uint32_t> pull_flush_gen{0};
@@ -2368,6 +2374,23 @@ static void live_urbs_dec(esp_rtl_sdr_handle *h)
 
 static void bulk_cb(usb_transfer_t *xfer);
 
+/** Bulk callback: how many of n bytes may still be delivered under max_bytes (all of them when
+ *  unbounded). Marks the capture complete once the bound is reached. */
+static size_t capture_take(esp_rtl_sdr_handle *h, size_t n)
+{
+    if (h->cap_max_bytes == 0) {
+        return n;
+    }
+    const uint64_t done = h->cap_bytes;
+    const uint64_t left = (done < h->cap_max_bytes) ? h->cap_max_bytes - done : 0;
+    const size_t take = static_cast<size_t>((n < left) ? n : left) & ~size_t{1};
+    h->cap_bytes = done + take;
+    if (h->cap_bytes >= h->cap_max_bytes) {
+        h->cap_done.store(true, std::memory_order_release);
+    }
+    return take;
+}
+
 /** Submit one bulk URB, counting it as live first: its callback may run (on the USB client
  * task) before usb_host_transfer_submit() even returns, and a decrement that ran ahead of the
  * increment left the count one too high for good. */
@@ -2446,7 +2469,10 @@ static void bulk_cb(usb_transfer_t *xfer)
             esp_rtl_sdr_delivery_mode_uses_read(h->cfg.delivery_mode) &&
             !esp_rtl_sdr_delivery_mode_uses_callback_iq(h->cfg.delivery_mode)) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
-            pull_ring_push(h, xfer->data_buffer, n, h->acquisition ? &observed : nullptr);
+            const size_t take = h->cap_done.load(std::memory_order_acquire) ? 0 : capture_take(h, n);
+            if (take > 0) {
+                pull_ring_push(h, xfer->data_buffer, take, h->acquisition ? &observed : nullptr);
+            }
             metric_add64(&h->metrics.bytes_total, n);
             h->metrics.blocks_total++;
             h->last_xfer_timestamp_us = esp_timer_get_time();
@@ -2454,7 +2480,8 @@ static void bulk_cb(usb_transfer_t *xfer)
             if (n != static_cast<size_t>(h->bulk_len)) {
                 h->metrics.short_transfers++;
             }
-            if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+            if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
                 const esp_err_t rs = usb_host_transfer_submit(xfer);
                 if (rs != ESP_OK) {
                     RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
@@ -2470,9 +2497,11 @@ static void bulk_cb(usb_transfer_t *xfer)
             return;
         }
         IqSlot *slot = nullptr;
-        if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
+        if (h->cap_done.load(std::memory_order_acquire)) {
+            /* bounded capture complete: nothing more is delivered */
+        } else if (xQueueReceive(h->free_q, &slot, 0) == pdTRUE && slot != nullptr) {
             const size_t n = static_cast<size_t>(xfer->actual_num_bytes);
-            const size_t copy = (n <= slot->capacity) ? n : slot->capacity;
+            const size_t copy = capture_take(h, (n <= slot->capacity) ? n : slot->capacity);
             std::memcpy(slot->data, xfer->data_buffer, copy);
             slot->bytes = copy;
             if (h->acquisition) h->acquisition->slots[slot - h->ring] = observed;
@@ -2518,7 +2547,8 @@ static void bulk_cb(usb_transfer_t *xfer)
                 metric_add64(&h->metrics.bytes_total, slot->bytes);
                 h->metrics.blocks_total++;
                 (void)xQueueSend(h->free_q, &slot, 0);
-                if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+                if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
                     esp_err_t rs = usb_host_transfer_submit(xfer);
                     if (rs != ESP_OK) {
                         RTL_LOGW(h, "bulk resubmit failed: %s; scheduling EP recovery",
@@ -2586,7 +2616,8 @@ static void bulk_cb(usb_transfer_t *xfer)
     }
 
     /* Resubmit only while streaming and not draining for stop/retune. */
-    if (h->streaming && !h->pause_resubmit && !h->device_gone) {
+    if (h->streaming && !h->pause_resubmit && !h->device_gone &&
+            !h->cap_done.load(std::memory_order_acquire)) {
         esp_err_t ret = usb_host_transfer_submit(xfer);
         if (ret != ESP_OK) {
             /* A bulk transfer error halts the endpoint, and every later
@@ -2672,6 +2703,9 @@ static void bulk_resume(esp_rtl_sdr_handle *h)
 {
     if (h == nullptr || !h->streaming) {
         return; /* stopping: pause_resubmit belongs to stop() */
+    }
+    if (h->cap_done.load(std::memory_order_acquire)) {
+        return; /* bounded capture complete: nothing more to fetch */
     }
     if (live_urbs_get(h) != 0) {
         RTL_LOGE(h, "bulk resume with %u URBs still live; staying paused for EP recovery",
@@ -3262,6 +3296,15 @@ static void delivery_task_fn(void *arg)
 {
     auto *h = static_cast<esp_rtl_sdr_handle *>(arg);
     while (h->tasks_run) {
+        /* Bounded capture: the wall-clock limit ends delivery like the byte limit does (bulk_cb
+         * stops resubmitting, so the URBs retire). */
+        if (h->streaming && h->cap_timeout_ms != 0 && h->stream_start_ms != 0 &&
+            !h->cap_done.load(std::memory_order_acquire) &&
+            now_ms() - h->stream_start_ms >= h->cap_timeout_ms) {
+            h->cap_done.store(true, std::memory_order_release);
+            RTL_LOGI(h, "bounded capture: %u ms limit reached",
+                     static_cast<unsigned>(h->cap_timeout_ms));
+        }
         /* A halted bulk IN endpoint can only be cleared from a task. Not gated on
          * pause_resubmit: a recovery whose drain timed out leaves the stream paused and must
          * run again; bulk_recover_stall() takes the EP0 window itself. */
@@ -3940,6 +3983,7 @@ static constexpr uint32_t kUnplugWaitMs = 2000;      /* plus control_timeout_ms 
 static constexpr uint32_t kUnplugFlushMs = 1000;
 static constexpr uint32_t kUnplugFinalFlushMs = 1000;
 static constexpr uint32_t kUnplugRetryMs = 500; /* between attempts while another task holds EP0 */
+static constexpr uint32_t kJoinWaitMs = 3000;   /* uninstall: worker / host task exit, device free */
 static constexpr uint32_t kEnumCheckEveryMs = 500;
 static constexpr uint32_t kRootPortOffMs = 300; /* VBUS stays off long enough for a device to drop fully */
 
@@ -5273,6 +5317,10 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         live_urbs_set(handle, 0);
         /* a new stream: queued slots from any earlier one are dropped on delivery */
         handle->iq_epoch.fetch_add(1, std::memory_order_acq_rel);
+        handle->cap_max_bytes = local.max_bytes;
+        handle->cap_timeout_ms = local.timeout_ms;
+        handle->cap_bytes = 0;
+        handle->cap_done.store(false, std::memory_order_release);
         /* a new stream gets the full recovery budget */
         handle->ep_stall_recover = false;
         handle->ep_recoveries_at_data = handle->ep_recoveries;
@@ -5739,6 +5787,13 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
         if (copied > 0) {
             *out_bytes = copied;
             return ESP_OK;
+        }
+        if (handle->cap_done.load(std::memory_order_acquire) &&
+            (handle->filled_q == nullptr || uxQueueMessagesWaiting(handle->filled_q) == 0) &&
+            handle->pull_r.load(std::memory_order_relaxed) ==
+                handle->pull_w.load(std::memory_order_acquire)) {
+            /* Bounded capture complete and every byte read: the stream has ended. */
+            return ESP_RTL_SDR_ERR_NOT_STREAMING;
         }
         if (timeout_ms == 0) {
             return ESP_RTL_SDR_ERR_TIMEOUT;
