@@ -22,4 +22,34 @@ menu "ESP_RTL_SDR-ESP"
         bool "Verbose driver logs"
         default n
 
+    choice ESP_RTL_SDR_ESP_R820T2_IF_MODE
+        prompt "R820T2 IF filter and IF for the sample rate (Blog V3, Nooelec)"
+        default ESP_RTL_SDR_ESP_R820T2_IF_VENDOR_FIXED
+        help
+            How the Blog V3 and Nooelec SMArt v5 profiles set the tuner IF filter
+            (reg 0x0a/0x0b) and the IF (demod IF and PLL LO offset) for the sample
+            rate at start. An explicit tuner bandwidth request still wins.
+            See docs/KCONFIG.md for the values each choice gives and an A/B procedure.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_VENDOR_FIXED
+            bool "A: vendor fixed (wide filter, 3.57 MHz IF at every rate)"
+            help
+                What the vendor DLL leaves on a Blog V3c or Nooelec v5 after a cold
+                open, and what the cold start already does: 0x0b = 0x6b, 3.57 MHz IF.
+                No extra writes.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_TABLE
+            bool "B: downstream fork table (Oldenburger-derived, hand-edited)"
+            help
+                The table davidcoulson/esp-rtl-sdr shipped (59deff2).
+                250k: 0xe8 / 1.70 MHz IF, 2048k: 0x8f / 1.75 MHz.
+
+        config ESP_RTL_SDR_ESP_R820T2_IF_LIBRTLSDR
+            bool "C: librtlsdr r82xx_set_bandwidth (filter and IF follow the rate)"
+            help
+                What osmocom librtlsdr and rtl-sdr-blog compute, and what the vendor DLL
+                writes on a Blog V4 at every rate. 250k: 0xe6 / 2.125 MHz IF, 2048k:
+                0xaf / 1.625 MHz, above 2.43 MS/s 0x6b / 3.57 MHz.
+    endchoice
+
 endmenu

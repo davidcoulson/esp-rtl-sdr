@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **Kconfig `ESP_RTL_SDR_ESP_R820T2_IF_MODE`: how the Blog V3 and Nooelec SMArt v5 set the tuner IF filter and IF
+  for the sample rate (downstream, davidcoulson/esp-rtl-sdr).** A (`..._IF_VENDOR_FIXED`, the default) is the cold-start
+  state the vendor DLL also leaves, wide filter and 3.57 MHz at every rate, and adds no writes. B (`..._IF_TABLE`) is a
+  downstream table, C (`..._IF_LIBRTLSDR`) is `r82xx_set_bandwidth()` with bandwidth = rate, whose values the V4 rate
+  matrix and the Nooelec explicit-bandwidth captures here also record. B and C are applied at start as a bandwidth
+  plan and kept across hot retunes; an explicit tuner bandwidth still wins. For an on-air A/B/C on the Nooelec at
+  915 MHz (hardcoreerik/esp-rtl-sdr#53); not hardware-tested. See `docs/KCONFIG.md`.
+
 ## 0.9.3 (2026-10-02) — RF band select, unplug recovery, V4/V4L band select
 
 ### Fixed
