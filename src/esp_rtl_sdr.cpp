@@ -300,6 +300,7 @@ struct IqSlot {
     int gain_tenth_db = 0;
     uint32_t bandwidth_hz = 0;
     uint32_t flags = 0;
+    uint32_t epoch = 0; /* h->iq_epoch when filled; older blocks are dropped on delivery */
 };
 
 struct esp_rtl_sdr_handle {
@@ -482,6 +483,14 @@ struct esp_rtl_sdr_handle {
      * a shared count - that count was the field that forced the lock. */
     std::atomic<size_t> pull_r{0};
     std::atomic<size_t> pull_w{0};
+    /** Bumped by start, stop and retune. Slots queued under an older value belong to a stopped
+     *  stream or an old frequency and are dropped instead of delivered. */
+    std::atomic<uint32_t> iq_epoch{0};
+    /** Flush request for the reader: skip everything up to pull_flush_w. Only the reader moves
+     *  pull_r, so it applies the flush itself on its next read (pull_flush_seen is its copy). */
+    std::atomic<uint32_t> pull_flush_gen{0};
+    std::atomic<size_t> pull_flush_w{0};
+    uint32_t pull_flush_seen = 0;
     SemaphoreHandle_t pull_mux = nullptr;
     SemaphoreHandle_t pull_sem = nullptr;
 };
@@ -1416,10 +1425,14 @@ static esp_err_t run_v3_tuner_reinit(esp_rtl_sdr_handle *h)
 /* Reinit resets 05/07 to 83/75. Restore an explicitly applied gain mode before native IQ resumes,
  * rather than reporting a stale gain. This must run only once the I2C repeater has been switched
  * back on (kBlogV3TunerRepeaterOn after the reinit and demod IF restore): written inside the reinit
- * itself it is STALLed, which made every start after a manual gain fail on the Nooelec. */
-static esp_err_t run_nooelec_gain_restore(esp_rtl_sdr_handle *h)
+ * itself it is STALLed, which made every start after a manual gain fail on the Nooelec.
+ * Every R820-family profile cold-reinits (rtl_profile_needs_cold_tuner_reinit), not only the
+ * Nooelec: on the V3 / V4L the gain state survived the reinit, so the stream ran at the reinit
+ * default while get_tuner_gain() and set_tuner_gain_mode(MANUAL) ("already applied") said
+ * otherwise. These are the same records the gain setters write on those profiles. */
+static esp_err_t run_r820_gain_restore(esp_rtl_sdr_handle *h)
 {
-    if (h->profile != RtlProfileId::NooelecSmartV5) return ESP_OK;
+    if (!rtl_profile_uses_r820t2_i2c_remap(h->profile)) return ESP_OK;
     if (h->gain_mode == ESP_RTL_SDR_GAIN_MODE_MANUAL) {
         return apply_r820t2_gain_records(h, h->gain_tenth_db, &h->gain_tenth_db);
     }
@@ -1601,7 +1614,7 @@ static esp_err_t run_profile_tune(esp_rtl_sdr_handle *h, uint32_t frequency_hz,
         if (err != ESP_OK) {
             return err;
         }
-        err = run_nooelec_gain_restore(h);
+        err = run_r820_gain_restore(h);
         if (err != ESP_OK) {
             return err;
         }
@@ -1764,7 +1777,7 @@ static esp_err_t run_bandwidth_program(esp_rtl_sdr_handle *h, uint32_t rf_hz,
     }
     esp_err_t err = run_records(h, kBlogV3TunerRepeaterOn,
                                  std::size(kBlogV3TunerRepeaterOn));
-    if (err == ESP_OK && left_direct) err = run_nooelec_gain_restore(h);
+    if (err == ESP_OK && left_direct) err = run_r820_gain_restore(h);
     if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0a, plan.reg0a), false);
     if (err == ESP_OK) err = run_record(h, measured_v4_ir_reg_write(0x0b, plan.reg0b), false);
     if (err == ESP_OK) err = run_profile_tune(h, rf_hz, previous_rf_hz, plan.if_hz);
@@ -1866,6 +1879,7 @@ static void run_cleanup_best_effort(esp_rtl_sdr_handle *h)
 
 /* Defined below; bulk_cb's read-only fast path fills the ring directly. */
 static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t bytes);
+static void pull_ring_request_flush(esp_rtl_sdr_handle *h);
 
 /* 64-bit counters written from the USB client task (bulk_cb) or a reader task without the API
  * lock. On a 32-bit core a plain 64-bit access is two loads/stores, so get_metrics() could read
@@ -1984,6 +1998,7 @@ static void bulk_cb(usb_transfer_t *xfer)
             std::memcpy(slot->data, xfer->data_buffer, copy);
             slot->bytes = copy;
             slot->sequence = ++h->iq_sequence;
+            slot->epoch = h->iq_epoch.load(std::memory_order_acquire);
             slot->frequency_hz = h->frequency_hz;
             slot->sample_rate_sps = h->sample_rate_sps;
             slot->host_timestamp_us = esp_timer_get_time();
@@ -2081,7 +2096,7 @@ static void bulk_cb(usb_transfer_t *xfer)
              * here and a byte count elsewhere, which is what made it
              * uninterpretable. */
             h->metrics.overruns++;
-            h->metrics.consumer_drops++;
+            (void)__atomic_fetch_add(&h->metrics.consumer_drops, 1u, __ATOMIC_RELAXED);
             h->metrics.slot_starve_blocks++;
         }
     } else if (xfer->status != USB_TRANSFER_STATUS_CANCELED &&
@@ -2384,6 +2399,9 @@ static esp_err_t apply_pending_retune(esp_rtl_sdr_handle *h)
     const uint32_t tune_hz =
         (h->pending_retune_hz != 0) ? h->pending_retune_hz : freq;
 
+    /* Bulk is drained: what is queued or buffered now was captured at the old frequency. */
+    pull_ring_request_flush(h);
+
     t_drained = esp_timer_get_time();
     const uint32_t previous_hz = h->frequency_hz;
     bool fault = false;
@@ -2536,7 +2554,7 @@ static void pull_ring_push(esp_rtl_sdr_handle *h, const uint8_t *data, size_t by
     n &= ~(size_t)1;                    /* keep CU8 I/Q pairs together */
     if (n < bytes) {
         const size_t lost = bytes - n;
-        h->metrics.consumer_drops += static_cast<uint32_t>(lost);
+        (void)__atomic_fetch_add(&h->metrics.consumer_drops, static_cast<uint32_t>(lost), __ATOMIC_RELAXED);
         metric_add64(&h->metrics.ring_overrun_bytes, lost);
         h->metrics.ring_overrun_blocks++;
     }
@@ -2576,12 +2594,30 @@ static void pull_ring_reset(esp_rtl_sdr_handle *h)
          * longer provides that - the USB callback does not take it. */
         h->pull_r.store(0, std::memory_order_relaxed);
         h->pull_w.store(0, std::memory_order_relaxed);
+        h->pull_flush_w.store(0, std::memory_order_release); /* a pending flush lands on 0 too */
         xSemaphoreGive(h->pull_mux);
     }
     if (h->pull_sem != nullptr) {
         while (xSemaphoreTake(h->pull_sem, 0) == pdTRUE) {
         }
     }
+}
+
+/**
+ * Retune: make the reader drop what the ring holds now (it was captured at the old frequency;
+ * read() has no metadata to tell). Call with the bulk URBs drained, so the USB callback is not
+ * producing. Bumps iq_epoch first, then publishes the flush under pull_mux: a delivery-task push
+ * either lands before the flush point (and is skipped) or sees the new epoch (and is dropped).
+ */
+static void pull_ring_request_flush(esp_rtl_sdr_handle *h)
+{
+    h->iq_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if (h->pull_mux == nullptr || xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+    h->pull_flush_w.store(h->pull_w.load(std::memory_order_acquire), std::memory_order_release);
+    h->pull_flush_gen.fetch_add(1, std::memory_order_acq_rel);
+    xSemaphoreGive(h->pull_mux);
 }
 
 /** Tear down pull ring under handle lock (or during uninstall). Fail-closed. */
@@ -2813,15 +2849,27 @@ static void delivery_task_fn(void *arg)
             }
         }
 
+        if (slot->epoch != h->iq_epoch.load(std::memory_order_acquire)) {
+            /* Captured before a stop/start or a retune: not this stream, or not this frequency. */
+            (void)xQueueSend(h->free_q, &slot, portMAX_DELAY);
+            continue;
+        }
+
         /* Lazy pull ring: allocate only when mode uses read() and IQ arrives. */
         if (esp_rtl_sdr_delivery_mode_uses_read(mode)) {
             if (ensure_pull_ring(h) == ESP_OK) {
-                pull_ring_push(h, slot->data, slot->bytes);
+                /* Under pull_mux, so a ring reset or retune flush cannot land mid-push; the epoch
+                 * is checked again inside it. */
+                if (xSemaphoreTake(h->pull_mux, pdMS_TO_TICKS(20)) == pdTRUE) {
+                    if (slot->epoch == h->iq_epoch.load(std::memory_order_acquire)) {
+                        pull_ring_push(h, slot->data, slot->bytes);
+                    }
+                    xSemaphoreGive(h->pull_mux);
+                }
             } else {
                 HandleLock lk(h, kQueryLockTicks);
                 if (lk.ok()) {
-                    h->metrics.consumer_drops +=
-                        static_cast<uint32_t>(slot->bytes > 0 ? slot->bytes : 1);
+                    (void)__atomic_fetch_add(&h->metrics.consumer_drops, static_cast<uint32_t>(slot->bytes > 0 ? slot->bytes : 1), __ATOMIC_RELAXED);
                 }
             }
         }
@@ -4255,6 +4303,7 @@ static esp_err_t stop_stream_internal(esp_rtl_sdr_handle *h, uint32_t timeout_ms
     h->state = ESP_RTL_SDR_STATE_STOPPING;
     h->pause_resubmit = true;
     h->streaming = false;
+    h->iq_epoch.fetch_add(1, std::memory_order_acq_rel); /* queued slots are this stream's last */
     h->frontend_applied_valid = false;
     h->pending_retune_hz = 0;
     h->pending_gain = false;
@@ -4541,7 +4590,7 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
             if (ret != ESP_OK) {
                 break;
             }
-            ret = run_nooelec_gain_restore(handle);
+            ret = run_r820_gain_restore(handle);
             if (ret != ESP_OK) {
                 break;
             }
@@ -4643,6 +4692,8 @@ esp_err_t esp_rtl_sdr_start(esp_rtl_sdr_handle_t handle,
         handle->pause_resubmit = false;
         /* alloc_bulk_pool() refused unless this was already 0 */
         live_urbs_set(handle, 0);
+        /* a new stream: queued slots from any earlier one are dropped on delivery */
+        handle->iq_epoch.fetch_add(1, std::memory_order_acq_rel);
         /* a new stream gets the full recovery budget */
         handle->ep_stall_recover = false;
         handle->ep_recoveries_at_data = handle->ep_recoveries;
@@ -5004,6 +5055,14 @@ esp_err_t esp_rtl_sdr_read(esp_rtl_sdr_handle_t handle, uint8_t *out_buf, size_t
          * lock here would be waited on from a context ESP-IDF says must not
          * block. */
         {
+            /* A retune asked to drop what was buffered at the old frequency (only the reader
+             * moves pull_r, so the reader applies it). */
+            const uint32_t fg = handle->pull_flush_gen.load(std::memory_order_acquire);
+            if (fg != handle->pull_flush_seen) {
+                handle->pull_flush_seen = fg;
+                handle->pull_r.store(handle->pull_flush_w.load(std::memory_order_acquire),
+                                     std::memory_order_release);
+            }
             const size_t r = handle->pull_r.load(std::memory_order_relaxed);
             const size_t w = handle->pull_w.load(std::memory_order_acquire);
             const size_t used = (w >= r) ? (w - r) : (handle->pull_cap - r + w);
