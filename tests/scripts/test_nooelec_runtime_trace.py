@@ -52,7 +52,8 @@ HARNESS = r'''
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
-#define RTL_LOGW(...) ((void)0)
+static unsigned rtl_warnings = 0;
+#define RTL_LOGW(...) ((void)++rtl_warnings)
 #define RTL_LOGE(...) ((void)0)
 #define RTL_LOGD(...) ((void)0)
 #define pdMS_TO_TICKS(x) (x)
@@ -64,7 +65,7 @@ struct esp_rtl_sdr_handle {
     RtlProfileId profile = RtlProfileId::NooelecSmartV5;
     uint32_t frequency_hz = 99100000, preferred_frequency_hz = 99100000;
     int32_t freq_correction_ppm = 0;
-    uint32_t last_pll_if_hz = 0, last_lo_hz = 0;
+    uint32_t last_pll_if_hz = 0, last_lo_hz = 0, pll_unlocked_tunes = 0;
     bool ctrl_stall = false, bias_tee_want = false, tuner_auto_applied = false;
     uint32_t tuner_reg_known = 0;
     uint8_t tuner_reg_val[32] = {}, tuner_reg05_low_bits = 3, tuner_reg07 = 0x75;
@@ -72,7 +73,7 @@ struct esp_rtl_sdr_handle {
     int gain_tenth_db = 0;
 };
 static std::vector<RtlControlRecord> wire;
-static constexpr bool kFailTuneOnPllUnlock = true; // as in the driver
+static constexpr bool kFailTuneOnPllUnlock = false; // as in the driver
 static bool pll_locked = true; // what the tuner status read (regs 00..02) reports
 static esp_err_t ctrl_submit(esp_rtl_sdr_handle *, uint8_t type, uint8_t,
     uint16_t value, uint16_t index, const uint8_t *data, uint8_t length, bool,
@@ -214,9 +215,10 @@ int main() {
         if (r.request_type == 0x40 && r.index == 0x0610 && r.length == 2 && r.data[0] == 0x1a && r.data[1] == 0x61)
             pll_1a_seen = true;
     CHECK(pll_1a_seen);
-    // The PLL lock read is checked: an unlocked PLL fails the tune (and its re-reads go over the wire).
-    h = {}; wire.clear(); pll_locked = false;
-    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_RTL_SDR_ERR_PLL_UNLOCKED);
+    // The PLL lock read is checked: an unlocked PLL is re-read, warned about and counted, and the tune goes on.
+    h = {}; wire.clear(); pll_locked = false; const unsigned warned = rtl_warnings;
+    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_OK);
+    CHECK(rtl_warnings == warned + 1); CHECK(h.pll_unlocked_tunes == 1);
     size_t lock_reads = 0;
     for (const auto &r : wire)
         if (r.request_type == 0xc0 && r.index == 0x0600 && r.length == 3) ++lock_reads;

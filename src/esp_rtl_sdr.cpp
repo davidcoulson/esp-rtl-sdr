@@ -346,6 +346,7 @@ struct esp_rtl_sdr_handle {
     bool ctrl_stall = false;
     uint16_t ctrl_data_len = 0; /* bytes the device returned in the data stage of the last control transfer */
     uint32_t last_pll_if_hz = 0; /* PLL IF used by the last run_tune */
+    uint32_t pll_unlocked_tunes = 0; /* tunes whose PLL status read said unlocked (logged) */
     uint32_t last_lo_hz = 0;     /* LO the last run_tune programmed (ppm-corrected tuner frequency + IF); band rows key on it */
     /** ctrl_xfer submitted and its callback not yet run. usb_host_device_close()
      *  asserts (usbh num_ctrl_xfers_inflight == 0) while this is true. */
@@ -1480,15 +1481,18 @@ static bool hf_direct_route(const esp_rtl_sdr_handle *h, uint32_t rf_hz)
  * Blog V4 HF (public): RF < 28.8 MHz is upconverted by 28.8 MHz before the tuner.
  * User-facing metrics keep RF; only the PLL pack uses tuner_hz.
  */
-/* Fail a tune whose PLL does not report lock. librtlsdr only warns (after raising the VCO current,
- * which this template does not do), so this is a policy, not a register fact: set it false if a
- * frequency that does receive keeps reporting unlocked on real hardware. */
-static constexpr bool kFailTuneOnPllUnlock = true;
+/* Fail a tune whose PLL does not report lock? Off: a working V3 reads unlocked (3B 69 01) twice ~6 ms
+ * apart in docs/captures/v3c_live_bandwidth_pc_control_transfers_2026-09-28.txt, and librtlsdr only
+ * warns ("PLL not locked!", see NOTES.md) after raising the VCO current, which this template does not
+ * do. So an unlocked read is logged and counted, and the tune goes on. The strict path (start fails,
+ * a hot retune is rolled back with ERR_PLL_UNLOCKED) stays here for when lock reads are trusted. */
+static constexpr bool kFailTuneOnPllUnlock = false;
 
 /**
  * Run the template's pointer write + 3-byte status read and check VCO lock: R82xx register 02
  * bit 6. Tuner reads come back bit-reversed per byte (librtlsdr r82xx_read() reverses them), so
  * that is bit 1 of the raw third byte. Re-reads twice, 2 ms apart, before calling it unlocked.
+ * Unlocked: warn and count; fail only if kFailTuneOnPllUnlock.
  */
 static esp_err_t check_tuner_pll_lock(esp_rtl_sdr_handle *h, const RtlControlRecord &pointer,
                                       const RtlControlRecord &read, uint32_t tune_hz)
@@ -1496,7 +1500,8 @@ static esp_err_t check_tuner_pll_lock(esp_rtl_sdr_handle *h, const RtlControlRec
     uint8_t st[3] = {0, 0, 0};
     for (int attempt = 0; attempt < 3; ++attempt) {
         if (attempt > 0) {
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* at least one tick: pdMS_TO_TICKS(2) is 0 at CONFIG_FREERTOS_HZ=100 */
+            vTaskDelay(pdMS_TO_TICKS(2) > 0 ? pdMS_TO_TICKS(2) : 1);
             const esp_err_t pe = run_record(h, pointer, false);
             if (pe != ESP_OK) {
                 return pe;
@@ -1513,9 +1518,10 @@ static esp_err_t check_tuner_pll_lock(esp_rtl_sdr_handle *h, const RtlControlRec
             return ESP_OK;
         }
     }
-    RTL_LOGW(h, "tuner PLL not locked at %u Hz (status %02x %02x %02x)%s",
+    h->pll_unlocked_tunes++;
+    RTL_LOGW(h, "tuner PLL not locked at %u Hz (status %02x %02x %02x; %u unlocked tunes)%s",
              static_cast<unsigned>(tune_hz), st[0], st[1], st[2],
-             kFailTuneOnPllUnlock ? "" : "; continuing");
+             static_cast<unsigned>(h->pll_unlocked_tunes), kFailTuneOnPllUnlock ? "" : "; continuing");
     return kFailTuneOnPllUnlock ? ESP_RTL_SDR_ERR_PLL_UNLOCKED : ESP_OK;
 }
 
