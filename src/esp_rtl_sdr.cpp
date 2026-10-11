@@ -316,9 +316,9 @@ struct esp_rtl_sdr_handle {
     uint32_t frequency_hz = 0;
     uint32_t sample_rate_sps = 0;
     uint32_t stream_start_ms = 0;
-    uint32_t in_callback_depth = 0;
-    /** Task currently inside emit_after_unlock; null if depth == 0. */
-    TaskHandle_t callback_task = nullptr;
+    /** Tasks currently inside emit_after_unlock (per task, so two emitting tasks never see each
+     *  other as reentrant). */
+    EspRtlSdrCallbackTracker callbacks;
     bool destroying = false;
 
     bool owns_host = false;
@@ -583,9 +583,7 @@ static esp_err_t check_not_reentrant(const esp_rtl_sdr_handle *h)
     if (h == nullptr) {
         return ESP_OK;
     }
-    const uint32_t depth = __atomic_load_n(&h->in_callback_depth, __ATOMIC_SEQ_CST);
-    const TaskHandle_t cb = __atomic_load_n(&h->callback_task, __ATOMIC_SEQ_CST);
-    if (esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle())) {
+    if (esp_rtl_sdr_cb_is_inside(&h->callbacks, xTaskGetCurrentTaskHandle())) {
         return ESP_RTL_SDR_ERR_REENTRANT;
     }
     return ESP_OK;
@@ -599,8 +597,8 @@ static uint32_t now_ms(void)
 
 /**
  * Invoke app callback without holding the API mutex.
- * Depth + callback_task are atomic so another task can call setters while
- * we emit; only the callback task itself is ERR_REENTRANT.
+ * Tracked per task (EspRtlSdrCallbackTracker), so another task can call setters while we emit;
+ * only a task that is itself inside a callback is ERR_REENTRANT.
  */
 static void emit_after_unlock(esp_rtl_sdr_handle *h,
                               esp_rtl_sdr_event_t ev,
@@ -612,17 +610,10 @@ static void emit_after_unlock(esp_rtl_sdr_handle *h,
         return;
     }
     const TaskHandle_t self = xTaskGetCurrentTaskHandle();
-    if (handle_live(h)) {
-        __atomic_store_n(&h->callback_task, self, __ATOMIC_SEQ_CST);
-        __atomic_add_fetch(&h->in_callback_depth, 1u, __ATOMIC_SEQ_CST);
-    }
+    const int slot = handle_live(h) ? esp_rtl_sdr_cb_enter(&h->callbacks, self) : -1;
     cb(ev, payload, ctx);
-    if (handle_live(h)) {
-        const uint32_t d = __atomic_sub_fetch(&h->in_callback_depth, 1u, __ATOMIC_SEQ_CST);
-        if (d == 0) {
-            __atomic_store_n(&h->callback_task, static_cast<TaskHandle_t>(nullptr),
-                             __ATOMIC_SEQ_CST);
-        }
+    if (slot >= 0 && handle_live(h)) {
+        esp_rtl_sdr_cb_exit(&h->callbacks, slot);
     }
 }
 
@@ -4027,9 +4018,7 @@ esp_err_t esp_rtl_sdr_uninstall(esp_rtl_sdr_handle_t handle)
         if (handle->destroying) {
             return ESP_RTL_SDR_ERR_BUSY;
         }
-        const uint32_t depth = __atomic_load_n(&handle->in_callback_depth, __ATOMIC_SEQ_CST);
-        const TaskHandle_t cb = __atomic_load_n(&handle->callback_task, __ATOMIC_SEQ_CST);
-        if (esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle())) {
+        if (esp_rtl_sdr_cb_is_inside(&handle->callbacks, xTaskGetCurrentTaskHandle())) {
             return ESP_RTL_SDR_ERR_REENTRANT;
         }
         handle->destroying = true;
@@ -4874,10 +4863,8 @@ esp_err_t esp_rtl_sdr_retune_hz(esp_rtl_sdr_handle_t handle, uint32_t frequency_
         }
         handle->pending_retune_hz = q;
         {
-            const uint32_t depth = __atomic_load_n(&handle->in_callback_depth, __ATOMIC_SEQ_CST);
-            const TaskHandle_t cb = __atomic_load_n(&handle->callback_task, __ATOMIC_SEQ_CST);
             from_callback =
-                esp_rtl_sdr_caller_is_event_callback(depth, cb, xTaskGetCurrentTaskHandle());
+                esp_rtl_sdr_cb_is_inside(&handle->callbacks, xTaskGetCurrentTaskHandle());
         }
         set_error_unlocked(handle, ESP_OK);
     }
