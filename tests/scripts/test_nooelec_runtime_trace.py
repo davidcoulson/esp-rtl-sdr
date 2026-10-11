@@ -13,8 +13,8 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = """ctrl_submit esp_rtl_sdr_get_tuner_gains esp_rtl_sdr_set_offset_tuning esp_rtl_sdr_get_offset_tuning_state apply_freq_correction_hz encode_r820_pll tuner_i2c_value_for_handle
 map_tuner_record_for_profile run_record run_records run_profile_demod_if_restore
-run_v3_direct_tune run_v3_enter_direct run_v3_tuner_reinit run_nooelec_gain_restore run_v3_leave_direct
-trace_e4000_start_state run_e4000_masked_write run_e4000_gain run_e4000_initialize_tuner run_init_table e4000_sample_rate_record_allowed rtl_tuner_driver_for_profile run_e4000_set_zero_if run_e4000_tune run_tune run_profile_tune frontend_rf_hz apply_r820t2_gain_records apply_gain_records
+run_v3_direct_tune run_v3_enter_direct run_v3_tuner_reinit run_r820_gain_restore run_v3_leave_direct
+trace_e4000_start_state run_e4000_masked_write run_e4000_gain run_e4000_initialize_tuner run_init_table e4000_sample_rate_record_allowed rtl_tuner_driver_for_profile run_e4000_set_zero_if run_e4000_tune check_tuner_pll_lock run_tune run_profile_tune frontend_rf_hz apply_r820t2_gain_records apply_gain_records
 apply_tuner_agc_auto_records apply_rtl_agc_records run_bandwidth_program""".split()
 
 
@@ -98,6 +98,8 @@ static bool handle_ok(esp_rtl_sdr_handle *h) { return h != nullptr; }
 static esp_err_t check_not_reentrant(esp_rtl_sdr_handle *) { return api_reentrant; }
 constexpr size_t kDemodBringupRecordCount = 86;
 static std::vector<RtlControlRecord> wire;
+static constexpr bool kFailTuneOnPllUnlock = true; // as in the driver
+static bool pll_locked = true; // what the tuner status read (regs 00..02) reports
 static size_t fail_transfer = 0;
 static uint8_t e4000_registers[256] = {};
 static uint8_t e4000_pointer = 0;
@@ -118,6 +120,11 @@ static esp_err_t wire_submit(esp_rtl_sdr_handle *, uint8_t type, uint8_t,
     if (value==0x00c8 && index==0x0610 && length) {
         e4000_pointer=data[0];
         if (length==2 && data[0]!=ignored_e4000_write) e4000_registers[data[0]]=data[1];
+    }
+    if (response != nullptr && response_length > 0) {
+        std::memset(response, 0, response_length);
+        // VCO lock is reg 02 bit 6; tuner reads come back bit-reversed, so bit 1 of the raw byte
+        if (type == 0xc0 && response_length >= 3 && pll_locked) response[2] = 0x02;
     }
     return fail_transfer == wire.size() ? ESP_FAIL : ESP_OK;
 }
@@ -241,7 +248,7 @@ int main() {
     // The restore runs separately, once the repeater is on.
     h = {}; wire.clear(); h.gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL; h.gain_tenth_db = 496;
     CHECK(run_v3_tuner_reinit(&h) == ESP_OK); gain(0x83, 0x75, 0xf0);
-    wire.clear(); CHECK(run_nooelec_gain_restore(&h) == ESP_OK); gain(0x9f, 0x6e, 0x68);
+    wire.clear(); CHECK(run_r820_gain_restore(&h) == ESP_OK); gain(0x9f, 0x6e, 0x68);
     // A Q retune can cancel queued MANUAL while the old AUTO-applied flag remains.
     h.gain_mode = ESP_RTL_SDR_GAIN_MODE_MANUAL; h.gain_tenth_db = 496;
     h.tuner_auto_applied = true;
@@ -489,6 +496,14 @@ int main() {
     // Mode A (the default) has no plan: the cold reinit + demod IF restore above is its whole state.
     { MeasuredTunerBandwidthPlan plan{};
       CHECK(!r820t2_rate_plan(RtlProfileId::NooelecSmartV5, 2048000, 915000000, &plan)); }
+    // The PLL lock read is checked: an unlocked PLL fails the tune (and its re-reads go over the wire).
+    h = {}; wire.clear(); pll_locked = false;
+    CHECK(run_profile_tune(&h, 433920000, 0) == ESP_RTL_SDR_ERR_PLL_UNLOCKED);
+    size_t lock_reads = 0;
+    for (const auto &r : wire)
+        if (r.request_type == 0xc0 && r.index == 0x0600 && r.length == 3) ++lock_reads;
+    CHECK(lock_reads == 3);
+    pll_locked = true;
     std::printf("RESULT nooelec_runtime_trace passed=%u failed=0\n", checks);
 }
 '''
