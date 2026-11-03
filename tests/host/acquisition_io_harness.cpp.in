@@ -20,6 +20,7 @@ struct esp_rtl_sdr_handle {
     struct { uint32_t consumer_drops=0, ring_overrun_blocks=0, ring_high_water=0;
              uint64_t ring_overrun_bytes=0, bytes_consumed=0; } metrics;
 };
+static inline void metric_add64(uint64_t *p, uint64_t v) { *p += v; }
 static unsigned ticks;
 static unsigned xTaskGetTickCount() { return ticks; }
 static void vTaskDelay(unsigned n) { ticks+=n; }

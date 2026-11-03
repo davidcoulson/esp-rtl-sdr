@@ -1,4 +1,6 @@
 #include "esp_rtl_sdr_acquisition.h"
+#include <atomic>
+#include <new>
 #include <cstdio>
 #define RTL_LOGE(...) ((void)0)
 #define RTL_LOGW(...) ((void)0)
@@ -7,7 +9,12 @@ struct esp_rtl_sdr_handle {
     bool ep_stall_recover = true, streaming = true, pause_resubmit = false;
     uint32_t ep_recoveries = 0, ep_recoveries_at_data = 0, live_urbs = 2;
     esp_rtl_sdr_state_t state = ESP_RTL_SDR_STATE_STREAMING;
+    bool device_gone = false;
+    std::atomic<bool> ep0_sideband_busy{false};
 };
+static int failed;
+static void fail_stream(esp_rtl_sdr_handle *h, esp_err_t, const char *) { ++failed; h->streaming = false; h->state = ESP_RTL_SDR_STATE_FAULT; }
+static uint32_t live_urbs_get(esp_rtl_sdr_handle *h) { return h->live_urbs; }
 static bool drained;
 static int resumed, endpoint_calls;
 static constexpr uint32_t kEpRecoverAttempts = 8;
@@ -23,15 +30,25 @@ static void bulk_resume(esp_rtl_sdr_handle *h) { ++resumed;h->live_urbs=3; }
 // ACTUAL_RECOVERY
 int main() {
     esp_rtl_sdr_handle h;drained=false;
+    // Drain timeout: stay paused with the flag set so the next pass retries; nothing is cleared or resumed.
     bulk_recover_stall(&h);
-    if (resumed || endpoint_calls || h.live_urbs!=2 || h.streaming || h.state!=ESP_RTL_SDR_STATE_FAULT) {
+    if (resumed || endpoint_calls || h.live_urbs!=2 || !h.ep_stall_recover || !h.streaming || h.ep0_sideband_busy) {
         std::puts("FAIL recovery resumed or hid outstanding transfers after drain timeout");return 1;
     }
-    h={};drained=true;resumed=endpoint_calls=0;
+    drained=true;
     bulk_recover_stall(&h);
-    if (resumed!=1 || endpoint_calls!=3 || !h.streaming) return 1;
-    h={};h.ep_recoveries=kEpRecoverAttempts;resumed=endpoint_calls=0;
+    if (resumed!=1 || endpoint_calls!=3 || !h.streaming || h.ep_stall_recover || h.ep0_sideband_busy) return 1;
+    // EP0 window busy: the pass is skipped and the flag survives.
+    h.ep_stall_recover=true;h.ep0_sideband_busy=true;resumed=endpoint_calls=0;
     bulk_recover_stall(&h);
-    if (resumed || h.streaming || h.state!=ESP_RTL_SDR_STATE_FAULT) return 1;
+    if (resumed || endpoint_calls || !h.ep_stall_recover) return 1;
+    // Unplugged: no endpoint calls, flag dropped.
+    h.ep0_sideband_busy=false;h.device_gone=true;
+    bulk_recover_stall(&h);
+    if (resumed || endpoint_calls || h.ep_stall_recover || h.ep0_sideband_busy) return 1;
+    // Out of attempts: the stream FAULTs through fail_stream.
+    new (&h) esp_rtl_sdr_handle;h.ep_recoveries=kEpRecoverAttempts;resumed=endpoint_calls=0;
+    bulk_recover_stall(&h);
+    if (resumed || failed!=1 || h.streaming || h.state!=ESP_RTL_SDR_STATE_FAULT || h.ep0_sideband_busy) return 1;
     return 0;
 }

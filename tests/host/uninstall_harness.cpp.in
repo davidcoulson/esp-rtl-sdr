@@ -27,14 +27,15 @@ static int destroyed, deregistered, released, freed;
 static int stop_result, deregister_result, release_result;
 static bool stall_workers, lock_ok = true;
 static unsigned ticks;
+struct EspRtlSdrCallbackTracker { const void *task = nullptr; };
 struct AcquisitionRuntime { uint64_t metadata_drop_bytes=0; };
 struct esp_rtl_sdr_handle {
     AcquisitionRuntime *acquisition = nullptr;
     unsigned magic = kHandleMagic;
     void *lock = reinterpret_cast<void *>(1);
     bool destroying = false, uninstall_active = false, tasks_run = true, client_registered = true;
-    unsigned in_callback_depth = 0;
-    TaskHandle_t callback_task = nullptr, client_task = nullptr, delivery_task = nullptr;
+    EspRtlSdrCallbackTracker callbacks;
+    TaskHandle_t client_task = nullptr, delivery_task = nullptr;
     unsigned worker_task_count = 2, live_urbs = 0;
     std::atomic<unsigned> workers_exited{0};
     std::atomic<bool> ctrl_inflight{false};
@@ -57,7 +58,7 @@ static void vTaskDelay(int) {
     if (active && !active->tasks_run && !stall_workers) active->workers_exited = active->worker_task_count;
 }
 static TaskHandle_t xTaskGetCurrentTaskHandle() { return reinterpret_cast<void *>(3); }
-static bool esp_rtl_sdr_caller_is_event_callback(unsigned depth, TaskHandle_t cb, TaskHandle_t me) { return depth && cb == me; }
+static bool esp_rtl_sdr_cb_is_inside(const EspRtlSdrCallbackTracker *t, const void *me) { return t->task == me; }
 static void set_error_unlocked(esp_rtl_sdr_handle *h, int err) { h->last_error = err; }
 static void usb_fault_guard_disarm() {}
 static int stop_stream_internal(esp_rtl_sdr_handle *, int) { return stop_result; }
@@ -112,9 +113,9 @@ int main() {
     release_result = ESP_OK;
     CHECK(esp_rtl_sdr_uninstall(h) == ESP_OK && destroyed == 1 && deregistered == 1);
     CHECK(esp_rtl_sdr_uninstall(nullptr) == ESP_OK);
-    h = reset(); h->in_callback_depth = 1; h->callback_task = xTaskGetCurrentTaskHandle();
+    h = reset(); h->callbacks.task = xTaskGetCurrentTaskHandle();
     CHECK(esp_rtl_sdr_uninstall(h) == ESP_RTL_SDR_ERR_REENTRANT && !h->destroying);
-    h->in_callback_depth = 0;
+    h->callbacks.task = nullptr;
     CHECK(esp_rtl_sdr_uninstall(h) == ESP_OK);
     std::printf("actual uninstall checks=%d\n", checks); return 0;
 }

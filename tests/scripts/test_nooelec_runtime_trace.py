@@ -110,7 +110,7 @@ static esp_err_t wire_submit(esp_rtl_sdr_handle *, uint8_t type, uint8_t,
     uint16_t value, uint16_t index, const uint8_t *data, uint8_t length, bool, uint8_t *response=nullptr, uint16_t response_length=0) {
     CHECK(length <= 8);
     RtlControlRecord r{value, index, type, length, {}};
-    if (response) {
+    if (response && response_length == 1) {
         CHECK(response_length==1 && length==1 && index==0x0600);
         wire.push_back(r);
         if(fail_transfer==wire.size()) return ESP_FAIL;
@@ -158,6 +158,7 @@ static esp_err_t ctrl_transfer_locked(esp_rtl_sdr_handle *h,void *dev,uint8_t bm
  CHECK(control_lock_depth==1 && dev!=nullptr);
  return wire_submit(h,bm,req,value,index,data,static_cast<uint8_t>(len),stall,response,response_len);
 }
+static void ctrl_mutex_take(esp_rtl_sdr_handle *h) { xSemaphoreTake(h->ctrl_mutex, 0); }
 // ACTUAL_DRIVER_FUNCTIONS
 static int last_tuner(uint8_t reg) {
     for (auto i = wire.rbegin(); i != wire.rend(); ++i) {
